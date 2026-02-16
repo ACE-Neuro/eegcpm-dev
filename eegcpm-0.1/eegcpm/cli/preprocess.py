@@ -120,7 +120,9 @@ def preprocess_command(args):
 
             try:
                 # Find input files (may be multiple runs)
-                input_files = _find_input_files(args.project, subject_id, task)
+                input_files_response = _find_input_files(args.project, subject_id, task)
+                print(input_files_response)
+                input_files = input_files_response.get("files", None)
                 if not input_files:
                     console.print(f"  [yellow]⚠ {subject_id}: No input files found for task {task}[/yellow]")
                     workflow.status = ProcessingStatus.FAILED
@@ -154,8 +156,40 @@ def preprocess_command(args):
                     workflow.session = session  # Update workflow with actual session
                     workflow.run = run_num      # Update workflow with actual run
                     manager.save_state(workflow)
+                    _, _, after = str(input_file).rpartition(".")
+                    extension = after
+                    print("extension:\t", extension)
+                    raw = None
+                    match extension:
+                        case "vhdr":
+                            raw = mne.io.read_raw_brainvision(input_file, preload=True, verbose=False)
+                            # Auto-set common auxiliary channel types for BrainVision
+                            misc_channels = {
+                                'photosensor': 'stim',
+                                'optical': 'stim',
+                                'ecg': 'ecg',
+                                'resp': 'misc'
+                            }
+                            channels_to_set = {
+                                ch: ch_type for ch, ch_type in misc_channels.items()
+                                if ch in raw.ch_names
+                            }
+                            if channels_to_set:
+                                raw.set_channel_types(channels_to_set)
+                        case "fif":
+                            raw = mne.io.read_raw_fif(input_file, preload=True, verbose=False)
+                        case "edf":
+                            raw = mne.io.read_raw_edf(input_file, preload=True, verbose=False)
+                        case "bdf":
+                            raw = mne.io.read_raw_bdf(input_file, preload=True, verbose=False)
+                        case "set":
+                            raw = mne.io.read_raw_eeglab(input_file, preload=True, verbose=False)
+                        case "cnt":
+                            raw = mne.io.read_raw_cnt(input_file, preload=True, verbose=False)
+                        case "cdt":
+                            raw = mne.io.read_raw_curry(input_file, preload=True, verbose=False)
 
-                    raw = mne.io.read_raw_fif(input_file, preload=True, verbose=False)
+                    # raw = mne.io.read_raw_fif(input_file, preload=True, verbose=False)
 
                     load_step.status = ProcessingStatus.COMPLETED
                     load_step.completed_at = datetime.now()
@@ -352,7 +386,7 @@ def _get_subject_list(args, console, paths: EEGCPMPaths) -> List[str]:
         return subjects
 
 
-def _find_input_files(project_root: Path, subject_id: str, task: str) -> List[Path]:
+def _find_input_files(project_root: Path, subject_id: str, task: str) -> dict["files": List[Path], "file_type": str]:
     """
     Find all input EEG files for subject/task.
 
@@ -360,42 +394,66 @@ def _find_input_files(project_root: Path, subject_id: str, task: str) -> List[Pa
     """
     files = []
 
+    # Define supported formats: (extension, file_type_name)
+    supported_formats = [
+        ('fif', 'FIF'),           # MNE native format
+        ('vhdr', 'BrainVision'),  # BrainVision
+        ('edf', 'EDF'),           # European Data Format
+        ('bdf', 'BDF'),           # BioSemi
+        ('set', 'EEGLAB'),        # EEGLAB
+        ('cnt', 'NeuroScan'),     # NeuroScan
+        ('cdt', 'CURRY'),         # CURRY
+    ]
+
     # Try project_root directly as BIDS (common case)
     eeg_dir = project_root / f"sub-{subject_id}" / "ses-01" / "eeg"
 
     if eeg_dir.exists():
-        # Look for run-based files first
-        run_files = sorted(eeg_dir.glob(f"sub-{subject_id}_ses-01_task-{task}_run-*_eeg.fif"))
-        if run_files:
-            return run_files
+        print("task:\t", task)
+        print("subject_id:\t", subject_id)
+        print("eeg_dir:\t", eeg_dir)
 
-        # Look for single file without run
-        single_file = eeg_dir / f"sub-{subject_id}_ses-01_task-{task}_eeg.fif"
-        if single_file.exists():
-            return [single_file]
+        # Search for files in order of format preference
+        for ext, file_type in supported_formats:
+            # Look for run-based files first (multiple runs)
+            run_files = sorted(eeg_dir.glob(f"sub-{subject_id}_ses-01_task-{task}_run-*_eeg.{ext}"))
+            if run_files:
+                print(f"Found {file_type} type with {len(run_files)} run(s)!")
+                return {"files": run_files, "file_type": file_type}
+
+            # Look for single file without run number
+            single_file = eeg_dir / f"sub-{subject_id}_ses-01_task-{task}_eeg.{ext}"
+            if single_file.exists():
+                print(f"Found {file_type} type (single file)!")
+                return {"files": [single_file], "file_type": file_type}
 
     # Try without session
     eeg_dir_no_ses = project_root / f"sub-{subject_id}" / "eeg"
     if eeg_dir_no_ses.exists():
-        # Look for run-based files
-        run_files = sorted(eeg_dir_no_ses.glob(f"sub-{subject_id}_task-{task}_run-*_eeg.fif"))
-        if run_files:
-            return run_files
+        for ext, file_type in supported_formats:
+            # Look for run-based files
+            run_files = sorted(eeg_dir_no_ses.glob(f"sub-{subject_id}_task-{task}_run-*_eeg.{ext}"))
+            if run_files:
+                return {"files": run_files, "file_type": file_type}
 
-        # Look for single file
-        single_file = eeg_dir_no_ses / f"sub-{subject_id}_task-{task}_eeg.fif"
-        if single_file.exists():
-            return [single_file]
+            # Look for single file
+            single_file = eeg_dir_no_ses / f"sub-{subject_id}_task-{task}_eeg.{ext}"
+            if single_file.exists():
+                return {"files": [single_file], "file_type": file_type}
 
     # Try project_root/bids subdirectory (legacy)
     eeg_dir_legacy = project_root / "bids" / f"sub-{subject_id}" / "ses-01" / "eeg"
     if eeg_dir_legacy.exists():
-        run_files = sorted(eeg_dir_legacy.glob(f"sub-{subject_id}_ses-01_task-{task}_run-*_eeg.fif"))
-        if run_files:
-            return run_files
+        for ext, file_type in supported_formats:
+            # Look for run-based files
+            run_files = sorted(eeg_dir_legacy.glob(f"sub-{subject_id}_ses-01_task-{task}_run-*_eeg.{ext}"))
+            if run_files:
+                return {"files": run_files, "file_type": file_type}
 
-        single_file = eeg_dir_legacy / f"sub-{subject_id}_ses-01_task-{task}_eeg.fif"
-        if single_file.exists():
-            return [single_file]
+            # Look for single file
+            single_file = eeg_dir_legacy / f"sub-{subject_id}_ses-01_task-{task}_eeg.{ext}"
+            if single_file.exists():
+                return {"files": [single_file], "file_type": file_type}
 
-    return files
+    # No files found
+    return {"files": files, "file_type": "NOT_FOUND"}
