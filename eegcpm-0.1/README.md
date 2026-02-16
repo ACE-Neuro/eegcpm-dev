@@ -31,6 +31,7 @@ A comprehensive Python toolbox for EEG preprocessing, source reconstruction, con
 - **HPC Integration**: SLURM batch processing with checkpoint/resume
 - **GUI**: Streamlit-based web interface
 - **BIDS Compatible**: Works with BIDS-formatted datasets
+- **Multi-Format Support**: FIF, BrainVision, EDF, BDF, EEGLAB, NeuroScan, CURRY
 
 ## Installation
 

@@ -25,7 +25,7 @@ pip install -e ".[dev]"
 ### 4. Verify Installation
 
 ```bash
-# Run tests (should see 219 passing)
+# Run tests (should see 235 passing)
 pytest tests/ -v --override-ini="addopts="
 
 # Try CLI
