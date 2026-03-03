@@ -196,8 +196,9 @@ def batch_config_section(bids_root: Path, eegcpm_path: Path):
     st.subheader("Subject Selection")
 
     subjects = scan_subjects(bids_root)
-
+   
     if not subjects:
+        print("subjects scanned:\t", subjects)
         st.error("No subjects found in BIDS directory")
         return None
 

@@ -7,22 +7,24 @@ from pathlib import Path
 import numpy as np
 import mne
 
-from eegcpm.cli.preprocess import _find_input_files
+from eegcpm.cli.preprocess import _find_input_files, read_raw_eeg
+from eegcpm.data.bids_utils import find_eeg_run_files
+
+
+@pytest.fixture
+def sample_raw():
+    """Module-level sample raw object for sharing across test classes."""
+    info = mne.create_info(
+        ch_names=["EEG 001", "EEG 002", "EEG 003"],
+        sfreq=256.0,
+        ch_types="eeg",
+    )
+    data = np.random.randn(3, 256 * 10)
+    return mne.io.RawArray(data, info)
 
 
 class TestFindInputFiles:
     """Test _find_input_files function for multi-format file detection."""
-
-    @pytest.fixture
-    def sample_raw(self):
-        """Create a sample raw object for testing."""
-        info = mne.create_info(
-            ch_names=["EEG 001", "EEG 002", "EEG 003"],
-            sfreq=256.0,
-            ch_types="eeg",
-        )
-        data = np.random.randn(3, 256 * 10)  # 10 seconds of data
-        return mne.io.RawArray(data, info)
 
     def create_bids_structure(self, tmpdir, subject_id, task, has_session=True):
         """Helper to create BIDS directory structure."""
@@ -310,3 +312,173 @@ class TestFindInputFiles:
 
             assert result["file_type"] == "NOT_FOUND"
             assert len(result["files"]) == 0
+
+
+class TestFindEegRunFiles:
+    """Tests for find_eeg_run_files in bids_utils."""
+
+    def make_subject_dir(self, tmpdir, subject_id, sessions=None):
+        """Create BIDS subject directory, optionally with session subdirectories."""
+        subject_dir = Path(tmpdir) / f"sub-{subject_id}"
+        if sessions:
+            for ses in sessions:
+                (subject_dir / f"ses-{ses}" / "eeg").mkdir(parents=True, exist_ok=True)
+        else:
+            (subject_dir / "eeg").mkdir(parents=True, exist_ok=True)
+        return subject_dir
+
+    def test_single_session_single_file(self):
+        """Test finding a single file within one session."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subject_id, task = "001", "rest"
+            subject_dir = self.make_subject_dir(tmpdir, subject_id, sessions=["01"])
+            f = subject_dir / "ses-01" / "eeg" / f"sub-{subject_id}_ses-01_task-{task}_eeg.vhdr"
+            f.touch()
+
+            result = find_eeg_run_files(subject_dir, subject_id, task)
+
+            assert result is not None
+            assert result["file_type"] == "BrainVision"
+            assert result["files"] == [f]
+
+    def test_single_session_run_files(self):
+        """Test finding run-based files (_run-*) within one session."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subject_id, task = "001", "rest"
+            subject_dir = self.make_subject_dir(tmpdir, subject_id, sessions=["01"])
+            eeg_dir = subject_dir / "ses-01" / "eeg"
+            run_files = []
+            for run in ["01", "02"]:
+                f = eeg_dir / f"sub-{subject_id}_ses-01_task-{task}_run-{run}_eeg.vhdr"
+                f.touch()
+                run_files.append(f)
+
+            result = find_eeg_run_files(subject_dir, subject_id, task)
+
+            assert result is not None
+            assert len(result["files"]) == 2
+            assert result["files"] == sorted(run_files)
+
+    def test_multiple_sessions_collects_all_files(self):
+        """Test that files are collected across all sessions."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subject_id, task = "001", "rest"
+            subject_dir = self.make_subject_dir(tmpdir, subject_id, sessions=["01", "02"])
+            expected = []
+            for ses in ["01", "02"]:
+                f = subject_dir / f"ses-{ses}" / "eeg" / f"sub-{subject_id}_ses-{ses}_task-{task}_eeg.vhdr"
+                f.touch()
+                expected.append(f)
+
+            result = find_eeg_run_files(subject_dir, subject_id, task)
+
+            assert result is not None
+            assert len(result["files"]) == 2
+            assert set(result["files"]) == set(expected)
+
+    def test_no_session_single_file(self):
+        """Test finding a single file with no session directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subject_id, task = "001", "rest"
+            subject_dir = self.make_subject_dir(tmpdir, subject_id)
+            f = subject_dir / "eeg" / f"sub-{subject_id}_task-{task}_eeg.vhdr"
+            f.touch()
+
+            result = find_eeg_run_files(subject_dir, subject_id, task)
+
+            assert result is not None
+            assert result["file_type"] == "BrainVision"
+            assert result["files"] == [f]
+
+    def test_no_session_run_files(self):
+        """Test finding run-based files with no session directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subject_id, task = "001", "rest"
+            subject_dir = self.make_subject_dir(tmpdir, subject_id)
+            eeg_dir = subject_dir / "eeg"
+            run_files = []
+            for run in ["01", "02", "03"]:
+                f = eeg_dir / f"sub-{subject_id}_task-{task}_run-{run}_eeg.vhdr"
+                f.touch()
+                run_files.append(f)
+
+            result = find_eeg_run_files(subject_dir, subject_id, task)
+
+            assert result is not None
+            assert len(result["files"]) == 3
+            assert result["files"] == sorted(run_files)
+
+    def test_returns_none_when_not_found(self):
+        """Test returns None when no matching files exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subject_dir = Path(tmpdir) / "sub-NONE"
+            subject_dir.mkdir()
+
+            result = find_eeg_run_files(subject_dir, "NONE", "rest")
+
+            assert result is None
+
+    def test_format_priority(self):
+        """Test that FIF takes priority over other formats."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subject_id, task = "001", "rest"
+            subject_dir = self.make_subject_dir(tmpdir, subject_id, sessions=["01"])
+            eeg_dir = subject_dir / "ses-01" / "eeg"
+            (eeg_dir / f"sub-{subject_id}_ses-01_task-{task}_eeg.fif").touch()
+            (eeg_dir / f"sub-{subject_id}_ses-01_task-{task}_eeg.vhdr").touch()
+
+            result = find_eeg_run_files(subject_dir, subject_id, task)
+
+            assert result["file_type"] == "FIF"
+
+    def test_skips_session_without_eeg_dir(self):
+        """Test that sessions missing an eeg/ subdirectory are skipped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subject_id, task = "001", "rest"
+            subject_dir = Path(tmpdir) / f"sub-{subject_id}"
+            (subject_dir / "ses-01").mkdir(parents=True)  # no eeg/ inside
+            eeg_dir = subject_dir / "ses-02" / "eeg"
+            eeg_dir.mkdir(parents=True)
+            f = eeg_dir / f"sub-{subject_id}_ses-02_task-{task}_eeg.vhdr"
+            f.touch()
+
+            result = find_eeg_run_files(subject_dir, subject_id, task)
+
+            assert result is not None
+            assert result["files"] == [f]
+
+    def test_wrong_task_not_found(self):
+        """Test that files for a different task are not returned."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subject_id = "001"
+            subject_dir = self.make_subject_dir(tmpdir, subject_id, sessions=["01"])
+            eeg_dir = subject_dir / "ses-01" / "eeg"
+            (eeg_dir / f"sub-{subject_id}_ses-01_task-oddball_eeg.vhdr").touch()
+
+            result = find_eeg_run_files(subject_dir, subject_id, task="rest")
+
+            assert result is None
+
+
+class TestReadRawEeg:
+    """Tests for read_raw_eeg function."""
+
+    def test_unsupported_extension_raises_value_error(self):
+        """Test that an unsupported extension raises ValueError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_file = Path(tmpdir) / "test_eeg.xyz"
+            fake_file.touch()
+
+            with pytest.raises(ValueError, match="Unsupported EEG file extension"):
+                read_raw_eeg(fake_file)
+
+    def test_reads_fif_file(self, sample_raw):
+        """Test that a valid FIF file is read successfully."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fif_file = Path(tmpdir) / "test_eeg.fif"
+            sample_raw.save(fif_file, overwrite=True, verbose=False)
+
+            raw = read_raw_eeg(fif_file)
+
+            assert raw is not None
+            assert len(raw.ch_names) == len(sample_raw.ch_names)

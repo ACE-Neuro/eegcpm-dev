@@ -17,8 +17,8 @@ class Project:
         last_accessed: Optional[str] = None
     ):
         self.name = name
-        self.bids_root = bids_root
-        self.eegcpm_root = eegcpm_root
+        self.bids_root = str(Path(bids_root).resolve())
+        self.eegcpm_root = str(Path(eegcpm_root).resolve())
         self.last_accessed = last_accessed or datetime.now().isoformat()
 
     def to_dict(self) -> Dict:
