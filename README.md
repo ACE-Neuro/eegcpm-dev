@@ -2,7 +2,7 @@
 
 ![Private](https://img.shields.io/badge/repo-private-red)
 ![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue)
-![Tests](https://img.shields.io/badge/tests-246%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-253%20passing-brightgreen)
 
 ## Project Overview
 
@@ -40,7 +40,7 @@
 
 | Metric | Value |
 |--------|-------|
-| Tests | 246 passing |
+| Tests | 253 passing |
 | CLI Commands | 7 |
 | UI Pages | 12 |
 | Connectivity Methods | 13 |
@@ -83,7 +83,7 @@
 git clone https://github.com/clivehywong/eegcpm-dev.git
 cd eegcpm-dev/eegcpm-0.1
 pip install -e ".[dev]"
-pytest tests/ -v  # Should see 246 passing
+pytest tests/ -v  # Should see 253 passing
 ```
 
 ### Run the UI
@@ -118,7 +118,7 @@ eegcpm-dev/                    # Private development repo
 │   │   ├── ui/               # 12 Streamlit pages
 │   │   ├── evaluation/       # Prediction framework
 │   │   └── ...
-│   ├── tests/                # 246 tests
+│   ├── tests/                # 253 tests
 │   └── README.md             # User documentation
 ├── planning/                  # Architecture docs (6 files)
 ├── implementation/            # Development history
