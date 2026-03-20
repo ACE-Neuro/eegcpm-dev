@@ -6,6 +6,9 @@ This page allows you to:
 3. Preview and save task configuration YAML files
 """
 
+from eegcpm.modules.epochs import sanitize_name
+from eegcpm.core.paths import EEGCPMPaths
+from eegcpm.ui.utils import scan_subjects, scan_tasks
 import streamlit as st
 from pathlib import Path
 import sys
@@ -15,9 +18,6 @@ from collections import Counter
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from eegcpm.ui.utils import scan_subjects, scan_tasks
-from eegcpm.core.paths import EEGCPMPaths
 
 
 def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None = 50) -> dict:
@@ -494,8 +494,12 @@ def main():
                 "- You're interested in RT effects on brain activity\n"
                 "- You need to filter out trials with missing/invalid responses")
 
-        # Check if response mapping exists in loaded config
-        loaded_response = loaded_config.get('response_mapping', {}) if loaded_config else {}
+        # Check if response mapping exists in loaded config (legacy)
+        # loaded_response = loaded_config.get('response_mapping', {}) if loaded_config else {}
+        
+        # fails when response_mapping key exists but is explicitly null in YAML
+        # Use `or {}` to handle the case where response_mapping key exists but is explicitly null
+        loaded_response = (loaded_config.get('response_mapping') or {}) if loaded_config else {}
         has_response = bool(loaded_response)
 
         enable_response = st.checkbox("Enable Response Mapping", value=has_response)
@@ -515,7 +519,8 @@ def main():
             st.markdown("Define how values in the response column map to categories:")
 
             # Edit response categories
-            for key in list(st.session_state.response_categories.keys()):
+            # for key in list(st.session_state.response_categories.keys()): (legacy)
+            for key in list(st.session_state.get("response_categories", [])):
                 col1, col2, col3 = st.columns([2, 2, 1])
                 with col1:
                     st.text_input("Category", value=key, disabled=True, key=f"resp_cat_{key}")
@@ -641,7 +646,6 @@ def main():
 
                 st.caption("💡 Typical healthy EEG variance: 10-50 µV")
 
-
         else:
             eeg_reject = None
             eog_reject = None
@@ -736,7 +740,7 @@ def main():
         if enable_response:
             config_dict['response_mapping'] = {
                 'response_column': response_column,
-                'categories': st.session_state.response_categories
+                'categories': st.session_state.get('response_categories', [])
             }
 
             if rt_column != 'None':
