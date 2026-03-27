@@ -11,6 +11,7 @@ from typing import Dict, Any
 
 from eegcpm.core.paths import EEGCPMPaths
 from eegcpm.ui.utils.executor import run_eegcpm_command
+from eegcpm.ui.session_persistence import restore_project_from_storage
 
 
 def main():
@@ -26,6 +27,9 @@ def main():
     Multi-subject mode: Extract epochs from all subjects with consistent task configuration.
     Generates QC reports for each subject.
     """)
+
+    # Restore project from localStorage if session state was wiped by a refresh
+    restore_project_from_storage()
 
     # Check for project root
     if 'eegcpm_root' not in st.session_state:

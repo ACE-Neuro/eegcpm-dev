@@ -12,6 +12,7 @@ from datetime import datetime
 import mne
 
 from eegcpm.core.paths import EEGCPMPaths
+from eegcpm.ui.session_persistence import restore_project_from_storage
 
 
 def load_inclusion_state(state_file: Path) -> dict:
@@ -42,6 +43,9 @@ def main():
     st.markdown("""
     Review epoch extraction results across all subjects and select which to include in downstream analysis.
     """)
+
+    # Restore project from localStorage if session state was wiped by a refresh
+    restore_project_from_storage()
 
     # Check for project root
     if 'eegcpm_root' not in st.session_state:
