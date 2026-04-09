@@ -20,7 +20,17 @@ from eegcpm.ui.utils import scan_subjects, scan_tasks
 from eegcpm.core.paths import EEGCPMPaths
 
 
-def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None = 50) -> dict:
+# Scan BIDS EEG event files for the selected task 
+def scan_button_on_click(paths: EEGCPMPaths, selected_task: any, max_subjects: any, selected_col: any):
+    with st.spinner(f"Scanning events for task '{selected_task}'..."):
+        event_data = scan_events_from_bids(
+            paths.bids_root, selected_task, max_subjects = max_subjects, event_categorization_column = selected_col)
+        st.session_state.event_data = event_data
+        st.success(
+            f"✓ Scanned {event_data['sampling_info']['total_files']} files, found {event_data['sampling_info']['total_events']} events")
+
+
+def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None = 50, event_categorization_column: str | None = None) -> dict:
     """Scan BIDS events.tsv files to find unique event types and counts.
 
     Args:
@@ -45,15 +55,17 @@ def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None =
     if max_subjects is not None:
         subject_dirs = subject_dirs[:max_subjects]
 
+    categorization_options = []
     # Scan subject directories
     for subject_dir in subject_dirs:
         if not subject_dir.is_dir():
             continue
 
-        # Find events.tsv files for this task
-        events_files = list(subject_dir.rglob(f"*task-{task}*_events.tsv"))
-
-        for events_file in events_files:
+        # Find events.tsv files inside eeg folder for each session
+        events_files = list(subject_dir.rglob(f"eeg/*task-{task}*_events.tsv"))
+        # print("subject dir:\t", subject_dir)
+        # print("event files:\t", events_files)
+        for index, events_file in enumerate(events_files):
             try:
                 df = pd.read_csv(events_file, sep='\t')
                 total_files += 1
@@ -61,15 +73,43 @@ def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None =
 
                 # Track column names
                 columns_set.update(df.columns.tolist())
+                # print("df.columns.tolist():\t", df.columns.tolist())
+                # print("columns set:\t", columns_set)
+                # print("event_names:\t", event_names)
+                
+                # Count event types (usually in 'trial_type' column) (legacy)
+                # if 'trial_type' in df.columns:
+                #     event_names.update(df['trial_type'].dropna().astype(str).tolist())
 
-                # Count event types (usually in 'trial_type' column)
-                if 'trial_type' in df.columns:
-                    event_names.update(df['trial_type'].dropna().astype(str).tolist())
+                # Scan available categorical columns in events.tsv
+                categorization_cols = [
+                    col for col in df.columns if df[col].dtype == 'object' or df[col].nunique() < 20]
+                if event_categorization_column is not None:
+                    priority_cols = [event_categorization_column]
+                else:
+                    priority_cols = ['trial_type', 'Correct',
+                                     'stimulus', 'response', 'condition', 'Match']
+                
+                categorization_options += categorization_cols
+
+                for col in priority_cols:
+                    if col in df.columns:
+                        event_names.update(
+                            df[col].dropna().astype(str).tolist())
+                        # Optional logging
+                        # print(f"Using '{col}' for event names")
+                        break
+                    else:
+                        # print("No standard event column found - skipping")
+                        pass
 
             except Exception as e:
                 st.warning(f"Could not read {events_file.name}: {e}")
                 continue
 
+    # Remove duplicates from categorization options while preserving list format
+    st.session_state.categorization_options = list(set(categorization_options))
+    
     return {
         'event_names': event_names,
         'columns': sorted(list(columns_set)),
@@ -142,6 +182,18 @@ def main():
         help="Select which task to configure"
     )
 
+    # Initialize session state
+    if 'event_data' not in st.session_state:
+        st.session_state.event_data = None
+    if 'config_name' not in st.session_state:
+        st.session_state.config_name = selected_task
+    if 'loaded_config' not in st.session_state:
+        st.session_state.loaded_config = None
+    if 'categorization_col' not in st.session_state:
+        st.session_state.categorization_col = None
+    if 'categorization_options' not in st.session_state:
+        st.session_state.categorization_options = None
+
     # Load existing config section
     st.sidebar.markdown("---")
     st.sidebar.header("📂 Load Existing Config")
@@ -194,7 +246,21 @@ def main():
             step=10,
             help="Limit how many subjects are scanned for events"
         )
-    scan_button = st.sidebar.button("🔍 Scan Events", type="primary")
+    
+    # st.text(f"categorization options:\t {st.session_state.categorization_options}")
+
+    # Display available categorization options
+    if st.session_state.categorization_options is not None:
+        selected_col = st.sidebar.selectbox(
+            "Pick column for event names categorization:",
+            options=st.session_state.categorization_options,
+            help="Choose trial categorization (e.g., trial_type, Correct, SetSize)"
+        )
+    else:
+        selected_col = None
+
+    st.sidebar.button("🔍 Scan Events", type="primary", on_click=scan_button_on_click, args=[
+                      paths, selected_task, max_subjects, selected_col])
 
     # Clear config button
     if st.sidebar.button("🆕 New Config", help="Clear loaded config and start fresh"):
@@ -203,14 +269,6 @@ def main():
         st.session_state.response_categories = {'correct': 1, 'incorrect': 0}
         st.session_state.config_name = selected_task
         st.rerun()
-
-    # Initialize session state
-    if 'event_data' not in st.session_state:
-        st.session_state.event_data = None
-    if 'config_name' not in st.session_state:
-        st.session_state.config_name = selected_task
-    if 'loaded_config' not in st.session_state:
-        st.session_state.loaded_config = None
 
     # Auto-load matching config if exists (only on first load)
     if 'auto_loaded' not in st.session_state:
@@ -241,12 +299,12 @@ def main():
         if 'response_categories' not in st.session_state:
             st.session_state.response_categories = {'correct': 1, 'incorrect': 0}
 
-    # Scan events from BIDS
-    if scan_button:
-        with st.spinner(f"Scanning events for task '{selected_task}'..."):
-            event_data = scan_events_from_bids(paths.bids_root, selected_task, max_subjects=max_subjects)
-            st.session_state.event_data = event_data
-            st.success(f"✓ Scanned {event_data['sampling_info']['total_files']} files, found {event_data['sampling_info']['total_events']} events")
+    # Scan events from BIDS (legacy)
+    # if scan_button:
+    #     with st.spinner(f"Scanning events for task '{selected_task}'..."):
+    #         event_data = scan_events_from_bids(paths.bids_root, selected_task, max_subjects=max_subjects)
+    #         st.session_state.event_data = event_data
+    #         st.success(f"✓ Scanned {event_data['sampling_info']['total_files']} files, found {event_data['sampling_info']['total_events']} events")
 
     # Main interface
     if st.session_state.event_data is None:
@@ -297,6 +355,7 @@ def main():
         {'Event Type': event, 'Count': count}
         for event, count in event_data['event_names'].most_common()
     ])
+    # print(event_df)
     st.dataframe(event_df, width='stretch', hide_index=True)
 
     # Show available columns
@@ -494,8 +553,12 @@ def main():
                 "- You're interested in RT effects on brain activity\n"
                 "- You need to filter out trials with missing/invalid responses")
 
-        # Check if response mapping exists in loaded config
-        loaded_response = loaded_config.get('response_mapping', {}) if loaded_config else {}
+        # Check if response mapping exists in loaded config (legacy)
+        # loaded_response = loaded_config.get('response_mapping', {}) if loaded_config else {}
+
+        # fails when response_mapping key exists but is explicitly null in YAML
+        # Use `or {}` to handle the case where response_mapping key exists but is explicitly null
+        loaded_response = (loaded_config.get('response_mapping') or {}) if loaded_config else {}
         has_response = bool(loaded_response)
 
         enable_response = st.checkbox("Enable Response Mapping", value=has_response)
@@ -506,9 +569,11 @@ def main():
 
             response_column = st.selectbox(
                 "Response Column",
-                options=event_data['columns'] if event_data else [default_response_col],
-                index=event_data['columns'].index(default_response_col) if event_data and default_response_col in event_data['columns'] else 0,
-                help="Column in events.tsv containing response data"
+                options = event_data['columns'] if event_data else [
+                    default_response_col],
+                index = event_data['columns'].index(
+                    default_response_col) if event_data and default_response_col in event_data['columns'] else 0,
+                help = "Column in events.tsv containing response data"
             )
 
             st.markdown("**Response Categories**")
