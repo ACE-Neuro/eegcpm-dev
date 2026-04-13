@@ -2,7 +2,7 @@
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-235%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-246%20passed-brightgreen.svg)]()
 
 A comprehensive Python toolbox for EEG preprocessing, source reconstruction, connectivity analysis, and predictive modeling. Implements the Connectome Predictive Modeling (CPM) framework for predicting behavioral/cognitive outcomes from EEG functional connectivity.
 
@@ -31,6 +31,7 @@ A comprehensive Python toolbox for EEG preprocessing, source reconstruction, con
 - **HPC Integration**: SLURM batch processing with checkpoint/resume
 - **GUI**: Streamlit-based web interface
 - **BIDS Compatible**: Works with BIDS-formatted datasets
+- **Multi-Format Support**: FIF, BrainVision, EDF, BDF, EEGLAB, NeuroScan, CURRY
 
 ## Installation
 
@@ -263,7 +264,7 @@ pip install pytest-cov
 python -m pytest tests/ --cov=eegcpm --cov-report=html
 ```
 
-Current test coverage: **235 tests passing**
+Current test coverage: **246 tests passing**
 
 ## Dependencies
 

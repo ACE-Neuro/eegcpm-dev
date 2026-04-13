@@ -20,13 +20,13 @@ from eegcpm.ui.utils import scan_subjects, scan_tasks
 from eegcpm.core.paths import EEGCPMPaths
 
 
-def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int = 10) -> dict:
+def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None = 50) -> dict:
     """Scan BIDS events.tsv files to find unique event types and counts.
 
     Args:
         bids_root: Path to BIDS root directory
         task: Task name to scan
-        max_subjects: Maximum subjects to scan (for speed)
+        max_subjects: Maximum subjects to scan. If None, scans all subjects.
 
     Returns:
         Dictionary with event statistics:
@@ -41,8 +41,12 @@ def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int = 10) ->
     total_files = 0
     total_events = 0
 
+    subject_dirs = sorted(bids_root.glob("sub-*"))
+    if max_subjects is not None:
+        subject_dirs = subject_dirs[:max_subjects]
+
     # Scan subject directories
-    for subject_dir in sorted(bids_root.glob("sub-*"))[:max_subjects]:
+    for subject_dir in subject_dirs:
         if not subject_dir.is_dir():
             continue
 
@@ -177,6 +181,19 @@ def main():
 
     # Scan events button
     st.sidebar.markdown("---")
+    st.sidebar.header("🔍 Scan Settings")
+    scan_all = st.sidebar.checkbox("Scan all subjects", value=False)
+    if scan_all:
+        max_subjects = None
+        st.sidebar.caption("Scanning all subjects (may be slow for large datasets)")
+    else:
+        max_subjects = st.sidebar.number_input(
+            "Max subjects to scan",
+            min_value=1,
+            value=50,
+            step=10,
+            help="Limit how many subjects are scanned for events"
+        )
     scan_button = st.sidebar.button("🔍 Scan Events", type="primary")
 
     # Clear config button
@@ -227,7 +244,7 @@ def main():
     # Scan events from BIDS
     if scan_button:
         with st.spinner(f"Scanning events for task '{selected_task}'..."):
-            event_data = scan_events_from_bids(paths.bids_root, selected_task, max_subjects=20)
+            event_data = scan_events_from_bids(paths.bids_root, selected_task, max_subjects=max_subjects)
             st.session_state.event_data = event_data
             st.success(f"✓ Scanned {event_data['sampling_info']['total_files']} files, found {event_data['sampling_info']['total_events']} events")
 

@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
 import mne
-
-from ..data.bids_utils import BIDSFile, find_subject_runs
+from ..data.bids_utils import BIDSFile, find_subject_runs, read_raw_eeg
 from ..modules.preprocessing import PreprocessingPipeline
 from ..modules.qc.preprocessed_qc import PreprocessedQC
 from ..modules.qc.multirun_qc_report import MultiRunQCReport
@@ -143,7 +142,6 @@ class RunProcessor:
         """
         # Find all runs for this subject/task
         runs = find_subject_runs(self.bids_root, subject_id, task, session=session)
-
         if not runs:
             self._print(f"No runs found for {subject_id} task {task}")
             return []
@@ -229,7 +227,12 @@ class RunProcessor:
                 started_at=datetime.now()
             )
 
-            raw = mne.io.read_raw_fif(bids_file.path, preload=True, verbose=False)
+            # Read FIF file (Legacy)
+            # raw = mne.io.read_raw_fif(bids_file.path, preload=True, verbose=False)
+
+            # Automatically read different eeg standard file with mne
+            raw = read_raw_eeg(bids_file.path)
+
             n_original_channels = len(raw.ch_names)
             logs.append(f"Loaded raw data: {n_original_channels} channels, {raw.n_times} samples ({raw.times[-1]:.1f}s)")
 
