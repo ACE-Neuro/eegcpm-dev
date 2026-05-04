@@ -19,6 +19,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from eegcpm.ui.utils import scan_subjects, scan_tasks
 from eegcpm.core.paths import EEGCPMPaths
 
+def _coerce_value(v):
+    """Convert string values to int/float when possible, keep text as-is."""
+    if isinstance(v, str):
+        try:
+            return int(v)
+        except ValueError:
+            try:
+                return float(v)
+            except ValueError:
+                return v
+    return v
+
+
+# Scan BIDS EEG event files for the selected task
+def scan_button_on_click(paths: EEGCPMPaths, selected_task: any, max_subjects: any, selected_col: any):
+    with st.spinner(f"Scanning events for task '{selected_task}'..."):
+        event_data = scan_events_from_bids(
+            paths.bids_root, selected_task, max_subjects = max_subjects, event_categorization_column = selected_col)
+        st.session_state.event_data = event_data
+        st.success(
+            f"✓ Scanned {event_data['sampling_info']['total_files']} files, found {event_data['sampling_info']['total_events']} events")
+>>>>>>> 0f02ebe (Fix response mapping value type mismatch in Task Configuration)
+
 
 def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None = 50) -> dict:
     """Scan BIDS events.tsv files to find unique event types and counts.
@@ -200,7 +223,7 @@ def main():
     if st.sidebar.button("🆕 New Config", help="Clear loaded config and start fresh"):
         st.session_state.loaded_config = None
         st.session_state.conditions = []
-        st.session_state.response_categories = {'correct': 1, 'incorrect': 0}
+        st.session_state.response_categories = {'correct': '1', 'incorrect': '0'}
         st.session_state.config_name = selected_task
         st.rerun()
 
@@ -233,13 +256,15 @@ def main():
         # Response mapping
         response_mapping = loaded_config.get('response_mapping', {})
         if response_mapping and 'response_categories' not in st.session_state:
-            st.session_state.response_categories = response_mapping.get('categories', {})
+            st.session_state.response_categories = {
+                k: str(v) for k, v in response_mapping.get('categories', {}).items()
+            }
     else:
         # Default initialization
         if 'conditions' not in st.session_state:
             st.session_state.conditions = []
         if 'response_categories' not in st.session_state:
-            st.session_state.response_categories = {'correct': 1, 'incorrect': 0}
+            st.session_state.response_categories = {'correct': '1', 'incorrect': '0'}
 
     # Scan events from BIDS
     if scan_button:
@@ -520,7 +545,7 @@ def main():
                 with col1:
                     st.text_input("Category", value=key, disabled=True, key=f"resp_cat_{key}")
                 with col2:
-                    st.session_state.response_categories[key] = st.number_input(
+                    st.session_state.response_categories[key] = st.text_input(
                         "Value",
                         value=st.session_state.response_categories[key],
                         key=f"resp_val_{key}"
@@ -537,7 +562,7 @@ def main():
             with col2:
                 if st.button("➕ Add Category"):
                     if new_category and new_category not in st.session_state.response_categories:
-                        st.session_state.response_categories[new_category] = 0
+                        st.session_state.response_categories[new_category] = ""
                         st.rerun()
 
             # RT columns (optional)
@@ -736,7 +761,10 @@ def main():
         if enable_response:
             config_dict['response_mapping'] = {
                 'response_column': response_column,
-                'categories': st.session_state.response_categories
+                'categories': {
+                    k: _coerce_value(v)
+                    for k, v in st.session_state.get('response_categories', {}).items()
+                }
             }
 
             if rt_column != 'None':
