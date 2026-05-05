@@ -59,6 +59,12 @@ def scan_sessions(bids_root: Path, subject_id: str) -> List[str]:
             session_id = ses_dir.name[4:]
             sessions.append(session_id)
 
+    # Sessionless BIDS layout: subject_dir/eeg/ exists directly (no ses-* subdirs)
+    # Return a single empty-string session so downstream code can proceed; this
+    # matches the behaviour of find_eeg_run_files() in eegcpm.data.bids_utils
+    if not sessions and (subject_dir / 'eeg').is_dir():
+        sessions = [""]
+
     return sessions
 
 
