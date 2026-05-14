@@ -113,8 +113,15 @@ class MontageStep(ProcessingStep):
             montage = mne.channels.make_standard_montage(self.type)
             source = 'standard'
 
-        # Set montage
-        raw.set_montage(montage, on_missing=self.on_missing, verbose=False)
+        # Set montage with match_alias=True so MNE's official channel aliases
+        # (e.g., Cb1->POO7, Cb2->POO8, T3->T7, M1->TP9) get resolved automatically
+        # See mne._fiff.constants.CHANNEL_LOC_ALIASES for the full alias table
+        raw.set_montage(
+            montage,
+            match_alias=True,
+            on_missing=self.on_missing,
+            verbose=False,
+        )
 
         # After setting montage, drop channels with NaN/Inf positions
         # This happens when the montage doesn't include all channels (e.g., E129 in GSN-HydroCel-129)
