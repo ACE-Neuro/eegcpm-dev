@@ -36,7 +36,7 @@ EEGCPM (EEG Connectome Predictive Modeling) is a Python toolbox for end-to-end E
     ├── README.md                       # User documentation
     ├── pyproject.toml                  # Package config
     ├── eegcpm/                         # Source code
-    ├── tests/                          # Test suite (246 passing)
+    ├── tests/                          # Test suite (253 passing)
     └── config/                         # Example configs
 ```
 
@@ -356,7 +356,7 @@ For details, see `planning/UI_ARCHITECTURE.md`.
 
 ## Current Status
 
-**Working** (246 tests passing):
+**Working** (253 tests passing):
 - ✅ Preprocessing (filtering, ICA, ASR, bad channels)
 - ✅ QC System (raw, preprocessed, epochs, source, connectivity QC)
 - ✅ Epochs (event extraction, rejection, ERPs)
