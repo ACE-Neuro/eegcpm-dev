@@ -7,7 +7,7 @@ import mne
 import numpy as np
 import pytest
 
-from eegcpm.modules.epochs import EpochExtractionModule
+from eegcpm.modules.epochs import EpochExtractionModule, sanitize_name
 
 
 @pytest.fixture
@@ -521,3 +521,27 @@ class TestEpochIntegration:
 
         # Verify ERPs exist
         assert len(erps) > 0
+
+class TestSanitizeName:
+    def test_slash_replaced(self):
+        assert sanitize_name("Stimulus/S  1") == "Stimulus_S_1"
+
+    def test_backslash_replaced(self):
+        assert sanitize_name("Stimulus\\S1") == "Stimulus_S1"
+
+    def test_spaces_replaced(self):
+        assert sanitize_name("my condition") == "my_condition"
+
+    def test_multiple_invalid_chars_collapsed(self):
+        # consecutive invalid chars → single underscore
+        assert sanitize_name("Stimulus/S  1") == "Stimulus_S_1"
+
+    def test_leading_trailing_underscores_stripped(self):
+        assert sanitize_name("/condition/") == "condition"
+
+    def test_clean_name_unchanged(self):
+        assert sanitize_name("stimulus_1") == "stimulus_1"
+
+    def test_empty_string(self):
+        assert sanitize_name("") == ""
+

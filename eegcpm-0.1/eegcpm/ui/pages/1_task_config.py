@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from eegcpm.ui.utils import scan_subjects, scan_tasks
 from eegcpm.core.paths import EEGCPMPaths
+from eegcpm.modules.epochs import sanitize_name
 
 
 def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None = 50) -> dict:
@@ -427,7 +428,7 @@ def main():
         # Add condition button
         if st.button("➕ Add Condition"):
             st.session_state.conditions.append({
-                'name': f'condition_{len(st.session_state.conditions) + 1}',
+                'name': sanitize_name(f'condition_{len(st.session_state.conditions) + 1}'),
                 'event_codes': [],
                 'description': ''
             })
@@ -440,11 +441,15 @@ def main():
                 col1, col2 = st.columns([1, 3])
 
                 with col1:
-                    cond['name'] = st.text_input(
+                    raw_name = st.text_input(
                         "Condition Name",
                         value=cond['name'],
                         key=f"cond_name_{i}"
                     )
+                    sanitized = sanitize_name(raw_name)
+                    if sanitized != raw_name and raw_name:
+                        st.caption(f"Saved as: `{sanitized}`")
+                    cond['name'] = sanitized
 
                 with col2:
                     cond['description'] = st.text_input(

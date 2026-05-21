@@ -1,5 +1,6 @@
 """Epoch extraction module."""
 
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -8,6 +9,11 @@ import mne
 import numpy as np
 
 from eegcpm.pipeline.base import BaseModule, ModuleResult, RawDataModule
+
+
+def sanitize_name(name: str) -> str:
+    """Replace invalid filename characters with underscores."""
+    return re.sub(r'[/\\:*?"<>|\s]+', '_', name).strip('_')
 
 
 class EpochExtractionModule(RawDataModule):
@@ -152,7 +158,9 @@ class EpochExtractionModule(RawDataModule):
 
             # Save ERPs
             for condition, erp in erps.items():
-                erp_path = self.output_dir / f"{subject_id}_{condition}_ave.fif"
+                # erp_path = self.output_dir / f"{subject_id}_{condition}_ave.fif"
+                safe_condition = sanitize_name(condition)
+                erp_path = self.output_dir / f"{subject_id}_{safe_condition}_ave.fif"
                 erp.save(erp_path, overwrite=True, verbose=False)
                 output_files.append(erp_path)
 
