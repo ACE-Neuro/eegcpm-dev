@@ -6,21 +6,23 @@ This page allows you to:
 3. Preview and save task configuration YAML files
 """
 
-from eegcpm.modules.epochs import sanitize_name
-from eegcpm.core.paths import EEGCPMPaths
-from eegcpm.ui.utils import scan_subjects, scan_tasks
-import streamlit as st
-from pathlib import Path
 import sys
-import yaml
-import pandas as pd
 from collections import Counter
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import streamlit as st
+import yaml
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from eegcpm.core.paths import EEGCPMPaths
+from eegcpm.modules.epochs import sanitize_name
+from eegcpm.ui.utils import scan_subjects, scan_tasks
 
-def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None = 50) -> dict:
+def scan_events_from_bids(bids_root: Path, task: str, max_subjects: Optional[int] = 50) -> dict:
     """Scan BIDS events.tsv files to find unique event types and counts.
 
     Args:
@@ -324,6 +326,16 @@ def main():
         help="Human-readable description of this task"
     )
 
+    # Task type - determines the analysis workflow
+    default_task_type = loaded_config.get('task_type', 'event-related') if loaded_config else 'event-related'
+    task_type = st.radio(
+        "Task Type",
+        options=["event-related", "continuous"],
+        index=0 if default_task_type == "event-related" else 1,
+        horizontal=True,
+        help="event-related: time-locked to stimulus events | continuous: resting state or movie"
+    )
+
     # Tab interface for different sections
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "⏱️ Epoch Timing",
@@ -417,7 +429,7 @@ def main():
         # Add condition button
         if st.button("➕ Add Condition"):
             st.session_state.conditions.append({
-                'name': f'condition_{len(st.session_state.conditions) + 1}',
+                'name': sanitize_name(f'condition_{len(st.session_state.conditions) + 1}'),
                 'event_codes': [],
                 'description': ''
             })
@@ -430,11 +442,15 @@ def main():
                 col1, col2 = st.columns([1, 3])
 
                 with col1:
-                    cond['name'] = st.text_input(
+                    raw_name = st.text_input(
                         "Condition Name",
                         value=cond['name'],
                         key=f"cond_name_{i}"
                     )
+                    sanitized = sanitize_name(raw_name)
+                    if sanitized != raw_name and raw_name:
+                        st.caption(f"Saved as: `{sanitized}`")
+                    cond['name'] = sanitized
 
                 with col2:
                     cond['description'] = st.text_input(
@@ -723,6 +739,7 @@ def main():
         config_dict = {
             'task_name': config_name,
             'description': task_description,
+            'task_type': task_type,
             'tmin': float(tmin),
             'tmax': float(tmax),
             'baseline': [float(baseline_start), float(baseline_end)],
