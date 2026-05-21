@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from eegcpm.ui.project_manager import ProjectManager, Project
 from eegcpm.ui.utils import get_bids_info, get_subject_task_matrix
+from eegcpm.ui.session_persistence import save_project_to_storage, clear_project_from_storage
 from eegcpm.core.paths import EEGCPMPaths
 import pandas as pd
 
@@ -215,6 +216,7 @@ def main():
                     if pm.delete_project(selected_option):
                         st.success(f"Deleted project: {selected_option}")
                         st.session_state.current_project_name = None
+                        clear_project_from_storage()
                         st.rerun()
 
     # Handle rename dialog
@@ -290,6 +292,7 @@ def main():
                     st.session_state.current_project_name = project_name
                     st.session_state.bids_root = bids_root
                     st.session_state.eegcpm_root = eegcpm_root
+                    save_project_to_storage()
                     st.success(f"✅ Created project: {project_name}")
                     st.rerun()
 
@@ -306,6 +309,7 @@ def main():
                 st.session_state.current_project_name = project.name
                 st.session_state.bids_root = project.bids_root
                 st.session_state.eegcpm_root = project.eegcpm_root
+                save_project_to_storage()
 
                 # Show project paths
                 st.subheader(f"Project: {project.name}")

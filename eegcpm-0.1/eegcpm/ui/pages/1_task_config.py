@@ -101,6 +101,9 @@ def main():
 
     # Get paths from main app project selection
     from eegcpm.ui.project_manager import ProjectManager
+    from eegcpm.ui.session_persistence import restore_project_from_storage
+
+    restore_project_from_storage()
 
     if 'project_manager' not in st.session_state:
         st.session_state.project_manager = ProjectManager()
@@ -557,6 +560,8 @@ def main():
                 new_category = st.text_input("New Category Name", key="new_resp_cat")
             with col2:
                 if st.button("➕ Add Category"):
+                    if "response_categories" not in st.session_state:
+                        st.session_state.response_categories = {}
                     if new_category and new_category not in st.session_state.response_categories:
                         st.session_state.response_categories[new_category] = 0
                         st.rerun()

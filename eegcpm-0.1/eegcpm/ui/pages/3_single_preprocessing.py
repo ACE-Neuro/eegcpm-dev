@@ -9,6 +9,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from eegcpm.ui.utils import scan_subjects, scan_sessions, scan_tasks, get_bids_info
+from eegcpm.ui.session_persistence import restore_project_from_storage
 from eegcpm.pipeline.run_processor import RunProcessor
 from eegcpm.workflow.state import WorkflowStateManager
 from eegcpm.core.paths import EEGCPMPaths
@@ -25,6 +26,9 @@ def main():
 
     st.title("⚙️ Processing: Single Subject Preprocessing")
     st.markdown("Run preprocessing pipeline on individual subject/session/run")
+
+    # Restore project from localStorage if session state was wiped by a refresh
+    restore_project_from_storage()
 
     # Check if project is configured
     if 'bids_root' not in st.session_state or 'eegcpm_root' not in st.session_state:

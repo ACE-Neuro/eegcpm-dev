@@ -8,6 +8,7 @@ from typing import Dict, Any, List
 from eegcpm.core.paths import EEGCPMPaths
 from eegcpm.core.config import SourceConfig
 from eegcpm.ui.utils.executor import run_eegcpm_command, create_source_config
+from eegcpm.ui.session_persistence import restore_project_from_storage
 
 
 def main():
@@ -23,6 +24,9 @@ def main():
     Configure and run source reconstruction on epoched data.
     Creates source estimates and ROI time courses using inverse methods (dSPM, sLORETA, etc.).
     """)
+
+    # Restore project from localStorage if session state was wiped by a refresh
+    restore_project_from_storage()
 
     # Check for project root
     if 'eegcpm_root' not in st.session_state:

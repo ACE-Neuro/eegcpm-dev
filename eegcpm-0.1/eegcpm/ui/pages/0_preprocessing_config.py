@@ -10,6 +10,7 @@ import sys
 import yaml
 import shutil
 from typing import Dict, Any, List
+from eegcpm.ui.session_persistence import restore_project_from_storage
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -81,6 +82,9 @@ def main():
 
     st.title("🔧 Configuration: Preprocessing")
     st.markdown("Configure preprocessing pipeline parameters (filtering, ICA, ASR, bad channels)")
+
+    # Restore project from localStorage if session state was wiped by a refresh
+    restore_project_from_storage()
 
     # Check if project is configured
     if 'eegcpm_root' not in st.session_state:
