@@ -24,13 +24,13 @@ def _get_storage() -> LocalStorage:
 def save_project_to_storage() -> None:
     """Write current project session state keys to localStorage."""
     ls = _get_storage()
-    for i, key in enumerate(_PERSISTENT_KEYS):
+    for key in _PERSISTENT_KEYS:
         value = st.session_state.get(key)
         if value is not None:
             ls.setItem(
                 itemKey=f"{_LS_NAMESPACE}{key}",
                 itemValue=str(value),
-                key=f"save_{key}_{i}",
+                key=f"save_{key}",
             )
 
 
