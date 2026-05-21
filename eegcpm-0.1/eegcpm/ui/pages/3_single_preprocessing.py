@@ -4,6 +4,7 @@ import streamlit as st
 from pathlib import Path
 import sys
 import yaml
+import pandas as pd
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -13,6 +14,12 @@ from eegcpm.ui.session_persistence import restore_project_from_storage
 from eegcpm.pipeline.run_processor import RunProcessor
 from eegcpm.workflow.state import WorkflowStateManager
 from eegcpm.core.paths import EEGCPMPaths
+
+
+def reset_preprocessing_results():
+    # Clear cached results when selections change to prevent stale data display
+    st.session_state.preprocessing_results = None
+    st.session_state.task_config_for_qc = None
 
 
 def main():
@@ -70,7 +77,8 @@ def main():
         config_selection = st.sidebar.radio(
             "Project Configs",
             options=project_configs,
-            help="Your custom configs in project folder"
+            help="Your custom configs in project folder",
+            on_change=reset_preprocessing_results
         )
         config_file = str(project_config_dir / f"{config_selection}.yaml")
         st.sidebar.success(f"📁 Using project config")
@@ -85,7 +93,8 @@ def main():
             config_selection = st.sidebar.radio(
                 "Templates (Read-Only)",
                 options=template_configs,
-                help="Package templates - copy to project to customize"
+                help="Package templates - copy to project to customize",
+                on_change=reset_preprocessing_results
             )
             config_file = str(template_config_dir / f"{config_selection}.yaml")
         else:
@@ -120,7 +129,8 @@ def main():
     subject_id = st.sidebar.selectbox(
         "Subject",
         options=bids_info['subjects'],
-        help="Select subject to preprocess"
+        help="Select subject to preprocess",
+        on_change=reset_preprocessing_results
     )
 
     # Session dropdown
@@ -132,7 +142,8 @@ def main():
     session = st.sidebar.selectbox(
         "Session",
         options=sessions,
-        help="Select session to preprocess"
+        help="Select session to preprocess",
+        on_change=reset_preprocessing_results
     )
 
     # Task dropdown
@@ -144,7 +155,8 @@ def main():
     task = st.sidebar.selectbox(
         "Task",
         options=tasks,
-        help="Select task to preprocess"
+        help="Select task to preprocess",
+        on_change=reset_preprocessing_results
     )
 
     # Task config selection (optional - for ERP QC)
@@ -155,7 +167,6 @@ def main():
     if task_config_dir.exists():
         for task_config_path in task_config_dir.glob("*.yaml"):
             try:
-                import yaml
                 with open(task_config_path) as f:
                     task_cfg = yaml.safe_load(f)
 
@@ -225,7 +236,8 @@ def main():
     selected_pipeline_option = st.sidebar.selectbox(
         "Output Pipeline",
         options=pipeline_options,
-        help="Select existing pipeline variant or create new one"
+        help="Select existing pipeline variant or create new one",
+        on_change=reset_preprocessing_results
     )
 
     # If "Create New..." is selected, show text input
@@ -364,84 +376,90 @@ def main():
     # Initialize session state for results
     if 'preprocessing_results' not in st.session_state:
         st.session_state.preprocessing_results = None
-    if 'preprocessing_subject' not in st.session_state:
-        st.session_state.preprocessing_subject = None
+    if 'task_config_for_qc' not in st.session_state:
+        st.session_state.task_config_for_qc = None
 
     if st.button("🚀 Run Preprocessing", type="primary", width="stretch"):
-        # Setup state manager using new paths
-        state_db = paths.get_state_db()
-        state_db.parent.mkdir(parents=True, exist_ok=True)
-        state_manager = WorkflowStateManager(state_db)
+        # Placeholder for spinner
+        spinner_placeholder = st.empty()
 
-        # Handle force reprocess - clear old outputs
-        if force_reprocess:
-            from eegcpm.data.bids_utils import find_subject_runs
-            import shutil
+        with spinner_placeholder.container():
+            with st.spinner(f"Processing {subject_id} task {task} session {session}..."):
+                try:
+                    # Setup state manager using new paths
+                    state_db = paths.get_state_db()
+                    state_db.parent.mkdir(parents=True, exist_ok=True)
+                    state_manager = WorkflowStateManager(state_db)
 
-            st.info("🔄 Force reprocess enabled - clearing old outputs...")
+                    # Handle force reprocess - clear old outputs
+                    if force_reprocess:
+                        from eegcpm.data.bids_utils import find_subject_runs
+                        import shutil
 
-            # Find runs for this subject/task
-            runs = find_subject_runs(bids_root_path, subject_id, task, session=session)
+                        st.info("🔄 Force reprocess enabled - clearing old outputs...")
 
-            # Clear output directories for each run
-            for bids_file in runs:
-                run_id = bids_file.run or "01"
-                run_output = paths.get_preprocessing_dir(
-                    pipeline=pipeline,
-                    subject=subject_id,
-                    session=session,
-                    task=task,
-                    run=run_id
-                )
+                        # Find runs for this subject/task
+                        runs = find_subject_runs(bids_root_path, subject_id, task, session=session)
 
-                if run_output.exists():
-                    st.write(f"  Clearing: {run_output}")
-                    shutil.rmtree(run_output)
+                        # Clear output directories for each run
+                        for bids_file in runs:
+                            run_id = bids_file.run or "01"
+                            run_output = paths.get_preprocessing_dir(
+                                pipeline=pipeline,
+                                subject=subject_id,
+                                session=session,
+                                task=task,
+                                run=run_id
+                            )
 
-                # Clear workflow state for this run
-                if state_manager:
-                    state_manager.delete_state(
-                        subject_id=subject_id,
-                        task=task,
-                        pipeline=pipeline,
-                        session=session,
-                        run=run_id
+                            if run_output.exists():
+                                st.write(f"  Clearing: {run_output}")
+                                shutil.rmtree(run_output)
+
+                            # Clear workflow state for this run
+                            if state_manager:
+                                state_manager.delete_state(
+                                    subject_id=subject_id,
+                                    task=task,
+                                    pipeline=pipeline,
+                                    session=session,
+                                    run=run_id
+                                )
+
+                    # Create processor
+                    processor = RunProcessor(
+                        bids_root=bids_root_path,
+                        output_root=output_root,
+                        config=config,
+                        state_manager=state_manager,
+                        verbose=False  # Disable print in Streamlit
                     )
 
-        # Create processor
-        processor = RunProcessor(
-            bids_root=bids_root_path,
-            output_root=output_root,
-            config=config,
-            state_manager=state_manager,
-            verbose=False  # Disable print in Streamlit
-        )
+                    # Run preprocessing
+                    results = processor.process_subject_task(
+                        subject_id=subject_id,
+                        task=task,
+                        session=session,
+                        pipeline=pipeline
+                    )
 
-        # Run preprocessing
-        with st.spinner(f"Processing {subject_id} task {task} session {session}..."):
-            try:
-                results = processor.process_subject_task(
-                    subject_id=subject_id,
-                    task=task,
-                    session=session,
-                    pipeline=pipeline
-                )
+                    # Store results in session state
+                    st.session_state.preprocessing_results = results
+                    st.session_state.preprocessing_subject = subject_id
 
-                # Store results in session state
-                st.session_state.preprocessing_results = results
-                st.session_state.preprocessing_subject = subject_id
+                    # Display results
+                    st.success(f"✅ Processed {len(results)} runs")
 
-                # Display results
-                st.success(f"✅ Processed {len(results)} runs")
-
-            except Exception as e:
-                st.error(f"❌ Error: {e}")
-                import traceback
-                with st.expander("Show traceback"):
-                    st.code(traceback.format_exc())
+                except Exception as e:
+                    st.error(f"❌ Error: {e}")
+                    import traceback
+                    with st.expander("Show traceback"):
+                        st.code(traceback.format_exc())
+        
 
     # Display results (either from just-run or from session state)
     results = st.session_state.preprocessing_results
+    
     if results:
         st.header("📊 Processing Results")
 
@@ -579,5 +597,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import pandas as pd
     main()
