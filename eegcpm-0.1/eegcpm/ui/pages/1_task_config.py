@@ -324,6 +324,16 @@ def main():
         help="Human-readable description of this task"
     )
 
+    # Task type - determines the analysis workflow
+    default_task_type = loaded_config.get('task_type', 'event-related') if loaded_config else 'event-related'
+    task_type = st.radio(
+        "Task Type",
+        options=["event-related", "continuous"],
+        index=0 if default_task_type == "event-related" else 1,
+        horizontal=True,
+        help="event-related: time-locked to stimulus events | continuous: resting state or movie"
+    )
+
     # Tab interface for different sections
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "⏱️ Epoch Timing",
@@ -719,6 +729,7 @@ def main():
         config_dict = {
             'task_name': config_name,
             'description': task_description,
+            'task_type': task_type,
             'tmin': float(tmin),
             'tmax': float(tmax),
             'baseline': [float(baseline_start), float(baseline_end)],
