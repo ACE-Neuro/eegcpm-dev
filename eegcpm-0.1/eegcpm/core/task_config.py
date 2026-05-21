@@ -136,8 +136,34 @@ class TrialSorter:
         """Sort trials by experimental condition."""
         sorted_epochs = {}
         for condition in self.config.conditions:
-            # Get epochs for this condition's event codes
-            condition_epochs = epochs[condition.name]
+            # Get epochs for this condition's event codes (legacy)
+            # condition_epochs = epochs[condition.name]
+
+            try:
+                # First try direct name lookup (condition.name matches event name exactly)
+                condition_epochs = epochs[condition.name]
+            except KeyError:
+                # Fall back to event_codes-based lookup.
+                # Handles cases where condition names (e.g. "target") differ from
+                # event names stored in the epochs (e.g. "Stimulus/S 1").
+                matching_event_names = []
+                for code in condition.event_codes:
+                    if isinstance(code, int):
+                        # Find event names whose numeric code matches
+                        for event_name, event_code in epochs.event_id.items():
+                            if event_code == code:
+                                matching_event_names.append(event_name)
+                    elif isinstance(code, str) and code in epochs.event_id:
+                        matching_event_names.append(code)
+
+                if not matching_event_names:
+                    raise ValueError(
+                        f"Condition '{condition.name}' with event_codes {condition.event_codes} "
+                        f"could not be matched to any events in epochs. "
+                        f"Available events: {list(epochs.event_id.keys())}"
+                    )
+                condition_epochs = epochs[matching_event_names]
+
             sorted_epochs[condition.name] = {
                 'epochs': condition_epochs,
                 'n_trials': len(condition_epochs),

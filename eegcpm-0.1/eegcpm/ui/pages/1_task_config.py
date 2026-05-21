@@ -6,31 +6,49 @@ This page allows you to:
 3. Preview and save task configuration YAML files
 """
 
-import streamlit as st
-from pathlib import Path
 import sys
-import yaml
-import pandas as pd
 from collections import Counter
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import streamlit as st
+import yaml
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from eegcpm.ui.utils import scan_subjects, scan_tasks
 from eegcpm.core.paths import EEGCPMPaths
+from eegcpm.modules.epochs import sanitize_name
+from eegcpm.ui.utils import scan_subjects, scan_tasks
 
 
-# Scan BIDS EEG event files for the selected task 
-def scan_button_on_click(paths: EEGCPMPaths, selected_task: any, max_subjects: any, selected_col: any):
+def scan_button_on_click(
+    paths: EEGCPMPaths,
+    selected_task: str,
+    max_subjects: Optional[int],
+    selected_col: Optional[str],
+) -> None:
     with st.spinner(f"Scanning events for task '{selected_task}'..."):
         event_data = scan_events_from_bids(
-            paths.bids_root, selected_task, max_subjects = max_subjects, event_categorization_column = selected_col)
+            paths.bids_root,
+            selected_task,
+            max_subjects=max_subjects,
+            event_categorization_column=selected_col,
+        )
         st.session_state.event_data = event_data
         st.success(
-            f"✓ Scanned {event_data['sampling_info']['total_files']} files, found {event_data['sampling_info']['total_events']} events")
+            f"✓ Scanned {event_data['sampling_info']['total_files']} files, "
+            f"found {event_data['sampling_info']['total_events']} events"
+        )
 
 
-def scan_events_from_bids(bids_root: Path, task: str, max_subjects: int | None = 50, event_categorization_column: str | None = None) -> dict:
+def scan_events_from_bids(
+    bids_root: Path,
+    task: str,
+    max_subjects: Optional[int] = 50,
+    event_categorization_column: Optional[str] = None,
+) -> dict:
     """Scan BIDS events.tsv files to find unique event types and counts.
 
     Args:
@@ -139,6 +157,9 @@ def main():
 
     # Get paths from main app project selection
     from eegcpm.ui.project_manager import ProjectManager
+    from eegcpm.ui.session_persistence import restore_project_from_storage
+
+    restore_project_from_storage()
 
     if 'project_manager' not in st.session_state:
         st.session_state.project_manager = ProjectManager()
@@ -250,7 +271,7 @@ def main():
     # st.text(f"categorization options:\t {st.session_state.categorization_options}")
 
     # Display available categorization options
-    if st.session_state.categorization_options is not None:
+    if st.session_state.categorization_options:
         selected_col = st.sidebar.selectbox(
             "Pick column for event names categorization:",
             options=st.session_state.categorization_options,
@@ -383,6 +404,16 @@ def main():
         help="Human-readable description of this task"
     )
 
+    # Task type - determines the analysis workflow
+    default_task_type = loaded_config.get('task_type', 'event-related') if loaded_config else 'event-related'
+    task_type = st.radio(
+        "Task Type",
+        options=["event-related", "continuous"],
+        index=0 if default_task_type == "event-related" else 1,
+        horizontal=True,
+        help="event-related: time-locked to stimulus events | continuous: resting state or movie"
+    )
+
     # Tab interface for different sections
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "⏱️ Epoch Timing",
@@ -476,7 +507,7 @@ def main():
         # Add condition button
         if st.button("➕ Add Condition"):
             st.session_state.conditions.append({
-                'name': f'condition_{len(st.session_state.conditions) + 1}',
+                'name': sanitize_name(f'condition_{len(st.session_state.conditions) + 1}'),
                 'event_codes': [],
                 'description': ''
             })
@@ -489,11 +520,15 @@ def main():
                 col1, col2 = st.columns([1, 3])
 
                 with col1:
-                    cond['name'] = st.text_input(
+                    raw_name = st.text_input(
                         "Condition Name",
                         value=cond['name'],
                         key=f"cond_name_{i}"
                     )
+                    sanitized = sanitize_name(raw_name)
+                    if sanitized != raw_name and raw_name:
+                        st.caption(f"Saved as: `{sanitized}`")
+                    cond['name'] = sanitized
 
                 with col2:
                     cond['description'] = st.text_input(
@@ -555,7 +590,6 @@ def main():
 
         # Check if response mapping exists in loaded config (legacy)
         # loaded_response = loaded_config.get('response_mapping', {}) if loaded_config else {}
-
         # fails when response_mapping key exists but is explicitly null in YAML
         # Use `or {}` to handle the case where response_mapping key exists but is explicitly null
         loaded_response = (loaded_config.get('response_mapping') or {}) if loaded_config else {}
@@ -580,7 +614,8 @@ def main():
             st.markdown("Define how values in the response column map to categories:")
 
             # Edit response categories
-            for key in list(st.session_state.response_categories.keys()):
+            # for key in list(st.session_state.response_categories.keys()): (legacy)
+            for key in list(st.session_state.get("response_categories", [])):
                 col1, col2, col3 = st.columns([2, 2, 1])
                 with col1:
                     st.text_input("Category", value=key, disabled=True, key=f"resp_cat_{key}")
@@ -601,6 +636,8 @@ def main():
                 new_category = st.text_input("New Category Name", key="new_resp_cat")
             with col2:
                 if st.button("➕ Add Category"):
+                    if "response_categories" not in st.session_state:
+                        st.session_state.response_categories = {}
                     if new_category and new_category not in st.session_state.response_categories:
                         st.session_state.response_categories[new_category] = 0
                         st.rerun()
@@ -706,7 +743,6 @@ def main():
 
                 st.caption("💡 Typical healthy EEG variance: 10-50 µV")
 
-
         else:
             eeg_reject = None
             eog_reject = None
@@ -784,6 +820,7 @@ def main():
         config_dict = {
             'task_name': config_name,
             'description': task_description,
+            'task_type': task_type,
             'tmin': float(tmin),
             'tmax': float(tmax),
             'baseline': [float(baseline_start), float(baseline_end)],
@@ -801,7 +838,7 @@ def main():
         if enable_response:
             config_dict['response_mapping'] = {
                 'response_column': response_column,
-                'categories': st.session_state.response_categories
+                'categories': st.session_state.get('response_categories', {})
             }
 
             if rt_column != 'None':
