@@ -615,7 +615,7 @@ def main():
 
             # Edit response categories
             # for key in list(st.session_state.response_categories.keys()): (legacy)
-            for key in list(st.session_state.get("response_categories", [])):
+            for key in list(st.session_state.get("response_categories", {})):
                 col1, col2, col3 = st.columns([2, 2, 1])
                 with col1:
                     st.text_input("Category", value=key, disabled=True, key=f"resp_cat_{key}")

@@ -64,5 +64,5 @@ def restore_project_from_storage() -> bool:
 def clear_project_from_storage() -> None:
     """Remove project keys from localStorage (e.g. on project delete)."""
     ls = _get_storage()
-    for i, key in enumerate(_PERSISTENT_KEYS):
+    for key in _PERSISTENT_KEYS:
         ls.deleteItem(itemKey=f"{_LS_NAMESPACE}{key}")
