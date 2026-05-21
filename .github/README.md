@@ -25,7 +25,7 @@ pip install -e ".[dev]"
 ### 4. Verify Installation
 
 ```bash
-# Run tests (should see 235 passing)
+# Run tests (should see 253 passing)
 pytest tests/ -v --override-ini="addopts="
 
 # Try CLI
@@ -95,7 +95,7 @@ eegcpm-dev/                    # Private development repo
 │   │   ├── modules/          # Analysis modules
 │   │   ├── ui/               # 11 Streamlit pages
 │   │   └── ...
-│   └── tests/                # 219 tests
+│   └── tests/                # 253 tests
 ├── planning/                  # Architecture documentation
 ├── implementation/            # Development history
 └── docs/                      # User documentation

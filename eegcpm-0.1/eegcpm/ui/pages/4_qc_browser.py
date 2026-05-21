@@ -11,6 +11,8 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from eegcpm.ui.utils import scan_subjects, scan_tasks, scan_pipelines
+from eegcpm.ui.session_persistence import restore_project_from_storage
+from eegcpm.core.paths import EEGCPMPaths
 
 
 def find_qc_reports(
@@ -39,7 +41,6 @@ def find_qc_reports(
         QC report metadata
     """
     reports = []
-
     # Search pattern based on filters
     if pipeline:
         search_root = derivatives_root / f'pipeline-{pipeline}'
@@ -168,18 +169,59 @@ def main():
     st.markdown("Browse and view quality control reports for all processing stages")
 
     # Sidebar filters
-    st.sidebar.header("🔍 Filters")
+    if "qc_derivatives" in st.session_state:
+        st.sidebar.header("🔍 Filters")
 
-    derivatives_root = st.sidebar.text_input(
-        "Derivatives Root",
-        value="/Volumes/Work/data/hbn/derivatives",
-        help="Path to derivatives directory"
-    )
+    # Restore project from localStorage if session state was wiped by a refresh
+    restore_project_from_storage()
 
+    # Auto-detect derivatives path from active project (bids_root is set on the home page)
+    auto_derivatives = ""
+
+    if "bids_root" in st.session_state and st.session_state.bids_root:
+        auto_derivatives = str(Path(st.session_state.bids_root).parent / "derivatives")
+
+    # Initialise session state on first load (or after browser reload wipes state)
+    if "qc_derivatives_root" not in st.session_state or len(st.session_state.get("qc_derivatives_root", "")) == 0:
+        st.session_state.qc_derivatives_root = auto_derivatives  # may be "" if no project set
+    
+    # tracks whether user clicked Reset Path
+    if "qc_path_reset" not in st.session_state:
+        st.session_state.qc_path_reset = False  
+
+    # If a path is already confirmed, show it as a read-only label with a Reset button
+    if st.session_state.qc_derivatives_root and not st.session_state.qc_path_reset:
+        st.sidebar.markdown("**Derivatives Root**")
+        st.sidebar.caption(f"📁 {st.session_state.qc_derivatives_root}")
+        if st.sidebar.button("🔄 Reset Path", use_container_width=True):
+            # Allow user to enter a different path
+            st.session_state.qc_path_reset = True
+            st.rerun()
+        derivatives_root = st.session_state.qc_derivatives_root
+    else:
+        # No path yet (first visit / after reset) — show editable input
+        entered = st.sidebar.text_input(
+            "Derivatives Root",
+            value=st.session_state.qc_derivatives_root,
+            help="Path to derivatives directory"
+        ) if st.session_state.qc_derivatives_root != "" else ""
+
+        if entered != "":
+            if st.sidebar.button("✅ Set Path", use_container_width=True):
+                st.session_state.qc_derivatives_root = entered
+                st.session_state.qc_path_reset = False
+                st.rerun()
+
+        derivatives_root = entered
+        
     derivatives_path = Path(derivatives_root)
 
-    if not derivatives_path.exists():
-        st.error(f"❌ Derivatives directory not found: {derivatives_root}")
+    if not derivatives_path.exists() or derivatives_root == "":
+        if derivatives_root:
+            st.error(f"❌ Derivatives directory not found: {derivatives_root}")
+        else:
+            st.warning("⚠️ No project configured. Please go to the Home page to set up a project.")
+            st.page_link("app.py", label="→ Go to Home", icon="🏠")
         return
 
     # Pipeline filter

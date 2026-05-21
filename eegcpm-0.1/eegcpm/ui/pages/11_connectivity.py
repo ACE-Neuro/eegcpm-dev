@@ -230,6 +230,9 @@ def main():
 
     # Get paths from main app project selection
     from eegcpm.ui.project_manager import ProjectManager
+    from eegcpm.ui.session_persistence import restore_project_from_storage
+
+    restore_project_from_storage()
 
     if 'project_manager' not in st.session_state:
         st.session_state.project_manager = ProjectManager()
