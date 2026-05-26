@@ -385,6 +385,7 @@ set -e  # Exit on error
 
 # Paths
 BIDS_ROOT="{bids_root}"
+PROJECT_ROOT="${{BIDS_ROOT%/bids}}"
 EEGCPM_ROOT="{eegcpm_root}"
 CONFIG_FILE="{config['config_file']}"
 PIPELINE="{config['pipeline_name']}"
@@ -413,7 +414,7 @@ TOTAL={len(config['subjects'])}
     echo "[$CURRENT/$TOTAL] Processing {subject} (task: $TASK)..."
 
     eegcpm preprocess \\
-        --project "$BIDS_ROOT" \\
+        --project "$PROJECT_ROOT" \\
         --config "$CONFIG_FILE" \\
         --pipeline "$PIPELINE" \\
         --subject {subject} \\
@@ -460,6 +461,9 @@ def generate_slurm_script(config: dict, bids_root: Path, eegcpm_root: Path) -> s
     config_filename = Path(str(config['config_file'])).name
     hpc_config_file = f"{hpc_eegcpm}/eegcpm/config/preprocessing/{config_filename}"
 
+    # Derive project root (parent of bids/)
+    hpc_project_root = hpc_bids.rstrip('/').removesuffix('/bids') if hpc_bids.rstrip('/').endswith('/bids') else hpc_bids
+
     # Email line
     email_line = f"#SBATCH --mail-user={hpc_email}" if hpc_email else "# #SBATCH --mail-user=your_email@eduhk.hk"
 
@@ -472,8 +476,8 @@ def generate_slurm_script(config: dict, bids_root: Path, eegcpm_root: Path) -> s
 #SBATCH --mem={hpc_mem}
 #SBATCH --time={hpc_time}
 #SBATCH --array=0-{len(config['subjects'])-1}%{config['parallel_jobs']}
-#SBATCH --output={hpc_bids}/derivatives/preprocessing/{config['pipeline_name']}/slurm_%A_%a.out
-#SBATCH --error={hpc_bids}/derivatives/preprocessing/{config['pipeline_name']}/slurm_%A_%a.err
+#SBATCH --output={hpc_project_root}/derivatives/preprocessing/{config['pipeline_name']}/slurm_%A_%a.out
+#SBATCH --error={hpc_project_root}/derivatives/preprocessing/{config['pipeline_name']}/slurm_%A_%a.err
 #SBATCH --mail-type=END,FAIL
 {email_line}
 
@@ -489,6 +493,7 @@ set -e
 # Paths
 # ============================================================
 BIDS_ROOT="{hpc_bids}"
+PROJECT_ROOT="${{BIDS_ROOT%/bids}}"
 EEGCPM_ROOT="{hpc_eegcpm}"
 CONFIG_FILE="{hpc_config_file}"
 PIPELINE="{config['pipeline_name']}"
@@ -510,7 +515,7 @@ export PATH="${{CONDA_ENV_PATH}}/{hpc_conda_env}/bin:$PATH"
 # ============================================================
 # Create output directory (SLURM fails if log dir doesn't exist)
 # ============================================================
-mkdir -p "$BIDS_ROOT/derivatives/preprocessing/$PIPELINE"
+mkdir -p "$PROJECT_ROOT/derivatives/preprocessing/$PIPELINE"
 
 # ============================================================
 # Subject list
@@ -541,7 +546,7 @@ for TASK in "${{TASKS[@]}}"; do
     echo "--- Processing task: $TASK ---"
 
     eegcpm preprocess \\
-        --project "$BIDS_ROOT" \\
+        --project "$PROJECT_ROOT" \\
         --config "$CONFIG_FILE" \\
         --pipeline "$PIPELINE" \\
         --subject "$SUBJECT" \\
