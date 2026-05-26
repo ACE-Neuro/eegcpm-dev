@@ -120,11 +120,10 @@ squeue -u $USER
 sacct -j <JOB_ID> --brief
 
 # View output log for a specific subject (array index 0)
-cat /path/to/bids/derivatives/preprocessing/standard/slurm_<JOB_ID>_0.out
+cat /path/to/project/derivatives/preprocessing/standard/slurm_<JOB_ID>_0.out
 
 # View error log
-cat /path/to/bids/derivatives/preprocessing/standard/slurm_<JOB_ID>_0.err
-
+cat /path/to/project/derivatives/preprocessing/standard/slurm_<JOB_ID>_0.err
 # Check all failed tasks
 sacct -j <JOB_ID> --state=FAILED --format=JobID,State,ExitCode,Elapsed
 ```
