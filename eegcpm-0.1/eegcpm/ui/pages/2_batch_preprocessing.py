@@ -504,7 +504,7 @@ module purge
 module load anaconda/25.1.1
 
 # Activate conda environment (conda activate not available in scripts)
-CONDA_ENV_PATH=/home/ssschan/.conda/envs
+CONDA_ENV_PATH="${{HOME}}/.conda/envs"
 export PATH="${{CONDA_ENV_PATH}}/{hpc_conda_env}/bin:$PATH"
 
 # ============================================================
