@@ -385,7 +385,7 @@ set -e  # Exit on error
 
 # Paths
 BIDS_ROOT="{bids_root}"
-PROJECT_ROOT="${{BIDS_ROOT%/bids}}"
+PROJECT_ROOT="$(dirname "$BIDS_ROOT")"
 EEGCPM_ROOT="{eegcpm_root}"
 CONFIG_FILE="{config['config_file']}"
 PIPELINE="{config['pipeline_name']}"
@@ -423,7 +423,7 @@ TOTAL={len(config['subjects'])}
         if config['force']:
             script += "        --force \\\n"
 
-        script += """        2>&1 | tee -a "$BIDS_ROOT/derivatives/preprocessing/$PIPELINE/preprocessing.log"
+        script += """        2>&1 | tee -a "$PROJECT_ROOT/derivatives/preprocessing/$PIPELINE/preprocessing.log"
 
     if [ $? -eq 0 ]; then
         echo "  ✓ {subject} completed"
@@ -493,7 +493,7 @@ set -e
 # Paths
 # ============================================================
 BIDS_ROOT="{hpc_bids}"
-PROJECT_ROOT="${{BIDS_ROOT%/bids}}"
+PROJECT_ROOT="$(dirname "$BIDS_ROOT")"
 EEGCPM_ROOT="{hpc_eegcpm}"
 CONFIG_FILE="{hpc_config_file}"
 PIPELINE="{config['pipeline_name']}"
