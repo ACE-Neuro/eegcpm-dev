@@ -254,6 +254,10 @@ def batch_config_section(bids_root: Path, eegcpm_path: Path):
             default=[available_tasks[0]] if available_tasks else []
         )
 
+        if not selected_tasks:
+            st.error("Select at least one task to generate scripts.")
+            return None
+
     # Legacy: single task selection (replaced by multi-task above)
     # task = st.selectbox(
     #     "Task",
