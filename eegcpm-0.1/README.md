@@ -264,7 +264,7 @@ pip install pytest-cov
 python -m pytest tests/ --cov=eegcpm --cov-report=html
 ```
 
-Current test coverage: **257 tests passing**
+Current test coverage: **263 tests passing**
 
 ## Dependencies
 

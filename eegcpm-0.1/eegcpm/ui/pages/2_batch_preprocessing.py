@@ -232,13 +232,34 @@ def batch_config_section(bids_root: Path, eegcpm_path: Path):
         st.info(f"✓ Selected {len(selected_subjects)} subjects (index {start_idx} to {end_idx})")
 
     # Task selection
-    tasks = scan_tasks(bids_root, selected_subjects[0] if selected_subjects else None)
+    st.subheader("Task Selection")
+    # Scan across all subjects to detect all available tasks
+    tasks = scan_tasks(bids_root, None)
+    available_tasks = tasks if tasks else ["rest"]
 
-    task = st.selectbox(
-        "Task",
-        options=tasks if tasks else ["rest"],
-        help="Select task to process"
+    task_mode = st.radio(
+        "Selection mode",
+        options=["All tasks", "Specific tasks"],
+        horizontal=True,
+        key="task_selection_mode"
     )
+
+    if task_mode == "All tasks":
+        selected_tasks = available_tasks
+        st.info(f"✓ Selected all {len(selected_tasks)} tasks")
+    else:
+        selected_tasks = st.multiselect(
+            "Select tasks",
+            options=available_tasks,
+            default=[available_tasks[0]] if available_tasks else []
+        )
+
+    # Legacy: single task selection (replaced by multi-task above)
+    # task = st.selectbox(
+    #     "Task",
+    #     options=tasks if tasks else ["rest"],
+    #     help="Select task to process"
+    # )
 
     # Advanced options
     with st.expander("Advanced Options"):
@@ -256,24 +277,105 @@ def batch_config_section(bids_root: Path, eegcpm_path: Path):
             help="Number of subjects to process in parallel on HPC"
         )
 
+    with st.expander("🖥️ HPC Settings (for SLURM script)"):
+        st.markdown("Configure paths and environment for your HPC cluster.")
+
+        hpc_bids_root = st.text_input(
+            "BIDS root on HPC",
+            value=st.session_state.get('hpc_bids_root', ''),
+            placeholder="/share/ps_clivewong/25SusAttn/bids",
+            help="Path to BIDS data directory on HPC (where sub-XXX folders are)"
+        )
+        if hpc_bids_root:
+            st.session_state['hpc_bids_root'] = hpc_bids_root
+
+        hpc_eegcpm_root = st.text_input(
+            "EEGCPM root on HPC",
+            value=st.session_state.get('hpc_eegcpm_root', ''),
+            placeholder="/share/ps_clivewong/eegcpm-dev/eegcpm-0.1",
+            help="Path to eegcpm-0.1 directory on HPC"
+        )
+        if hpc_eegcpm_root:
+            st.session_state['hpc_eegcpm_root'] = hpc_eegcpm_root
+
+        hpc_conda_env = st.text_input(
+            "Conda environment name",
+            value=st.session_state.get('hpc_conda_env', 'eegcpm'),
+            help="Name of conda environment with eegcpm installed"
+        )
+        if hpc_conda_env:
+            st.session_state['hpc_conda_env'] = hpc_conda_env
+
+        hpc_email = st.text_input(
+            "Email for notifications (optional)",
+            value=st.session_state.get('hpc_email', ''),
+            placeholder="",
+            help="Receive email when jobs finish or fail"
+        )
+        if hpc_email:
+            st.session_state['hpc_email'] = hpc_email
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            hpc_partition = st.selectbox(
+                "Partition",
+                options=["shared_cpu", "shared_gpu_l40", "shared_gpu_h20"],
+                index=0,
+                help="HPC partition to submit jobs to"
+            )
+        with col2:
+            hpc_time = st.text_input(
+                "Time limit",
+                value="02:00:00",
+                help="Max wall time per subject (HH:MM:SS)"
+            )
+        with col3:
+            hpc_mem = st.text_input(
+                "Memory",
+                value="16G",
+                help="Memory allocation per subject"
+            )
+
+        hpc_cpus = st.number_input(
+            "CPUs per subject",
+            min_value=1,
+            max_value=15,
+            value=4,
+            help="Number of CPU cores per subject (max 15 for shared_cpu)"
+        )
+
     return {
         'config_file': config_file,
         'pipeline_name': pipeline_name,
         'subjects': selected_subjects,
-        'task': task,
+        'tasks': selected_tasks,
+        # 'task': task,  # Legacy: single task
         'force': force_reprocess,
-        'parallel_jobs': parallel_jobs
+        'parallel_jobs': parallel_jobs,
+        'hpc': {
+            'bids_root': hpc_bids_root,
+            'eegcpm_root': hpc_eegcpm_root,
+            'conda_env': hpc_conda_env,
+            'email': hpc_email,
+            'partition': hpc_partition,
+            'time': hpc_time,
+            'mem': hpc_mem,
+            'cpus': hpc_cpus,
+        }
     }
 
 
 def generate_local_script(config: dict, bids_root: Path, eegcpm_root: Path) -> str:
     """Generate bash script for local batch preprocessing."""
 
+    tasks_str = " ".join(f'"{t}"' for t in config['tasks'])
+
     script = f"""#!/bin/bash
 # EEGCPM Batch Preprocessing Script
 # Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 # Pipeline: {config['pipeline_name']}
 # Subjects: {len(config['subjects'])}
+# Tasks: {', '.join(config['tasks'])}
 
 set -e  # Exit on error
 
@@ -282,43 +384,52 @@ BIDS_ROOT="{bids_root}"
 EEGCPM_ROOT="{eegcpm_root}"
 CONFIG_FILE="{config['config_file']}"
 PIPELINE="{config['pipeline_name']}"
-TASK="{config['task']}"
+
+# Tasks to process
+TASKS=({tasks_str})
 
 # Create output directories (handled by CLI automatically)
 
 # Process subjects
 TOTAL={len(config['subjects'])}
-CURRENT=0
+
+"""
+
+    script += """for TASK in "${TASKS[@]}"; do
+    echo "========================================"
+    echo "Processing task: $TASK"
+    echo "========================================"
+    CURRENT=0
 
 """
 
     for subject in config['subjects']:
-        script += f"""
-# Subject: {subject}
-CURRENT=$((CURRENT + 1))
-echo "[$CURRENT/$TOTAL] Processing {subject}..."
+        script += f"""    # Subject: {subject}
+    CURRENT=$((CURRENT + 1))
+    echo "[$CURRENT/$TOTAL] Processing {subject} (task: $TASK)..."
 
-eegcpm preprocess \\
-    --project "$BIDS_ROOT" \\
-    --config "$CONFIG_FILE" \\
-    --pipeline "$PIPELINE" \\
-    --subject {subject} \\
-    --task "$TASK" \\
+    eegcpm preprocess \\
+        --project "$BIDS_ROOT" \\
+        --config "$CONFIG_FILE" \\
+        --pipeline "$PIPELINE" \\
+        --subject {subject} \\
+        --task "$TASK" \\
 """
         if config['force']:
-            script += "    --force \\\n"
+            script += "        --force \\\n"
 
-        script += """    2>&1 | tee -a "$BIDS_ROOT/derivatives/preprocessing/$PIPELINE/preprocessing.log"
+        script += """        2>&1 | tee -a "$BIDS_ROOT/derivatives/preprocessing/$PIPELINE/preprocessing.log"
 
-if [ $? -eq 0 ]; then
-    echo "  ✓ {subject} completed"
-else
-    echo "  ✗ {subject} failed"
-fi
+    if [ $? -eq 0 ]; then
+        echo "  ✓ {subject} completed"
+    else
+        echo "  ✗ {subject} failed"
+    fi
 
 """.format(subject=subject)
 
-    script += """
+    script += """done
+
 echo "Batch preprocessing complete!"
 """
 
@@ -328,29 +439,78 @@ echo "Batch preprocessing complete!"
 def generate_slurm_script(config: dict, bids_root: Path, eegcpm_root: Path) -> str:
     """Generate SLURM script for HPC batch preprocessing."""
 
+    tasks_str = " ".join(f'"{t}"' for t in config['tasks'])
+
+    # HPC settings (use placeholders if not configured)
+    hpc = config.get('hpc', {})
+    hpc_bids = hpc.get('bids_root', '') or '/path/to/your/bids/on/hpc'
+    hpc_eegcpm = hpc.get('eegcpm_root', '') or '/path/to/eegcpm-0.1/on/hpc'
+    hpc_conda_env = hpc.get('conda_env', 'eegcpm')
+    hpc_email = hpc.get('email', '')
+    hpc_partition = hpc.get('partition', 'shared_cpu')
+    hpc_time = hpc.get('time', '02:00:00')
+    hpc_mem = hpc.get('mem', '16G')
+    hpc_cpus = hpc.get('cpus', 4)
+
+    # Determine config file path on HPC
+    config_filename = Path(str(config['config_file'])).name
+    hpc_config_file = f"{hpc_eegcpm}/eegcpm/config/preprocessing/{config_filename}"
+
+    # Email line
+    email_line = f"#SBATCH --mail-user={hpc_email}" if hpc_email else "# #SBATCH --mail-user=your_email@eduhk.hk"
+
     script = f"""#!/bin/bash
 #SBATCH --job-name=eegcpm_{config['pipeline_name']}
-#SBATCH --output={bids_root}/derivatives/preprocessing/{config['pipeline_name']}/slurm_%A_%a.out
-#SBATCH --error={bids_root}/derivatives/preprocessing/{config['pipeline_name']}/slurm_%A_%a.err
+#SBATCH --partition={hpc_partition}
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task={hpc_cpus}
+#SBATCH --mem={hpc_mem}
+#SBATCH --time={hpc_time}
 #SBATCH --array=0-{len(config['subjects'])-1}%{config['parallel_jobs']}
-#SBATCH --time=02:00:00
-#SBATCH --mem=16G
-#SBATCH --cpus-per-task=4
+#SBATCH --output={hpc_bids}/derivatives/preprocessing/{config['pipeline_name']}/slurm_%A_%a.out
+#SBATCH --error={hpc_bids}/derivatives/preprocessing/{config['pipeline_name']}/slurm_%A_%a.err
+#SBATCH --mail-type=END,FAIL
+{email_line}
 
 # EEGCPM SLURM Batch Preprocessing
 # Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 # Pipeline: {config['pipeline_name']}
+# Tasks: {', '.join(config['tasks'])}
+# Subjects: {len(config['subjects'])}
 
 set -e
 
+# ============================================================
 # Paths
-BIDS_ROOT="{bids_root}"
-EEGCPM_ROOT="{eegcpm_root}"
-CONFIG_FILE="{config['config_file']}"
+# ============================================================
+BIDS_ROOT="{hpc_bids}"
+EEGCPM_ROOT="{hpc_eegcpm}"
+CONFIG_FILE="{hpc_config_file}"
 PIPELINE="{config['pipeline_name']}"
-TASK="{config['task']}"
 
+# Tasks to process
+TASKS=({tasks_str})
+
+# ============================================================
+# Environment Setup
+# ============================================================
+source /usr/share/modules/init/profile.sh
+module purge
+module load anaconda/25.1.1
+
+# Activate conda environment (conda activate not available in scripts)
+CONDA_ENV_PATH=/home/ssschan/.conda/envs
+export PATH="${{CONDA_ENV_PATH}}/{hpc_conda_env}/bin:$PATH"
+
+# ============================================================
+# Create output directory (SLURM fails if log dir doesn't exist)
+# ============================================================
+mkdir -p "$BIDS_ROOT/derivatives/preprocessing/$PIPELINE"
+
+# ============================================================
 # Subject list
+# ============================================================
 SUBJECTS=(
 """
 
@@ -362,28 +522,40 @@ SUBJECTS=(
 # Get subject for this array task
 SUBJECT="${{SUBJECTS[$SLURM_ARRAY_TASK_ID]}}"
 
+echo "========================================"
 echo "SLURM Array Task: $SLURM_ARRAY_TASK_ID / {len(config['subjects'])}"
 echo "Processing subject: $SUBJECT"
+echo "Tasks: {', '.join(config['tasks'])}"
+echo "Pipeline: {config['pipeline_name']}"
+echo "Started: $(date)"
+echo "========================================"
 
-# Load modules (adjust for your HPC environment)
-# module load python/3.10
-# source /path/to/venv/bin/activate
+# ============================================================
+# Run preprocessing (loop through all tasks)
+# ============================================================
+for TASK in "${{TASKS[@]}}"; do
+    echo "--- Processing task: $TASK ---"
 
-# Run preprocessing
-eegcpm preprocess \\
-    --project "$BIDS_ROOT" \\
-    --config "$CONFIG_FILE" \\
-    --pipeline "$PIPELINE" \\
-    --subject "$SUBJECT" \\
-    --task "$TASK" \\
+    eegcpm preprocess \\
+        --project "$BIDS_ROOT" \\
+        --config "$CONFIG_FILE" \\
+        --pipeline "$PIPELINE" \\
+        --subject "$SUBJECT" \\
+        --task "$TASK" \\
 """
 
     if config['force']:
-        script += "    --force \\\n"
+        script += "        --force \\\n"
 
-    script += """    2>&1
+    script += """        2>&1
 
-echo "Subject $SUBJECT complete"
+    echo "--- Task $TASK complete for $SUBJECT ---"
+done
+
+echo "========================================"
+echo "Subject $SUBJECT complete (all tasks)"
+echo "Finished: $(date)"
+echo "========================================"
 """
 
     return script
@@ -402,7 +574,7 @@ def script_generation_section(batch_config: dict, bids_root: Path, eegcpm_root: 
     - Pipeline: `{batch_config['pipeline_name']}`
     - Config: `{batch_config['config_file'].name}`
     - Subjects: {len(batch_config['subjects'])}
-    - Task: `{batch_config['task']}`
+    - Tasks: `{', '.join(batch_config['tasks'])}` ({len(batch_config['tasks'])} tasks)
     - Force reprocess: {'Yes' if batch_config['force'] else 'No'}
     """)
 
@@ -437,8 +609,8 @@ def script_generation_section(batch_config: dict, bids_root: Path, eegcpm_root: 
     with tab2:
         st.markdown("### SLURM script for HPC clusters")
 
+        # Always show script preview
         slurm_script = generate_slurm_script(batch_config, bids_root, eegcpm_root)
-
         st.code(slurm_script, language='bash')
 
         col1, col2 = st.columns([3, 1])
@@ -449,25 +621,33 @@ def script_generation_section(batch_config: dict, bids_root: Path, eegcpm_root: 
                 data=slurm_script,
                 file_name=f"batch_preprocess_{batch_config['pipeline_name']}_slurm.sh",
                 mime="text/plain",
-                width="stretch"
+                use_container_width=True,
             )
 
         st.markdown(f"""
         **Usage:**
         ```bash
+        # 1. Upload script to HPC (via Cyberduck/scp)
+
+        # 2. SSH to HPC and submit
+        cd /path/to/your/project
         sbatch batch_preprocess_{batch_config['pipeline_name']}_slurm.sh
 
-        # Check job status
+        # 3. Monitor job status
         squeue -u $USER
 
-        # Check array job progress
-        sacct -j <JOB_ID>
+        # 4. Check completed/failed summary
+        sacct -j <JOB_ID> --brief
+
+        # 5. Cancel if needed
+        scancel <JOB_ID>
         ```
 
         **Notes:**
         - Runs {len(batch_config['subjects'])} subjects with max {batch_config['parallel_jobs']} parallel jobs
-        - Adjust `#SBATCH` directives for your cluster
-        - Load appropriate modules/environment before running
+        - Each subject processes {len(batch_config['tasks'])} tasks sequentially
+        - Completed subjects are skipped on resubmit (no --force)
+        - Email notification on job completion or failure
         """)
 
 

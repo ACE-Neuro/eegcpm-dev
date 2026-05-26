@@ -22,7 +22,7 @@ pip install -e ".[dev]"
 # Run tests
 pytest tests/ -v --override-ini="addopts="
 
-# Should see: 253 tests passing
+# Should see: 263 tests passing
 ```
 
 ---
