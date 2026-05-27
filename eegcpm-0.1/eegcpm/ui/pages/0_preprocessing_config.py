@@ -358,7 +358,10 @@ def main():
                     index=all_methods.index(current_method),
                     help=(
                         "PREP = comprehensive (4 criteria). "
-                        "Variance = flag channels with abnormal signal variance."
+                        "Variance = abnormal signal variance. "
+                        "RANSAC = robust prediction-based. "
+                        "Correlation = low neighbor correlation. "
+                        "Deviation = extreme amplitude deviation."
                     )
                 )
 
@@ -381,10 +384,14 @@ def main():
                 )
                 bad_config['drop'] = drop
 
-                if method == 'prep':
-                    st.info("💡 **PREP**: Uses deviation + correlation + HF noise + RANSAC")
-                elif method == 'variance':
-                    st.info("💡 **Variance**: Flags channels with abnormally high/low signal variance")
+                method_info = {
+                    'prep': "💡 **PREP**: Uses deviation + correlation + HF noise + RANSAC",
+                    'variance': "💡 **Variance**: Flags channels with abnormally high/low signal variance",
+                    'ransac': "💡 **RANSAC**: Predicts channels from neighbors, flags poor predictions",
+                    'correlation': "💡 **Correlation**: Flags channels poorly correlated with neighbors",
+                    'deviation': "💡 **Deviation**: Flags channels with extreme amplitude deviation",
+                }
+                st.info(method_info[method])
 
                 update_step_in_config(config, 'bad_channels', bad_config)
 
