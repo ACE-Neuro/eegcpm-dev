@@ -344,28 +344,49 @@ def main():
                 })
 
             # Step 4: Bad Channels (before Zapline)
-            with st.expander("4️⃣ Bad Channels - PREP Detection", expanded=True):
+            with st.expander("4️⃣ Bad Channels Detection", expanded=True):
                 bad_params = get_step_from_config(config, 'bad_channels')
+
+                all_methods = ['prep', 'variance', 'ransac', 'correlation', 'deviation']
+                current_method = bad_params.get('method', 'prep')
+                if current_method not in all_methods:
+                    current_method = 'prep'
 
                 method = st.selectbox(
                     "Detection Method",
-                    options=['prep', 'ransac', 'correlation', 'deviation'],
-                    index=0,
-                    help="PREP = comprehensive pipeline (recommended)"
+                    options=all_methods,
+                    index=all_methods.index(current_method),
+                    help=(
+                        "PREP = comprehensive (4 criteria). "
+                        "Variance = flag channels with abnormal signal variance."
+                    )
                 )
+
+                bad_config = {'method': method}
+
+                if method == 'variance':
+                    variance_thresh = st.slider(
+                        "Variance Threshold (SD from median)",
+                        min_value=2.0, max_value=10.0,
+                        value=bad_params.get('variance_threshold', 5.0),
+                        step=0.5,
+                        help="Channels with variance this many SDs from median are flagged"
+                    )
+                    bad_config['variance_threshold'] = variance_thresh
 
                 drop = st.checkbox(
                     "Drop Bad Channels (vs Interpolate)",
-                    value=bad_params.get('drop', True),
-                    help="⚠️ Drop avoids interpolation artifacts but reduces channel count"
+                    value=bad_params.get('drop', False),
+                    help="Drop removes channels; unchecked = interpolate (recommended)"
                 )
+                bad_config['drop'] = drop
 
-                st.info("💡 **PREP Method**: Uses deviation + correlation + HF noise + RANSAC")
+                if method == 'prep':
+                    st.info("💡 **PREP**: Uses deviation + correlation + HF noise + RANSAC")
+                elif method == 'variance':
+                    st.info("💡 **Variance**: Flags channels with abnormally high/low signal variance")
 
-                update_step_in_config(config, 'bad_channels', {
-                    'method': method,
-                    'drop': drop
-                })
+                update_step_in_config(config, 'bad_channels', bad_config)
 
             # Step 5: Zapline (after Bad Channels)
             with st.expander("5️⃣ Zapline - Line Noise Removal", expanded=False):
