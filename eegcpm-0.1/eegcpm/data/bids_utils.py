@@ -90,7 +90,15 @@ def read_raw_eeg(input_file: Path):
                 'photosensor': 'stim',
                 'optical': 'stim',
                 'ecg': 'ecg',
-                'resp': 'misc'
+                'resp': 'misc',
+                'VEOG': 'eog',
+                'HEOG': 'eog',
+                'EKG': 'ecg',
+                'EMG': 'emg',
+                'F11': 'misc',
+                'F12': 'misc',
+                'FT11': 'misc',
+                'FT12': 'misc',
             }
             channels_to_set = {ch: t for ch,
                                t in misc_channels.items() if ch in raw.ch_names}
