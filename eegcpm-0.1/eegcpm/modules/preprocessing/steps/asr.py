@@ -220,11 +220,7 @@ class ASRStep(ProcessingStep):
             data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Create new Raw object
-        # LEGACY: info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types='eeg')
-        # Preserve original channel types so non-EEG channels are not reclassified as EEG.
-        original_types_by_name = dict(zip(raw.ch_names, raw.get_channel_types()))
-        ch_types = [original_types_by_name.get(ch_name, 'eeg') for ch_name in ch_names]
-        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
+        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types='eeg')
         raw_cleaned = mne.io.RawArray(data, info, verbose=False)
 
         # Preserve original annotations/events - CRITICAL for epoching later
