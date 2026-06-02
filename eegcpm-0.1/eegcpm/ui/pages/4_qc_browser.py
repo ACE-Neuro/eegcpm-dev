@@ -1,18 +1,17 @@
 """QC Report Browser - View and download quality control reports."""
 
-import streamlit as st
-from pathlib import Path
-import sys
 import json
-import pandas as pd
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional
+
+import pandas as pd
+import streamlit as st
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from eegcpm.ui.utils import scan_subjects, scan_tasks, scan_pipelines
 from eegcpm.ui.session_persistence import restore_project_from_storage
-from eegcpm.core.paths import EEGCPMPaths
 
 
 def find_qc_reports(
@@ -150,7 +149,7 @@ def load_quality_metrics(qc_file: Path) -> Optional[Dict]:
         try:
             with open(json_file, 'r') as f:
                 return json.load(f)
-        except:
+        except Exception:
             return None
 
     return None
@@ -168,6 +167,9 @@ def main():
     st.title("📊 Quality Control: QC Browser")
     st.markdown("Browse and view quality control reports for all processing stages")
 
+    def short_pipeline(p: str) -> str:
+        return p.split("/", 1)[-1] if "/" in p else p
+
     # Sidebar filters
     if "qc_derivatives" in st.session_state:
         st.sidebar.header("🔍 Filters")
@@ -184,10 +186,10 @@ def main():
     # Initialise session state on first load (or after browser reload wipes state)
     if "qc_derivatives_root" not in st.session_state or len(st.session_state.get("qc_derivatives_root", "")) == 0:
         st.session_state.qc_derivatives_root = auto_derivatives  # may be "" if no project set
-    
+
     # tracks whether user clicked Reset Path
     if "qc_path_reset" not in st.session_state:
-        st.session_state.qc_path_reset = False  
+        st.session_state.qc_path_reset = False
 
     # If a path is already confirmed, show it as a read-only label with a Reset button
     if st.session_state.qc_derivatives_root and not st.session_state.qc_path_reset:
@@ -213,7 +215,7 @@ def main():
                 st.rerun()
 
         derivatives_root = entered
-        
+
     derivatives_path = Path(derivatives_root)
 
     if not derivatives_path.exists() or derivatives_root == "":
@@ -224,30 +226,52 @@ def main():
             st.page_link("app.py", label="→ Go to Home", icon="🏠")
         return
 
-    # Pipeline filter
-    pipelines = scan_pipelines(derivatives_path)
-    pipeline_options = ['All'] + pipelines
+    # First pass: scan without pipeline filter to populate all dropdowns
+    with st.spinner("Scanning QC reports..."):
+        unfiltered_reports = find_qc_reports(
+            derivatives_path,
+            pipeline=None,
+            subject=None,
+            task=None
+        )
 
-    selected_pipeline = st.sidebar.selectbox(
+    available_pipelines = sorted(set(
+        r['pipeline'] for r in unfiltered_reports if r['pipeline'] != 'Unknown'
+    ))
+    available_subjects = sorted(set(
+        r['subject'] for r in unfiltered_reports if r['subject'] != 'Unknown'
+    ))
+    available_tasks = sorted(set(
+        r['task'] for r in unfiltered_reports if r['task'] != 'Unknown'
+    ))
+
+    # Pipeline dropdown (show variant name only)
+    pipeline_display = {'All': 'All'}
+    pipeline_display.update({p: short_pipeline(p) for p in available_pipelines})
+    selected_pipeline_display = st.sidebar.selectbox(
         "Pipeline",
-        options=pipeline_options,
+        options=list(pipeline_display.keys()),
+        index=0,
+        format_func=lambda k: pipeline_display[k],
         help="Filter by pipeline"
     )
 
-    pipeline_filter = None if selected_pipeline == 'All' else selected_pipeline
-
-    # Subject filter
-    subject_filter = st.sidebar.text_input(
-        "Subject ID (partial match)",
-        value="",
-        help="Filter by subject ID (leave empty for all)"
+    # Subject dropdown
+    subject_options = ['All'] + available_subjects
+    selected_subject = st.sidebar.selectbox(
+        "Subject",
+        options=subject_options,
+        index=0,
+        help="Select a subject to filter"
     )
 
-    # Task filter
-    task_filter = st.sidebar.text_input(
-        "Task (partial match)",
-        value="",
-        help="Filter by task name (leave empty for all)"
+    # Task dropdown
+    task_options = ['All'] + available_tasks
+    selected_task = st.sidebar.selectbox(
+        "Task",
+        options=task_options,
+        index=0,
+        help="Select a task to filter"
     )
 
     # Report type filter
@@ -259,20 +283,26 @@ def main():
     )
 
     st.sidebar.markdown("---")
-    refresh_button = st.sidebar.button("🔄 Refresh Reports", width="stretch")
+    st.sidebar.button("🔄 Refresh Reports", width="stretch")
 
-    # Find reports
-    with st.spinner("Scanning for QC reports..."):
-        reports = find_qc_reports(
-            derivatives_path,
-            pipeline=pipeline_filter,
-            subject=subject_filter if subject_filter else None,
-            task=task_filter if task_filter else None
-        )
+    # Apply filters in-memory
+    pipeline_filter = None if selected_pipeline_display == 'All' else selected_pipeline_display
+    subject_filter = None if selected_subject == 'All' else selected_subject
+    task_filter = None if selected_task == 'All' else selected_task
+
+    reports = [
+        r for r in unfiltered_reports
+        if (pipeline_filter is None or r['pipeline'].endswith(pipeline_filter))
+        and (subject_filter is None or r['subject'] == subject_filter)
+        and (task_filter is None or r['task'] == task_filter)
+    ]
 
     # Filter by report type
     if report_type_filter:
         reports = [r for r in reports if r['type'] in report_type_filter]
+
+    # Default sort: Subject then Task
+    reports.sort(key=lambda x: (str(x['subject']).lower(), str(x['task']).lower()))
 
     # Display summary
     st.markdown("---")
@@ -323,7 +353,7 @@ def main():
             'Subject': r['subject'],
             'Task': r['task'],
             'Run': r['run'],
-            'Pipeline': r['pipeline'],
+            'Pipeline': short_pipeline(r['pipeline']),
             'Type': r['type'],
             'Size (KB)': f"{r['size_kb']:.1f}",
             'Modified': mod_time,
@@ -332,23 +362,6 @@ def main():
 
     df = pd.DataFrame(report_data)
 
-    # Display table with selection using data_editor (interactive)
-    st.markdown("**Select a report from the table below:**")
-
-    # Use selectbox for now (more reliable than row selection)
-    # Create readable options
-    report_options = []
-    for i, r in enumerate(reports):
-        option = f"{r['subject']} | {r['task']} | Run {r['run']} | {r['type']}"
-        report_options.append(option)
-
-    selected_idx = st.selectbox(
-        "Select Report",
-        options=range(len(reports)),
-        format_func=lambda i: report_options[i],
-        label_visibility="collapsed"
-    )
-
     # Display the full table for reference
     st.dataframe(
         df,
@@ -356,11 +369,31 @@ def main():
         height=300
     )
 
+    # Report selection using path-based selectbox (persists across sort changes)
+    st.markdown("**Select a report to view:**")
+
+    report_options = {str(r['path']): f"{r['subject']} | {r['task']} | Run {r['run']} | {r['type']}" for r in reports}
+    report_paths = list(report_options.keys())
+
+    if 'qc_selected_report' not in st.session_state or st.session_state.qc_selected_report not in report_paths:
+        st.session_state.qc_selected_report = report_paths[0] if report_paths else None
+
+    st.selectbox(
+        "Select Report",
+        options=report_paths,
+        format_func=lambda p: report_options.get(p, p),
+        key="qc_selected_report",
+        label_visibility="collapsed"
+    )
+
+    selected_report = next(
+        (r for r in reports if str(r['path']) == st.session_state.qc_selected_report),
+        reports[0]
+    )
+
     # Report viewer
     st.markdown("---")
     st.subheader("👁️ View Report")
-
-    selected_report = reports[selected_idx]
 
     if selected_report:
 
