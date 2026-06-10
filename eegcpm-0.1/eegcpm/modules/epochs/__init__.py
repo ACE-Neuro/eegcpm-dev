@@ -41,10 +41,8 @@ class EpochExtractionModule(RawDataModule):
         self.decim = config.get("decim", 1)
 
         # Parse rejection config (supports nested dict or flat)
-        # Nested: config has "rejection": {"strategy": ..., "reject": ..., "flat": ...}
-        # Flat: config has "reject": {...}, "flat": {...} at top level (e.g. task config)
-        rejection = config.get("rejection", None)
-        if isinstance(rejection, dict) and ("reject" in rejection or "strategy" in rejection):
+        rejection = config.get("rejection", {})
+        if isinstance(rejection, dict):
             self.reject = rejection.get("reject", None)
             self.flat = rejection.get("flat", None)
             self.reject_tmin = rejection.get("reject_tmin", None)
@@ -54,15 +52,15 @@ class EpochExtractionModule(RawDataModule):
             self.autoreject_n_interpolate = rejection.get("autoreject_n_interpolate", [1, 4, 8, 16])
             self.rejection_strategy = rejection.get("strategy", "threshold")
         else:
-            # Flat config or no rejection specified: read from top-level keys
+            # Backwards compatibility with flat config
             self.reject = config.get("reject_criteria", config.get("reject", None))
             self.flat = config.get("flat", None)
-            self.reject_tmin = config.get("reject_tmin", None)
-            self.reject_tmax = config.get("reject_tmax", None)
+            self.reject_tmin = None
+            self.reject_tmax = None
             self.reject_by_annotation = config.get("reject_by_annotation", True)
             self.use_autoreject = config.get("use_autoreject", False)
-            self.autoreject_n_interpolate = config.get("autoreject_n_interpolate", [1, 4, 8, 16])
-            self.rejection_strategy = config.get("rejection_strategy", "threshold")
+            self.autoreject_n_interpolate = [1, 4, 8, 16]
+            self.rejection_strategy = "threshold"
 
     def process(
         self,
