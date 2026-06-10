@@ -1,0 +1,88 @@
+# Task Configuration: CPT-Auditory (cptaud)
+# Continuous Performance Task - Auditory modality
+#
+# Event codes match the trial_type column in BIDS events.tsv.
+# See also: preprocess-multi-format-input branch for BrainVision support.
+
+task_name: cptaud
+description: 'Sustained attention / inhibitory-control task (auditory modality).
+
+  A continuous stream of environmental sounds cross-fades from one to the
+
+  next. Press SPACE for city/urban sounds (target), withhold for nature
+
+  sounds (non-target).'
+
+task_type: event-related
+
+primary_event:
+  name: all_stimuli
+  codes: [1, 2]
+
+tmin: -0.2
+tmax: 0.8
+baseline: [-0.2, 0.0]
+
+conditions:
+  - name: target
+    event_codes: ["target"]
+    description: "City/urban sound - spacebar press required (go)"
+  - name: nontarget
+    event_codes: ["nontarget"]
+    description: "Nature sound - withhold response (no-go)"
+
+# Behavioral response mapping
+response_mapping:
+  response_column: key_resp.corr
+  categories:
+    correct: 1
+    incorrect: 0
+    no_response: n/a
+  rt_column: key_resp.rt
+  rt_min: 100
+  rt_max: 1000
+
+# ERP components
+erp_components:
+  - name: N1
+    search_window: [0.08, 0.15]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Auditory N1 (sensory response)
+  - name: P2
+    search_window: [0.15, 0.25]
+    channels: [Fz, FCz, Cz]
+    polarity: positive
+    description: Auditory P2
+  - name: N2
+    search_window: [0.2, 0.3]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Conflict / no-go N2
+  - name: P3
+    search_window: [0.3, 0.5]
+    channels: [Pz, CPz, Cz]
+    polarity: positive
+    description: Target detection P3
+
+# Rejection criteria
+reject:
+  eeg: 150e-6
+
+flat:
+  eeg: 1e-6
+
+# Trial binning
+binning:
+  - name: rt_quartiles
+    method: quantile
+    n_bins: 4
+    column: key_resp.rt
+    labels: [fast, medium_fast, medium_slow, slow]
+
+sampling_rate: 1000
+
+notes: |
+  Use phase=="main" filter (set in UI) to exclude practice trials.
+  Auditory N1/P2 are strongest at fronto-central midline (Fz/FCz/Cz).
+  Dataset has no EOG channels; rely on ICA for ocular artifact removal.

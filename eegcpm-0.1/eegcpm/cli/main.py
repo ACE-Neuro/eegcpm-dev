@@ -8,7 +8,7 @@ from .status import status_command
 from .preprocess import preprocess_command
 from .resume import resume_command
 from .import_qc import import_qc_command
-from .epochs import epochs_command
+from .epochs import epochs_command, discover_events_command
 from .source_reconstruct import source_reconstruct_command
 from .connectivity import connectivity_command
 
@@ -260,6 +260,37 @@ For more information: https://github.com/clivehywong/eegcpm-dev
         help='Specific runs to combine (e.g., 1 2 3). If not specified, combines all runs.'
     )
 
+    # Discover events command
+    discover_parser = subparsers.add_parser(
+        'discover-events',
+        help='Discover event codes from preprocessed FIF files',
+        description='Read preprocessed data and print annotation/event codes to help configure task configs'
+    )
+    discover_parser.add_argument(
+        '--project',
+        type=Path,
+        required=True,
+        help='Project root directory'
+    )
+    discover_parser.add_argument(
+        '--preprocessing',
+        type=str,
+        required=True,
+        help='Preprocessing pipeline variant (e.g., optimized, standard)'
+    )
+    discover_parser.add_argument(
+        '--task',
+        type=str,
+        required=True,
+        help='Task name (e.g., cptaud)'
+    )
+    discover_parser.add_argument(
+        '--subjects',
+        type=str,
+        nargs='+',
+        help='Specific subjects to check (default: first subject)'
+    )
+
     # Source reconstruction command
     source_parser = subparsers.add_parser(
         'source-reconstruct',
@@ -381,6 +412,8 @@ For more information: https://github.com/clivehywong/eegcpm-dev
             import_qc_command(args)
         elif args.command == 'epochs':
             epochs_command(args)
+        elif args.command == 'discover-events':
+            discover_events_command(args)
         elif args.command == 'source-reconstruct':
             source_reconstruct_command(args)
         elif args.command == 'connectivity':
