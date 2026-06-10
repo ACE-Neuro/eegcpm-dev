@@ -113,9 +113,33 @@ class MontageStep(ProcessingStep):
             montage = mne.channels.make_standard_montage(self.type)
             source = 'standard'
 
+        # Rename channels to match standard montage naming conventions
+        # Neuroscan uses uppercase (FP1, CZ) while MNE uses mixed case (Fp1, Cz)
+        NEUROSCAN_RENAME = {
+            'FP1': 'Fp1', 'FP2': 'Fp2', 'FPZ': 'Fpz',
+            'FZ': 'Fz', 'CZ': 'Cz', 'PZ': 'Pz', 'OZ': 'Oz',
+            'FCZ': 'FCz', 'CPZ': 'CPz', 'POZ': 'POz',
+            'AF3': 'AF3', 'AF4': 'AF4', 'AF7': 'AF7', 'AF8': 'AF8',
+            'CB1': 'Cb1', 'CB2': 'Cb2',
+            'HEOG': 'HEOG', 'VEOG': 'VEOG',
+            'M1': 'M1', 'M2': 'M2',
+        }
+        rename_map = {}
+        for ch in raw.ch_names:
+            if ch in NEUROSCAN_RENAME:
+                new_name = NEUROSCAN_RENAME[ch]
+                if new_name != ch:
+                    rename_map[ch] = new_name
+            elif ch not in montage.ch_names and ch.upper() != ch:
+                # Mixed-case channel not in montage — try lowercase first letter variant
+                alt = ch[0].upper() + ch[1:].lower() if len(ch) > 1 else ch.lower()
+                if alt in montage.ch_names:
+                    rename_map[ch] = alt
+        if rename_map:
+            raw.rename_channels(rename_map)
+
         # Set montage with match_alias=True so MNE's official channel aliases
         # (e.g., Cb1->POO7, Cb2->POO8, T3->T7, M1->TP9) get resolved automatically
-        # See mne._fiff.constants.CHANNEL_LOC_ALIASES for the full alias table
         raw.set_montage(
             montage,
             match_alias=True,

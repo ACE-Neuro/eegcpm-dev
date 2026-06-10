@@ -437,6 +437,12 @@ class RunProcessor:
                             for ch_name in montage_step['channels_dropped']:
                                 removed_channels[ch_name] = 'no_position'
 
+                        # Check for drop_flat step (channels dropped due to being flat)
+                        drop_flat_step = preproc_result.metadata.get('drop_flat', {})
+                        if drop_flat_step.get('flat_channels'):
+                            for ch_name in drop_flat_step['flat_channels']:
+                                removed_channels[ch_name] = 'dropped_flat'
+
                     # Compute QC
                     qc_result = qc_generator.compute(
                         data=raw_processed,  # Preprocessed data

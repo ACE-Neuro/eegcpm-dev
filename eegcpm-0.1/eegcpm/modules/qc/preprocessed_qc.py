@@ -30,6 +30,78 @@ from ..preprocessing.channel_clustering import (
     get_clustering_recommendation
 )
 
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+_NEUROSCAN_CH_TO_MNE = {
+    "FP1": "Fp1", "FP2": "Fp2", "FPZ": "Fpz",
+    "FZ": "Fz", "CZ": "Cz", "PZ": "Pz", "OZ": "Oz",
+    "FCZ": "FCz", "CPZ": "CPz", "POZ": "POz",
+    "CB1": "Cb1", "CB2": "Cb2",
+}
+NEUROSCAN_LOCS_CACHE: Optional[Dict[str, np.ndarray]] = None
+
+
+def _load_neuroscan_locs() -> Dict[str, np.ndarray]:
+    global NEUROSCAN_LOCS_CACHE
+    if NEUROSCAN_LOCS_CACHE is not None:
+        return NEUROSCAN_LOCS_CACHE
+    locs_file = DATA_DIR / "neuroscan_64ch.locs"
+    result = {}
+    if locs_file.exists():
+        with open(locs_file) as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) < 4:
+                    continue
+                name = parts[3]
+                theta_deg = float(parts[1])
+                radius = float(parts[2])
+                theta_rad = np.radians(theta_deg)
+                x = radius * np.sin(theta_rad)
+                y = radius * np.cos(theta_rad)
+                mapped = _NEUROSCAN_CH_TO_MNE.get(name, name)
+                result[mapped] = np.array([x, y])
+    NEUROSCAN_LOCS_CACHE = result
+    return result
+
+
+def _draw_head_outline(ax, *, head_radius=0.5, linewidth=1.5):
+    """Draw EEGLAB-style head outline (circle + nose + ears) centered at origin.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        The axes to draw on.
+    head_radius : float
+        Radius of the head circle (0.5 for Neuroscan .locs convention).
+    linewidth : float
+        Line width for all outline elements.
+    """
+    from matplotlib.patches import Circle
+    r = head_radius
+    ax.add_patch(Circle((0, 0), r, fill=False, linewidth=linewidth, color='k'))
+    nh = r * 0.18
+    nw = r * 0.08
+    ax.plot([-nw, nw, 0, -nw], [r, r, r + nh, r], 'k-', lw=linewidth)
+    ear_ext = r * 0.07
+    ear_y = r * 0.15
+    ear_t = np.linspace(0, np.pi, 20)
+    ax.plot(-r - ear_ext * np.sin(ear_t), -ear_y * np.cos(ear_t), 'k-', lw=linewidth)
+    ax.plot(r + ear_ext * np.sin(ear_t), -ear_y * np.cos(ear_t), 'k-', lw=linewidth)
+
+
+def _get_ica_reject_reason(idx: int, excluded_set: set, eog_set: set, ecg_set: set,
+                           auto_detected: dict, manual_set: Optional[set] = None) -> str:
+    """Determine ICA rejection reason from step metadata."""
+    if idx not in excluded_set:
+        return '-'
+    if idx in eog_set:
+        return 'ICA auto-detected EOG'
+    if idx in ecg_set:
+        return 'ICA auto-detected ECG'
+    if manual_set and idx in manual_set:
+        return 'Manually excluded'
+    return 'ICA excluded'
+
 
 class PreprocessedQC(BaseQC):
     """
@@ -117,13 +189,100 @@ class PreprocessedQC(BaseQC):
         # Use provided removed_channels or empty dict
         channel_reasons = removed_channels if removed_channels else {}
 
+        # Safety net: catch channels dropped/marked by any step not in removed_channels
+        safety_net_channels = {}
+        if raw_before is not None:
+            before_eeg = set(mne.pick_types(raw_before.info, eeg=True, exclude=[]))
+            before_eeg = {raw_before.ch_names[i] for i in before_eeg}
+            after_chs = set(raw.ch_names)
+            dropped = before_eeg - after_chs
+            for ch in dropped:
+                if ch not in channel_reasons:
+                    channel_reasons[ch] = 'dropped'
+                    safety_net_channels[ch] = 'dropped'
+            for ch in raw.info["bads"]:
+                if ch not in channel_reasons:
+                    channel_reasons[ch] = 'marked_bad'
+                    safety_net_channels[ch] = 'marked_bad'
+        if safety_net_channels:
+            ch_list = list(safety_net_channels.keys())
+            ch_str = ', '.join(ch_list[:10])
+            if len(ch_list) > 10:
+                ch_str += f'... ({len(ch_list)} total)'
+            result.add_note(f"Bad/removed channel(s): {ch_str}")
+
         # Extract preprocessing metadata if provided
         preprocessing_metadata = kwargs.get('preprocessing_metadata', {})
 
         # Extract and store ICLabel information from metadata
         ica_components_info = None
         if metadata and 'iclabel' in metadata:
-            ica_components_info = metadata.get('iclabel', {}).get('components', None)
+            iclabel_data = metadata.get('iclabel', {})
+            ica_components_info = iclabel_data.get('components', None)
+            if ica_components_info:
+                n_classified = len(ica_components_info)
+                n_rejected = sum(1 for c in ica_components_info if c.get('rejected', False))
+                result.add_note(f"ICA classification: ICLabel ({n_classified} components, {n_rejected} rejected)")
+
+        # Fallback: build component info from ICA step when ICLabel unavailable
+        ica_step_meta = metadata.get('ica', {}) if metadata else {}
+        if ica_components_info is None and ica is not None and ica_step_meta:
+            auto_detected = ica_step_meta.get('auto_detected', {})
+            excluded = ica_step_meta.get('excluded_indices', [])
+            excluded_set = set(excluded) if excluded else set()
+            eog_indices = set(auto_detected.get('eog', []) or [])
+            ecg_indices = set(auto_detected.get('ecg', []) or [])
+
+            # Compute variance explained from ICA object
+            variance_ratios = None
+            if hasattr(ica, 'pca_explained_variance_') and ica.pca_explained_variance_ is not None:
+                total_variance = ica.pca_explained_variance_.sum()
+                if total_variance > 0:
+                    variance_ratios = (ica.pca_explained_variance_ / total_variance * 100)
+
+            fallback_components = []
+            for i in range(ica.n_components_):
+                label = 'other'
+                if i in eog_indices:
+                    label = 'eye'
+                elif i in ecg_indices:
+                    label = 'heart'
+                variance_explained = None
+                if variance_ratios is not None and i < len(variance_ratios):
+                    variance_explained = float(variance_ratios[i])
+                fallback_components.append({
+                    'index': i,
+                    'label': label,
+                    'probability': 1.0 if label != 'other' else 0.0,
+                    'variance_explained': variance_explained,
+                    'rejected': i in excluded_set,
+                    'reject_reason': _get_ica_reject_reason(i, excluded_set, eog_indices, ecg_indices, auto_detected),
+                })
+            ica_components_info = fallback_components
+            if fallback_components:
+                n_labeled = sum(1 for c in fallback_components if c['label'] != 'other')
+                result.add_note(f"ICA classification: Using EOG/ECG auto-detection ({n_labeled} labeled, ICLabel not available)")
+
+        # Merge ICA exclusions into component info (even when ICLabel provided data)
+        n_ica_merged = 0
+        if ica_components_info is not None and ica_step_meta:
+            excluded = ica_step_meta.get('excluded_indices', [])
+            auto_detected = ica_step_meta.get('auto_detected', {})
+            excluded_set = set(excluded) if excluded else set()
+            eog_set = set(auto_detected.get('eog', []) or [])
+            ecg_set = set(auto_detected.get('ecg', []) or [])
+            manual_excluded = ica_step_meta.get('manual_excluded', [])
+            manual_set = set(manual_excluded) if manual_excluded else set()
+            for comp in ica_components_info:
+                idx = comp.get('index')
+                if idx in excluded_set and not comp.get('rejected', False):
+                    comp['rejected'] = True
+                    comp['reject_reason'] = _get_ica_reject_reason(
+                        idx, excluded_set, eog_set, ecg_set, auto_detected, manual_set
+                    )
+                    n_ica_merged += 1
+            if n_ica_merged > 0:
+                result.add_note(f"ICA: {n_ica_merged} additional component(s) excluded by ICA but not flagged by ICLabel — marked as rejected in table")
 
         # Add preprocessing summary notes
         if preprocessing_metadata:
@@ -349,8 +508,9 @@ class PreprocessedQC(BaseQC):
 
         # Bad channel topography map
         try:
-            if raw_before is not None and (hasattr(raw_before.info, 'dig') and raw_before.info['dig'] or raw_before.get_montage()):
-                fig_topo_bad = self._plot_bad_channels_topomap(raw_before, channel_reasons)
+            raw_for_topo = raw_before if raw_before is not None and raw_before.get_montage() else raw
+            if channel_reasons and raw_for_topo.get_montage():
+                fig_topo_bad = self._plot_bad_channels_topomap(raw_for_topo, channel_reasons)
                 result.add_figure("bad_channels_topo", self.fig_to_base64(fig_topo_bad, self.dpi))
                 plt.close(fig_topo_bad)
         except Exception as e:
@@ -358,9 +518,9 @@ class PreprocessedQC(BaseQC):
 
         # Bad channel clustering analysis
         try:
-            if raw_before is not None and channel_reasons and raw_before.get_montage():
+            if channel_reasons and raw_for_topo.get_montage():
                 bad_channels = list(channel_reasons.keys())
-                clustering_result = compute_bad_channel_clustering(raw_before, bad_channels)
+                clustering_result = compute_bad_channel_clustering(raw_for_topo, bad_channels)
 
                 if 'error' not in clustering_result:
                     # Add clustering metrics
@@ -384,7 +544,7 @@ class PreprocessedQC(BaseQC):
                     result.add_note(f"Clustering Recommendation: {recommendation}")
 
                     # Generate visualization
-                    fig_clustering = visualize_channel_clustering(raw_before, bad_channels, clustering_result)
+                    fig_clustering = visualize_channel_clustering(raw_for_topo, bad_channels, clustering_result)
                     result.add_figure("bad_channel_clustering", self.fig_to_base64(fig_clustering, self.dpi))
                     plt.close(fig_clustering)
         except Exception as e:
@@ -1028,30 +1188,30 @@ class PreprocessedQC(BaseQC):
         # Use MNE's built-in ICA component plotting
         try:
             # ica.plot_components returns a list of figures (one per 20 components)
-            # We need to call it for all components and combine figures
             figs = ica.plot_components(
                 picks=range(n_components),
                 show=False,
                 title=None,
             )
 
-            # MNE creates multiple figures if n_components > 20
+            # Replace MNE's head outline + sensor spots with EEGLAB-style versions
+            if isinstance(figs, list):
+                for source_fig in figs:
+                    self._fix_ica_head_outlines(source_fig, ica)
+            else:
+                self._fix_ica_head_outlines(figs, ica)
+
             # Annotate with ICLabel classifications before combining
             if isinstance(figs, list):
-                # Annotate each figure with ICLabel info
                 for fig_idx, source_fig in enumerate(figs):
-                    # MNE shows 20 components per figure
                     comp_start = fig_idx * 20
                     self._annotate_ica_topographies(source_fig, comp_start, comp_info_map)
 
-                # Now combine figures
                 n_figs = len(figs)
                 if n_figs == 1:
                     fig = figs[0]
                     fig.suptitle(f"ICA Component Topographies ({n_components} components)")
                 else:
-                    # Create tall figure to stack all topography pages
-                    # Use constrained_layout for better handling of image axes
                     combined_fig, combined_axes = plt.subplots(
                         n_figs, 1,
                         figsize=(12, 8 * n_figs),
@@ -1060,18 +1220,12 @@ class PreprocessedQC(BaseQC):
                     if n_figs == 1:
                         combined_axes = [combined_axes]
 
-                    # Copy each figure into the combined plot
                     for idx, (source_fig, ax) in enumerate(zip(figs, combined_axes)):
-                        # Render the source figure to an image
                         source_fig.canvas.draw()
                         img = np.frombuffer(source_fig.canvas.tostring_rgb(), dtype=np.uint8)
                         img = img.reshape(source_fig.canvas.get_width_height()[::-1] + (3,))
-
-                        # Display in combined axes
                         ax.imshow(img)
                         ax.axis('off')
-
-                        # Close source figure
                         plt.close(source_fig)
 
                     combined_fig.suptitle(f"ICA Component Topographies ({n_components} components total)",
@@ -1081,12 +1235,11 @@ class PreprocessedQC(BaseQC):
                 fig = figs
                 self._annotate_ica_topographies(fig, 0, comp_info_map)
                 fig.suptitle(f"ICA Component Topographies ({n_components} components)")
-                fig.subplots_adjust(top=0.92)  # Make room for suptitle
+                fig.subplots_adjust(top=0.92)
 
             return fig
 
         except Exception as e:
-            # Fallback: create simple figure with error message
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.text(0.5, 0.5,
                     f"ICA topographies unavailable\n(requires montage with channel locations)\n\nError: {str(e)[:100]}",
@@ -1098,22 +1251,12 @@ class PreprocessedQC(BaseQC):
 
     def _annotate_ica_topographies(self, fig: plt.Figure, comp_start: int,
                                    comp_info_map: Dict[int, Dict]) -> None:
-        """Annotate ICA topography figure with ICLabel classifications.
-
-        Args:
-            fig: Matplotlib figure from MNE's plot_components
-            comp_start: Starting component index for this figure
-            comp_info_map: Dictionary mapping component index to classification info
-        """
-        # MNE's plot_components creates a grid of axes (4x5 for 20 components)
-        # Each axis shows one component topography with a title like "ICA000"
-
+        """Annotate ICA topography figure with ICLabel classifications."""
         for ax in fig.axes:
-            # Get the component number from the axis title
             title = ax.get_title()
             if title and title.startswith('ICA'):
                 try:
-                    comp_idx = int(title[3:])  # Extract number from "ICA000"
+                    comp_idx = int(title[3:])
 
                     if comp_idx in comp_info_map:
                         comp_info = comp_info_map[comp_idx]
@@ -1121,7 +1264,6 @@ class PreprocessedQC(BaseQC):
                         prob = comp_info.get('probability', 0)
                         is_rejected = comp_info.get('rejected', False)
 
-                        # Abbreviate labels
                         label_abbrev = {
                             'brain': 'Brain', 'muscle': 'Muscle', 'eye': 'Eye',
                             'heart': 'Heart', 'line_noise': 'LineNoise',
@@ -1129,13 +1271,10 @@ class PreprocessedQC(BaseQC):
                         }
                         label_text = label_abbrev.get(label, label)
 
-                        # Create new title with classification
                         new_title = f"{title}\n{label_text} ({prob:.2f})"
                         if is_rejected:
                             new_title += " ✗"
-                            # Make title red for rejected components
                             ax.set_title(new_title, fontsize=9, color='red', fontweight='bold')
-                            # Add red border around the topography
                             for spine in ax.spines.values():
                                 spine.set_edgecolor('red')
                                 spine.set_linewidth(2)
@@ -1143,8 +1282,42 @@ class PreprocessedQC(BaseQC):
                             ax.set_title(new_title, fontsize=9)
 
                 except (ValueError, IndexError):
-                    # Could not parse component index
                     pass
+
+    def _fix_ica_head_outlines(self, fig: plt.Figure, ica: mne.preprocessing.ICA) -> None:
+        """Replace MNE's head outline + sensor spots with our EEGLAB-style versions."""
+        locs_pos = _load_neuroscan_locs()
+        for ax in fig.axes:
+            lines = list(ax.lines)
+            if not lines:
+                continue
+            head_radius = None
+            for line in lines:
+                x, y = line.get_data()
+                if len(x) > 50:
+                    head_radius = np.mean(np.sqrt(x**2 + y**2))
+                    break
+            if head_radius is None:
+                continue
+            locs_scale = head_radius / 0.5
+            n_ica_ch = len(ica.ch_names)
+            for coll in ax.collections:
+                if not hasattr(coll, 'get_offsets'):
+                    continue
+                off = coll.get_offsets()
+                if len(off) != n_ica_ch:
+                    continue
+                new_off = np.zeros_like(off)
+                for i, name in enumerate(ica.ch_names):
+                    if name in locs_pos:
+                        new_off[i] = locs_pos[name] * locs_scale
+                    else:
+                        new_off[i] = off[i] if i < len(off) else [0, 0]
+                coll.set_offsets(new_off)
+            for line in lines:
+                line.remove()
+            _draw_head_outline(ax, head_radius=head_radius, linewidth=1.5)
+            ax.set_aspect('equal')
 
     def _plot_ica_component_spectra(self, ica: mne.preprocessing.ICA, raw: mne.io.BaseRaw,
                                     ica_components_info: Optional[List[Dict]] = None) -> plt.Figure:
@@ -1253,7 +1426,7 @@ class PreprocessedQC(BaseQC):
                 ax.set_title(title, fontsize=8, color='red' if is_rejected else 'black',
                            fontweight='bold' if is_rejected else 'normal')
 
-                # Add alpha band marker for brain components
+                # Add subtle alpha band marker for brain components
                 if label == 'brain':
                     ax.axvspan(8, 12, alpha=0.2, color='green', label='Alpha')
 
@@ -1295,10 +1468,10 @@ class PreprocessedQC(BaseQC):
         ]
 
         fig.suptitle(f"ICA Component Power Spectra ({n_components} components, {len(ica.exclude)} rejected)",
-                    fontsize=12, fontweight='bold', y=0.995)
+                    fontsize=12, fontweight='bold', y=1.0)
         fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, 0.98),
                   fontsize=9, ncol=7, framealpha=0.9)
-        fig.subplots_adjust(top=0.92, hspace=0.4, wspace=0.3)
+        fig.subplots_adjust(top=0.95, hspace=0.4, wspace=0.3)
         return fig
 
     def _plot_bad_channels_topomap(self, raw: mne.io.BaseRaw, channel_reasons: Dict[str, str]) -> plt.Figure:
@@ -1308,7 +1481,6 @@ class PreprocessedQC(BaseQC):
         Bad channels are highlighted with larger colored markers.
         """
         from matplotlib.lines import Line2D
-        from matplotlib.patches import Circle, Wedge
 
         # Check montage
         if raw.get_montage() is None:
@@ -1331,6 +1503,11 @@ class PreprocessedQC(BaseQC):
             'interpolated_variance': '#377EB8',   # Blue - variance interpolated
             'marked_bad_ransac': '#FF7F00',       # Orange - marked bad
             'no_position': '#984EA3',             # Purple - no montage position
+            'dropped': '#E41A1C',                 # Red - dropped (generic)
+            'marked_bad': '#FF7F00',              # Orange - marked bad (generic)
+            'dropped_flat': '#E41A1C',            # Red - dropped flat channel
+            # Bare method-name reasons (from legacy/converted configs)
+            'variance': '#E41A1C',
             # Legacy reasons (for backwards compatibility)
             'flatline': '#E41A1C',
             'high_variance': '#FF7F00',
@@ -1348,6 +1525,11 @@ class PreprocessedQC(BaseQC):
             'interpolated_variance': 'Interpolated (Variance)',
             'marked_bad_ransac': 'Marked Bad (RANSAC)',
             'no_position': 'Dropped (No Position)',
+            'dropped': 'Dropped',
+            'marked_bad': 'Marked Bad',
+            'dropped_flat': 'Dropped (Flat)',
+            # Bare method-name reasons
+            'variance': 'Dropped (Variance)',
             # Legacy labels
             'flatline': 'Flatline (dropped)',
             'high_variance': 'High Variance (dropped)',
@@ -1359,9 +1541,13 @@ class PreprocessedQC(BaseQC):
         eeg_picks = mne.pick_types(raw.info, eeg=True, exclude=[])
         eeg_ch_names = [raw.ch_names[i] for i in eeg_picks]
 
-        # Get channel positions from layout
-        layout = mne.channels.find_layout(raw.info, ch_type='eeg')
-        pos_dict = {name: pos for name, pos in zip(layout.names, layout.pos[:, :2])}
+        # Get channel positions from Neuroscan .locs (EEGLAB convention)
+        locs_pos = _load_neuroscan_locs()
+        if locs_pos:
+            pos_dict = {name: locs_pos[name] for name in eeg_ch_names if name in locs_pos}
+        else:
+            layout = mne.channels.find_layout(raw.info, ch_type='eeg')
+            pos_dict = {name: pos for name, pos in zip(layout.names, layout.pos[:, :2])}
 
         # Build position array for EEG channels
         layout_pos = []
@@ -1383,28 +1569,8 @@ class PreprocessedQC(BaseQC):
         # Create figure
         fig, ax = plt.subplots(figsize=(10, 10))
 
-        # Draw head outline (circle + nose + ears) to match layout coordinates
-        # Layout is in 0-1 range, head centered around (0.5, 0.5)
-        head_center = (0.5, 0.5)
-        head_radius = 0.45
-
-        # Head circle
-        head = Circle(head_center, head_radius, fill=False, linewidth=2, color='black')
-        ax.add_patch(head)
-
-        # Nose (triangle at top)
-        nose_width = 0.08
-        nose_height = 0.08
-        nose_x = [0.5 - nose_width/2, 0.5, 0.5 + nose_width/2]
-        nose_y = [0.5 + head_radius, 0.5 + head_radius + nose_height, 0.5 + head_radius]
-        ax.plot(nose_x, nose_y, 'k-', linewidth=2)
-
-        # Ears (small arcs on sides)
-        ear_radius = 0.04
-        left_ear = Wedge((0.5 - head_radius, 0.5), ear_radius, 90, 270, fill=False, linewidth=2, color='black')
-        right_ear = Wedge((0.5 + head_radius, 0.5), ear_radius, -90, 90, fill=False, linewidth=2, color='black')
-        ax.add_patch(left_ear)
-        ax.add_patch(right_ear)
+        # Draw head outline using shared EEGLAB-style function
+        _draw_head_outline(ax, head_radius=0.5, linewidth=2)
 
         # Track which reasons are present for legend
         reasons_present = set()
@@ -1420,6 +1586,8 @@ class PreprocessedQC(BaseQC):
             if reason == 'good':
                 good_indices.append(i)
             else:
+                if reason not in bad_indices:
+                    bad_indices[reason] = []
                 bad_indices[reason].append(i)
 
         # Plot good channels (smaller, in background)
@@ -1448,9 +1616,9 @@ class PreprocessedQC(BaseQC):
                            xytext=(0, 8), textcoords='offset points',
                            fontweight='bold')
 
-        # Set axis limits to match layout with padding
-        ax.set_xlim(-0.05, 1.05)
-        ax.set_ylim(-0.05, 1.15)  # Extra space for nose
+        # Set asymmetric axis limits (more space at top for nose, legend at bottom)
+        ax.set_xlim(-0.65, 0.65)
+        ax.set_ylim(-0.65, 0.75)
         ax.set_aspect('equal')
         ax.axis('off')
 
@@ -1609,7 +1777,7 @@ class PreprocessedQC(BaseQC):
                 picks=valid_picks_before, fmin=0.5, fmax=80,
                 reject_by_annotation=False, verbose=False
             )
-            psd_before.plot(axes=axes[0], show=False)
+            psd_before.plot(axes=axes[0], show=False, spatial_colors=True)
             axes[0].set_title(f"Before Preprocessing ({len(valid_picks_before)} channels)")
         else:
             axes[0].text(0.5, 0.5, "No valid channels", ha="center", va="center",
@@ -1617,12 +1785,53 @@ class PreprocessedQC(BaseQC):
             axes[0].set_title("Before Preprocessing")
 
         # Plot after
+        n_axes_before = len(fig.axes)
         if len(valid_picks_after) > 0:
             psd_after = raw_after.compute_psd(
                 picks=valid_picks_after, fmin=0.5, fmax=80,
                 reject_by_annotation=False, verbose=False
             )
-            psd_after.plot(axes=axes[1], show=False)
+            psd_after.plot(axes=axes[1], show=False, spatial_colors=True)
+
+            # Fix after panel spatial color legend: replace MNE 3D→2D with .locs positions
+            if len(fig.axes) > n_axes_before:
+                host_ax = fig.axes[-1]
+                orig_coll = next((c for c in host_ax.collections
+                                  if hasattr(c, 'get_offsets') and hasattr(c, 'get_array')), None)
+                if orig_coll is not None and len(orig_coll.get_offsets()) > 0:
+                    orig_offsets = orig_coll.get_offsets().copy()
+
+                    head_r_axes = 0.095
+                    for line in host_ax.lines:
+                        r = float(np.sqrt(line.get_xdata()**2 + line.get_ydata()**2).max())
+                        if 0.08 < r < 0.15:
+                            head_r_axes = r
+                            break
+
+                    locs_scale = head_r_axes / 0.5
+                    locs_pos = _load_neuroscan_locs()
+                    ch_names_after = [raw_after.ch_names[i] for i in valid_picks_after]
+
+                    new_offsets = np.zeros_like(orig_offsets)
+                    for i, ch_name in enumerate(ch_names_after):
+                        if i < len(orig_offsets) and ch_name in locs_pos:
+                            new_offsets[i] = locs_pos[ch_name] * locs_scale
+                        elif i < len(orig_offsets):
+                            new_offsets[i] = orig_offsets[i]
+
+                    orig_coll.set_offsets(new_offsets)
+
+                    for line in host_ax.lines:
+                        line.remove()
+
+                    nh = head_r_axes * 0.18
+                    _draw_head_outline(host_ax, head_radius=head_r_axes)
+
+                    max_ext = max(float(np.abs(new_offsets).max()), head_r_axes + nh) * 1.15
+                    host_ax.set_xlim(-max_ext, max_ext)
+                    host_ax.set_ylim(-max_ext, max_ext)
+                    host_ax.set_aspect('equal')
+                    host_ax.axis('off')
 
             # Show channel count and indicate if channels were dropped
             n_dropped = len(valid_picks_before) - len(valid_picks_after)
@@ -2150,9 +2359,9 @@ class PreprocessedQC(BaseQC):
 
         # Define figure order following user's requested sequence
         figure_order = [
-            # 3. Channel Layout (bad channels and clustering)
+            # 3. Channel Layout
             ("bad_channels_topo", "3a. Channel Layout - Bad/removed channels topography (color-coded by reason)"),
-            ("bad_channel_clustering", "3b. Channel Layout - Bad channel clustering analysis (spatial proximity)"),
+            ("bad_channel_clustering", "3c. Channel Layout - Bad channel clustering analysis (spatial proximity)"),
 
             # 4. Power Spectral Density Comparison
             ("before_after", "4. Power Spectral Density - Before vs after preprocessing comparison"),

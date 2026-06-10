@@ -31,6 +31,7 @@ dependencies = [
     "pandas>=1.3",
     "mne>=1.0",
     "mne-icalabel>=0.4",
+    "onnxruntime>=1.15",
     "scikit-learn>=1.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",
@@ -46,6 +47,10 @@ ui = [
 neural = [
     "torch>=2.0",
 ]
+asr = [
+    "eegprep>=0.0.4",
+    "eeglabio>=0.1.3",
+]
 all = [
     "streamlit>=1.20",
     "streamlit-local-storage==0.0.25",
@@ -54,6 +59,8 @@ all = [
     "autoreject>=0.4",
     "nibabel>=4.0",
     "networkx>=2.8",
+    "eegprep>=0.0.4",
+    "eeglabio>=0.1.3",
 ]
 dev = [
     "pytest>=7.0",
