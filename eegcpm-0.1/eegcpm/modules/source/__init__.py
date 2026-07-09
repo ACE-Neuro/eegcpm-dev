@@ -295,13 +295,116 @@ class SourceReconstructionModule(EpochsModule):
             warnings.append(f"Template forward model failed: {e}")
             raise
 
+    def _get_roi_vertex_mapping(
+        self,
+        forward: mne.Forward,
+        roi_radius: float = 10.0,
+    ) -> List[np.ndarray]:
+        """
+        Build a mapping from each CONN ROI to source-space vertex indices.
+
+        For each ROI, finds all source-space vertices within ``roi_radius``
+        (mm, in MNI space) of the ROI's MNI centre on the appropriate
+        hemisphere.  Falls back to the single nearest vertex when no vertices
+        fall within the radius (this happens, e.g., for the cerebellar ROIs
+        which are not on the cortical surface).
+
+        Returns
+        -------
+        list of np.ndarray
+            ``roi_vertex_indices[i]`` is a 1-D int array of row indices into
+            ``stc.data`` for ROI *i*.  Row indices already account for the
+            left-then-right ordering of MNE surface source estimates.
+        """
+        rois = get_conn_rois()
+        mni_coords = get_mni_coordinates()
+
+        # Source-space vertex positions in head coordinates
+        src = forward["src"]
+        mri_head_t = forward["mri_head_t"]
+
+        # fsaverage subjects_dir (where template forward was built)
+        subjects_dir = Path(mne.datasets.fetch_fsaverage(verbose=False)).parent
+
+        lh_vertno = src[0]["vertno"]
+        rh_vertno = src[1]["vertno"]
+        lh_pos_head = src[0]["rr"][lh_vertno]
+        rh_pos_head = src[1]["rr"][rh_vertno]
+
+        # Convert head -> MNI
+        lh_mni = mne.head_to_mni(
+            lh_pos_head, "fsaverage", mri_head_t, subjects_dir
+        )
+        rh_mni = mne.head_to_mni(
+            rh_pos_head, "fsaverage", mri_head_t, subjects_dir
+        )
+
+        n_lh = len(lh_vertno)  # offset for RH indices in stc.data
+        roi_vertex_indices: List[np.ndarray] = []
+
+        for roi, mni in zip(rois, mni_coords):
+            mni_arr = np.asarray(mni, dtype=float)
+            dl = np.sqrt(((lh_mni - mni_arr) ** 2).sum(axis=1))
+            dr = np.sqrt(((rh_mni - mni_arr) ** 2).sum(axis=1))
+
+            if roi.hemisphere == "L":
+                idx = np.where(dl < roi_radius)[0]
+            elif roi.hemisphere == "R":
+                idx = np.where(dr < roi_radius)[0]
+            else:
+                # Midline: pool both hemispheres
+                idx = np.concatenate(
+                    [np.where(dl < roi_radius)[0],
+                     n_lh + np.where(dr < roi_radius)[0]]
+                )
+
+            if len(idx) == 0:
+                # Fallback: use the single nearest vertex
+                if roi.hemisphere == "L":
+                    idx = np.array([int(np.argmin(dl))])
+                elif roi.hemisphere == "R":
+                    idx = np.array([n_lh + int(np.argmin(dr))])
+                else:
+                    if dl.min() <= dr.min():
+                        idx = np.array([int(np.argmin(dl))])
+                    else:
+                        idx = np.array([n_lh + int(np.argmin(dr))])
+
+            roi_vertex_indices.append(idx)
+        return roi_vertex_indices
+
+    def _extract_roi_tc_from_stc(
+        self,
+        stc: mne.SourceEstimate,
+        roi_vertex_indices: List[np.ndarray],
+    ) -> np.ndarray:
+        """
+        Average ``stc.data`` across vertices for each ROI.
+
+        Parameters
+        ----------
+        stc : mne.SourceEstimate
+        roi_vertex_indices : list of np.ndarray
+            Row indices into ``stc.data`` for each ROI.
+
+        Returns
+        -------
+        np.ndarray, shape (n_rois, n_times)
+        """
+        n_rois = len(roi_vertex_indices)
+        roi_tc = np.zeros((n_rois, stc.data.shape[1]), dtype=stc.data.dtype)
+        for i, idx in enumerate(roi_vertex_indices):
+            roi_tc[i, :] = stc.data[idx, :].mean(axis=0)
+        return roi_tc
+
     def _extract_conn_rois(
         self,
         stcs: Dict[str, mne.SourceEstimate],
         forward: mne.Forward,
     ) -> Dict[str, np.ndarray]:
         """
-        Extract time courses for CONN 32 ROIs.
+        Extract time courses for the CONN 32 ROIs by averaging source
+        estimates across vertices within ``roi_radius`` of each ROI centre.
 
         Args:
             stcs: Source estimates per condition
@@ -311,31 +414,17 @@ class SourceReconstructionModule(EpochsModule):
             Dict with ROI time courses per condition
         """
         roi_names = get_roi_names()
-        mni_coords = get_mni_coordinates()
-        n_rois = len(roi_names)
+        roi_radius = self.config.get("roi_radius", 10.0)
+        roi_vertex_indices = self._get_roi_vertex_mapping(forward, roi_radius)
 
         roi_data = {"roi_names": roi_names}
 
         for condition, stc in stcs.items():
-            # Get source positions in MNI space
-            src = forward["src"]
-
-            # Simple nearest-neighbor ROI assignment
-            # For each ROI, find the closest source vertex
-            roi_tc = np.zeros((n_rois, stc.data.shape[1]))
-
-            # This is a simplified version
-            # Full implementation would use proper label extraction
-            for i, (name, coord) in enumerate(zip(roi_names, mni_coords)):
-                # Find sources within sphere around ROI center
-                # Use average of sources within radius
-                roi_tc[i, :] = stc.data[i % stc.data.shape[0], :]
-
+            roi_tc = self._extract_roi_tc_from_stc(stc, roi_vertex_indices)
             roi_data[condition] = roi_tc
             roi_data[f"{condition}_times"] = stc.times
 
         # Add sampling frequency (required for connectivity analysis)
-        # Calculate from times array (assumes uniform sampling)
         if stcs:
             first_stc = list(stcs.values())[0]
             if len(first_stc.times) > 1:
@@ -365,6 +454,10 @@ class SourceReconstructionModule(EpochsModule):
         """
         roi_names = get_roi_names()
         n_rois = len(roi_names)
+
+        # Build ROI -> vertex mapping once
+        roi_radius = self.config.get("roi_radius", 10.0)
+        roi_vertex_indices = self._get_roi_vertex_mapping(forward, roi_radius)
 
         # Group epochs by condition if task config provided
         if self.task_config and 'conditions' in self.task_config:
@@ -407,9 +500,9 @@ class SourceReconstructionModule(EpochsModule):
                 )
 
                 # Extract ROI time courses for this trial
-                for roi_idx in range(n_rois):
-                    # Simplified ROI extraction (use modulo to handle ROI count mismatch)
-                    trial_roi_data[trial_idx, roi_idx, :] = stc.data[roi_idx % stc.data.shape[0], :]
+                trial_roi_data[trial_idx] = self._extract_roi_tc_from_stc(
+                    stc, roi_vertex_indices
+                )
 
             # Store trials for this condition
             roi_data[condition_name] = trial_roi_data  # (n_trials, n_rois, n_times)
