@@ -116,11 +116,17 @@ class SourceReconstructionModule(EpochsModule):
                             # Combine all matching events for this condition
                             condition_epochs = epochs[matching_events]
                             evoked = condition_epochs.average()
+                            # pick_ori="normal": signed current along the cortical
+                            # normal. pick_ori=None (default) would return the
+                            # unsigned norm/magnitude of the loose/free-orientation
+                            # current, which can never go negative and therefore
+                            # cannot represent a bipolar ERP-like waveform.
                             stc = mne.minimum_norm.apply_inverse(
                                 evoked,
                                 inverse_operator,
                                 lambda2=lambda2,
                                 method=self.method,
+                                pick_ori="normal",
                                 verbose=False,
                             )
                             stcs[condition_name] = stc
@@ -133,6 +139,7 @@ class SourceReconstructionModule(EpochsModule):
                             inverse_operator,
                             lambda2=lambda2,
                             method=self.method,
+                            pick_ori="normal",
                             verbose=False,
                         )
                         stcs[condition] = stc
@@ -373,29 +380,95 @@ class SourceReconstructionModule(EpochsModule):
             roi_vertex_indices.append(idx)
         return roi_vertex_indices
 
+    def _get_roi_labels(
+        self,
+        forward: mne.Forward,
+        roi_radius: float = 10.0,
+    ) -> List:
+        """
+        Build proper ``mne.Label`` / ``mne.BiHemiLabel`` objects for each CONN
+        ROI, using the same vertex selection as :meth:`_get_roi_vertex_mapping`.
+
+        These labels are required by ``mne.extract_label_time_course`` with
+        ``mode='mean_flip'``, which correctly handles the sign ambiguity of
+        signed (``pick_ori='normal'``) source estimates: nearby vertices on
+        opposite banks of a sulcus can have opposite-facing cortical normals,
+        so a naive average would partially cancel genuine signal. ``mean_flip``
+        flips each vertex's sign to match the label's dominant orientation
+        before averaging.
+
+        Returns
+        -------
+        list of mne.Label / mne.BiHemiLabel, one per ROI, in CONN-32 order.
+        """
+        rois = get_conn_rois()
+        roi_vertex_indices = self._get_roi_vertex_mapping(forward, roi_radius)
+
+        src = forward["src"]
+        lh_vertno = src[0]["vertno"]
+        rh_vertno = src[1]["vertno"]
+        n_lh = len(lh_vertno)
+
+        labels = []
+        for roi, idx in zip(rois, roi_vertex_indices):
+            lh_sel = idx[idx < n_lh]
+            rh_sel = idx[idx >= n_lh] - n_lh
+
+            sub_labels = []
+            if len(lh_sel) > 0:
+                verts = lh_vertno[lh_sel]
+                pos = src[0]["rr"][verts]
+                sub_labels.append(
+                    mne.Label(vertices=verts, pos=pos, hemi="lh",
+                              name=f"{roi.full_name}-lh", subject="fsaverage")
+                )
+            if len(rh_sel) > 0:
+                verts = rh_vertno[rh_sel]
+                pos = src[1]["rr"][verts]
+                sub_labels.append(
+                    mne.Label(vertices=verts, pos=pos, hemi="rh",
+                              name=f"{roi.full_name}-rh", subject="fsaverage")
+                )
+
+            if len(sub_labels) == 2:
+                labels.append(sub_labels[0] + sub_labels[1])  # BiHemiLabel
+            else:
+                labels.append(sub_labels[0])
+        return labels
+
     def _extract_roi_tc_from_stc(
         self,
         stc: mne.SourceEstimate,
-        roi_vertex_indices: List[np.ndarray],
+        roi_labels: List,
+        src: mne.SourceSpaces,
     ) -> np.ndarray:
         """
-        Average ``stc.data`` across vertices for each ROI.
+        Extract signed ROI time courses using MNE's ``mean_flip`` extraction.
+
+        Requires ``stc`` to have been computed with ``pick_ori='normal'``
+        (signed current along the cortical normal) — averaging unsigned
+        (``pick_ori=None``) magnitude/norm values would defeat the purpose of
+        sign-flipping and cannot represent a bipolar ERP-like waveform.
 
         Parameters
         ----------
         stc : mne.SourceEstimate
-        roi_vertex_indices : list of np.ndarray
-            Row indices into ``stc.data`` for each ROI.
+            Signed source estimate (``pick_ori='normal'``).
+        roi_labels : list of mne.Label / mne.BiHemiLabel
+            One label per ROI, from :meth:`_get_roi_labels`.
+        src : mne.SourceSpaces
+            The source space used to compute ``stc`` (needed for mean_flip's
+            cortical-patch-statistics normals).
 
         Returns
         -------
         np.ndarray, shape (n_rois, n_times)
         """
-        n_rois = len(roi_vertex_indices)
-        roi_tc = np.zeros((n_rois, stc.data.shape[1]), dtype=stc.data.dtype)
-        for i, idx in enumerate(roi_vertex_indices):
-            roi_tc[i, :] = stc.data[idx, :].mean(axis=0)
-        return roi_tc
+        tc = mne.extract_label_time_course(
+            stc, roi_labels, src, mode="mean_flip",
+            allow_empty=True, verbose=False,
+        )
+        return np.asarray(tc)
 
     def _extract_conn_rois(
         self,
@@ -403,11 +476,12 @@ class SourceReconstructionModule(EpochsModule):
         forward: mne.Forward,
     ) -> Dict[str, np.ndarray]:
         """
-        Extract time courses for the CONN 32 ROIs by averaging source
-        estimates across vertices within ``roi_radius`` of each ROI centre.
+        Extract signed time courses for the CONN 32 ROIs using MNE's
+        ``mean_flip`` label extraction (requires ``stcs`` computed with
+        ``pick_ori='normal'``).
 
         Args:
-            stcs: Source estimates per condition
+            stcs: Source estimates per condition (signed, pick_ori='normal')
             forward: Forward model
 
         Returns:
@@ -415,12 +489,13 @@ class SourceReconstructionModule(EpochsModule):
         """
         roi_names = get_roi_names()
         roi_radius = self.config.get("roi_radius", 10.0)
-        roi_vertex_indices = self._get_roi_vertex_mapping(forward, roi_radius)
+        roi_labels = self._get_roi_labels(forward, roi_radius)
+        src = forward["src"]
 
         roi_data = {"roi_names": roi_names}
 
         for condition, stc in stcs.items():
-            roi_tc = self._extract_roi_tc_from_stc(stc, roi_vertex_indices)
+            roi_tc = self._extract_roi_tc_from_stc(stc, roi_labels, src)
             roi_data[condition] = roi_tc
             roi_data[f"{condition}_times"] = stc.times
 
@@ -455,9 +530,10 @@ class SourceReconstructionModule(EpochsModule):
         roi_names = get_roi_names()
         n_rois = len(roi_names)
 
-        # Build ROI -> vertex mapping once
+        # Build ROI labels once (for mean_flip extraction)
         roi_radius = self.config.get("roi_radius", 10.0)
-        roi_vertex_indices = self._get_roi_vertex_mapping(forward, roi_radius)
+        roi_labels = self._get_roi_labels(forward, roi_radius)
+        src = forward["src"]
 
         # Group epochs by condition if task config provided
         if self.task_config and 'conditions' in self.task_config:
@@ -490,18 +566,22 @@ class SourceReconstructionModule(EpochsModule):
                 # Get single trial as evoked (MNE requires Evoked for apply_inverse)
                 single_trial = condition_epochs[trial_idx].average()
 
-                # Compute source estimate for this trial
+                # Compute source estimate for this trial. pick_ori="normal"
+                # gives signed current along the cortical normal (required for
+                # mean_flip label extraction / bipolar ERP-like waveforms) —
+                # see note in the evoked-mode branch of process() above.
                 stc = mne.minimum_norm.apply_inverse(
                     single_trial,
                     inverse_operator,
                     lambda2=lambda2,
                     method=self.method,
+                    pick_ori="normal",
                     verbose=False,
                 )
 
                 # Extract ROI time courses for this trial
                 trial_roi_data[trial_idx] = self._extract_roi_tc_from_stc(
-                    stc, roi_vertex_indices
+                    stc, roi_labels, src
                 )
 
             # Store trials for this condition
