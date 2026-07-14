@@ -163,31 +163,35 @@ def connectivity_command(args):
             print(f"   📂 Loading ROI data: {roi_file.name}")
 
             try:
-                # Load ROI data
-                roi_data = np.load(roi_file)
+                # Load ROI data into a plain dict. Passing NpzFile directly makes the
+                # connectivity module treat the whole archive as one condition
+                roi_npz = np.load(roi_file, allow_pickle=True)
+                roi_data = {key: roi_npz[key] for key in roi_npz.files}
                 print(f"   ✓ Loaded ROI timecourses")
 
-                # Get output directory
-                output_dir = paths.get_connectivity_dir(
-                    preprocessing=preprocessing,
-                    task=task,
-                    source_variant=source_variant,
-                    subject=subject_id,
-                    session=session_id
+                # Get output directory. EEGCPMPaths has no connectivity helper yet
+                output_dir = (
+                    paths.derivatives_root
+                    / "connectivity"
+                    / preprocessing
+                    / task
+                    / source_variant_dir
+                    / f"sub-{subject_id}"
                 )
+                output_dir.mkdir(parents=True, exist_ok=True)
 
                 # Create subject object
                 from types import SimpleNamespace
-                subject = SimpleNamespace(id=subject_id, session=session_id)
+                subject = SimpleNamespace(id=f"sub-{subject_id}", session=session_id)
 
                 # Run connectivity analysis
                 module = ConnectivityModule(
                     config=conn_config,
                     output_dir=output_dir,
-                    task_config=task_config.model_dump() if task_config else None
                 )
 
-                result = module.process({'roi_data': roi_data}, subject=subject)
+                sfreq = float(roi_data.get("sfreq", 500.0))
+                result = module.process(roi_data, subject=subject, sfreq=sfreq)
 
                 if result.success:
                     print(f"   ✅ Success!")
