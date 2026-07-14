@@ -83,6 +83,117 @@ def translate_event_codes(
     return translated
 
 
+def load_events_from_bids_tsv(
+    events_tsv_path: Path,
+    sfreq: float,
+    trial_type_col: str = "trial_type",
+    filter_col: Optional[str] = None,
+    filter_val: Optional[str] = None,
+    max_time: Optional[float] = None,
+) -> tuple:
+    """Load MNE-compatible events from a BIDS events.tsv file.
+
+    Creates an events array and event_id dict from onset/trial_type columns,
+    useful when the preprocessed FIF has no embedded annotations.
+
+    Parameters
+    ----------
+    events_tsv_path : Path
+        Path to BIDS events.tsv file.
+    sfreq : float
+        Sampling frequency (Hz) for converting onset seconds to samples.
+    trial_type_col : str
+        Column name for trial type/condition labels (default: 'trial_type').
+    filter_col : str, optional
+        Column to filter on (e.g., 'phase' to select 'main' trials only).
+    filter_val : str, optional
+        Value to match in filter_col (e.g., 'main').
+    max_time : float, optional
+        Maximum onset time in seconds; events beyond this are excluded.
+
+    Returns
+    -------
+    tuple of (np.ndarray, dict) or (None, None)
+        events: shape (n_events, 3), compatible with mne.Epochs
+        event_id: dict mapping trial_type to integer code
+    """
+    import numpy as np
+    import pandas as pd
+
+    if not events_tsv_path.exists():
+        return None, None
+
+    df = pd.read_csv(events_tsv_path, sep='\t')
+
+    if 'onset' not in df.columns or trial_type_col not in df.columns:
+        return None, None
+
+    # Apply optional filter (e.g., phase == "main")
+    if filter_col and filter_val and filter_col in df.columns:
+        df = df[df[filter_col] == filter_val]
+
+    # Exclude rows with missing onset/trial_type and beyond max_time
+    valid = df['onset'].notna() & df[trial_type_col].notna()
+    if max_time is not None:
+        valid = valid & (df['onset'] <= max_time)
+    df_valid = df[valid]
+
+    if len(df_valid) == 0:
+        return None, None
+
+    unique_types = sorted(df_valid[trial_type_col].unique())
+    event_id = {tt: i + 1 for i, tt in enumerate(unique_types)}
+
+    events = np.array([
+        [int(onset * sfreq), 0, event_id[trial_type]]
+        for onset, trial_type in zip(df_valid['onset'], df_valid[trial_type_col])
+    ], dtype=int)
+
+    return events, event_id
+
+
+def find_events_tsv(
+    bids_root: Path,
+    subject: str,
+    session: str,
+    task: str,
+    run: Optional[str] = None,
+) -> Path:
+    """Find the events.tsv for a BIDS run, trying both with and without run number.
+
+    Parameters
+    ----------
+    bids_root : Path
+        BIDS dataset root directory.
+    subject : str
+        Subject ID (without 'sub-' prefix).
+    session : str
+        Session ID (without 'ses-' prefix).
+    task : str
+        Task name (without 'task-' prefix).
+    run : str, optional
+        Run number (without 'run-' prefix).
+
+    Returns
+    -------
+    Path to existing events.tsv, or empty Path if not found.
+    """
+    eeg_dir = bids_root / f"sub-{subject}" / f"ses-{session}" / "eeg"
+
+    # Try with run number first
+    if run:
+        candidate = eeg_dir / f"sub-{subject}_ses-{session}_task-{task}_run-{run}_events.tsv"
+        if candidate.exists():
+            return candidate
+
+    # Fall back to without run number
+    candidate = eeg_dir / f"sub-{subject}_ses-{session}_task-{task}_events.tsv"
+    if candidate.exists():
+        return candidate
+
+    return Path()
+
+
 def get_event_mapping_for_run(
     bids_root: Path,
     subject: str,
