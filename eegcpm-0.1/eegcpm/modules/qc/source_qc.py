@@ -23,6 +23,13 @@ from .html_report import HTMLReportBuilder
 class SourceQC(BaseQC):
     """Quality control for source reconstruction results."""
 
+    @staticmethod
+    def _format_signal_value(value: float) -> str:
+        """Format source values without rounding tiny eLORETA signals to zero."""
+        if value != 0 and abs(value) < 0.01:
+            return f"{value:.2e}"
+        return f"{value:.4f}"
+
     def _parse_roi_data(self, roi_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Parse ROI data into a consistent format.
@@ -57,20 +64,25 @@ class SourceQC(BaseQC):
             if key not in metadata_keys and not key.endswith('_times'):
                 condition_keys.append(key)
 
-        conditions = sorted(condition_keys)
+        candidate_conditions = sorted(condition_keys)
         times = {}
         data = {}
 
-        for cond in conditions:
+        for cond in candidate_conditions:
             if cond in roi_data:
                 arr = roi_data[cond]
                 # Accept both 2D (evoked) and 3D (trial-level) data
                 if isinstance(arr, np.ndarray) and arr.ndim in [2, 3]:
+                    if arr.ndim == 3:
+                        arr = arr.mean(axis=0)  # Average trials -> (n_rois, n_times)
                     data[cond] = arr
                     # Get times if available
                     times_key = f"{cond}_times"
                     if times_key in roi_data:
                         times[cond] = roi_data[times_key]
+
+        # Only report conditions that produced valid ROI arrays.
+        conditions = sorted(data.keys())
 
         return {
             'roi_names': roi_names,
@@ -116,20 +128,25 @@ class SourceQC(BaseQC):
         # Parse ROI data into consistent format
         parsed = self._parse_roi_data(roi_data) if roi_data else None
 
-        # Add metadata
+        # Add metadata. In trial-level source reconstruction, STCs are intentionally
+        # omitted to avoid huge files, so condition metadata must come from ROI data.
+        roi_conditions = parsed.get('conditions', []) if parsed else []
+        stc_conditions = list(stcs.keys()) if stcs else []
+        conditions = roi_conditions or stc_conditions
         result.metadata['method'] = method
         result.metadata['parcellation'] = parcellation
-        result.metadata['n_conditions'] = len(stcs)
-        result.metadata['conditions'] = list(stcs.keys())
+        result.metadata['n_conditions'] = len(conditions)
+        result.metadata['conditions'] = conditions
 
         # Compute metrics
         if parsed and parsed['roi_names']:
             n_rois = len(parsed['roi_names'])
+            n_rois_with_data = self._count_rois_with_data(parsed)
             result.add_metric(QCMetric(
-                name="ROI Coverage",
-                value=n_rois,
-                unit="ROIs",
-                status="ok" if n_rois > 0 else "bad"
+                name="ROI Time Series Present",
+                value=n_rois_with_data,
+                unit=f"of {n_rois} ROIs",
+                status="ok" if n_rois_with_data == n_rois and n_rois > 0 else "warning"
             ))
 
             # Average signal strength across all ROIs and conditions
@@ -142,7 +159,7 @@ class SourceQC(BaseQC):
                     avg_power = np.mean(all_powers)
                     result.add_metric(QCMetric(
                         name="Average ROI Signal",
-                        value=float(f"{avg_power:.4f}"),
+                        value=float(avg_power),
                         unit="a.u.",
                         status="ok"
                     ))
@@ -215,10 +232,33 @@ class SourceQC(BaseQC):
 
         # Overall status
         has_roi = parsed is not None and len(parsed.get('roi_names', [])) > 0
+        has_roi_data = parsed is not None and bool(parsed.get('data'))
         has_stc = stcs is not None and len(stcs) > 0
-        result.status = "ok" if has_roi and has_stc else "bad"
+        # Trial-level source mode is valid with ROI data and no saved STCs.
+        result.status = "ok" if has_roi and (has_roi_data or has_stc) else "bad"
 
         return result
+
+    def _count_rois_with_data(self, parsed: Dict[str, Any]) -> int:
+        """Count ROIs with finite, non-zero samples in at least one condition."""
+        roi_names = parsed.get('roi_names', [])
+        data = parsed.get('data', {})
+        if not roi_names or not data:
+            return 0
+
+        has_data = np.zeros(len(roi_names), dtype=bool)
+        for arr in data.values():
+            if not isinstance(arr, np.ndarray):
+                continue
+            if arr.ndim == 3:
+                roi_has_data = np.any(np.isfinite(arr) & (arr != 0), axis=(0, 2))
+            elif arr.ndim == 2:
+                roi_has_data = np.any(np.isfinite(arr) & (arr != 0), axis=1)
+            else:
+                continue
+            has_data[: len(roi_has_data)] |= roi_has_data[: len(has_data)]
+
+        return int(has_data.sum())
 
     def _plot_source_power_distribution(
         self,
@@ -251,7 +291,7 @@ class SourceQC(BaseQC):
             ax.legend()
 
         fig.suptitle('Source Power Distribution', fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
         return fig
 
     def _plot_roi_coverage(self, parsed: Dict[str, Any]) -> Optional[plt.Figure]:
@@ -260,20 +300,34 @@ class SourceQC(BaseQC):
         if not roi_names:
             return None
 
-        # All ROIs have data if they're in the data arrays
         n_rois = len(roi_names)
-        has_data = [1] * n_rois  # All ROIs have data in this format
+        has_data = np.zeros(n_rois, dtype=int)
+        data = parsed.get('data', {})
+        for arr in data.values():
+            if not isinstance(arr, np.ndarray):
+                continue
+            if arr.ndim == 3:
+                roi_has_data = np.any(np.isfinite(arr) & (arr != 0), axis=(0, 2))
+            elif arr.ndim == 2:
+                roi_has_data = np.any(np.isfinite(arr) & (arr != 0), axis=1)
+            else:
+                continue
+            has_data[: len(roi_has_data)] |= roi_has_data[: len(has_data)].astype(int)
 
         fig, ax = plt.subplots(figsize=(12, 6))
 
         # Bar plot showing all ROIs have data
-        colors = ['green'] * n_rois
+        colors = ['green' if val else 'red' for val in has_data]
         ax.bar(range(n_rois), has_data, color=colors, alpha=0.7, edgecolor='black')
         ax.set_xticks(range(n_rois))
         ax.set_xticklabels(roi_names, rotation=45, ha='right', fontsize=9)
         ax.set_ylabel('Has Data')
         ax.set_ylim([0, 1.2])
-        ax.set_title(f'ROI Coverage ({n_rois}/{n_rois} ROIs)', fontsize=14, fontweight='bold')
+        ax.set_title(
+            f'ROI Time Series Present ({int(has_data.sum())}/{n_rois} ROIs)',
+            fontsize=14,
+            fontweight='bold'
+        )
         ax.grid(True, alpha=0.3, axis='y')
 
         plt.tight_layout()
@@ -358,7 +412,7 @@ class SourceQC(BaseQC):
                     ax.plot(times, tc, label=cond, alpha=0.8, color=colors[cond_idx % 10])
 
             ax.set_ylabel('Amplitude (a.u.)')
-            ax.set_title(f'{roi_name} (mean power: {power:.4f})')
+            ax.set_title(f'{roi_name} (mean |signal|: {self._format_signal_value(power)})')
             ax.grid(True, alpha=0.3)
             ax.axhline(0, color='k', linestyle='--', linewidth=0.5, alpha=0.5)
             ax.axvline(0, color='r', linestyle='--', linewidth=0.5, alpha=0.5)
@@ -366,8 +420,8 @@ class SourceQC(BaseQC):
                 ax.legend(loc='upper right', fontsize=8)
 
         axes[-1].set_xlabel(time_label)
-        fig.suptitle('ROI Time Courses (Top 6 by Power)', fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        fig.suptitle('ROI Time Courses (Top 6 by Mean Absolute Signal)', fontsize=14, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
         return fig
 
     def _plot_network_summary(self, parsed: Dict[str, Any]) -> Optional[plt.Figure]:
@@ -389,33 +443,37 @@ class SourceQC(BaseQC):
         conditions = parsed.get('conditions', [])
         data = parsed.get('data', {})
 
-        if not roi_names or not data:
+        if not roi_names or not conditions or not data:
             return None
 
-        # Build a mapping from short ROI name to index
-        # ROI names like "DefaultMode.MPFC" -> extract "MPFC"
-        roi_name_to_idx = {}
-        for idx, full_name in enumerate(roi_names):
-            if '.' in full_name:
-                short_name = full_name.split('.', 1)[1]
-            else:
-                short_name = full_name
-            roi_name_to_idx[short_name] = idx
-
-        # Calculate average power per network across conditions
+        # Calculate average signal per network across conditions. Use the network
+        # prefix in names like "DefaultMode.LP" so duplicated L/R ROI names are
+        # both included instead of overwritten in a short-name lookup.
         network_powers = {}
-        for network_name, network_roi_short_names in networks.items():
+        for network_name in networks:
             powers = []
-            for short_name in network_roi_short_names:
-                # Find ROI index
-                if short_name in roi_name_to_idx:
-                    roi_idx = roi_name_to_idx[short_name]
-                    # Average across conditions
-                    for cond in conditions:
-                        if cond in data:
-                            arr = data[cond]  # (n_rois, n_times)
-                            mean_power = np.mean(np.abs(arr[roi_idx, :]))
-                            powers.append(mean_power)
+            roi_indices = [
+                idx for idx, full_name in enumerate(roi_names)
+                if str(full_name).startswith(f"{network_name}.")
+            ]
+            for roi_idx in roi_indices:
+                for cond in conditions:
+                    if cond in data:
+                        arr = data[cond]
+                        mean_power = np.mean(np.abs(arr[roi_idx, :]))
+                        powers.append(mean_power)
+
+            # Backward-compatible fallback for any ROI names without network prefix.
+            if not powers:
+                for short_name in networks[network_name]:
+                    for idx, full_name in enumerate(roi_names):
+                        roi_short = str(full_name).split('.', 1)[-1]
+                        if roi_short == short_name:
+                            for cond in conditions:
+                                if cond in data:
+                                    arr = data[cond]
+                                    mean_power = np.mean(np.abs(arr[idx, :]))
+                                    powers.append(mean_power)
 
             if powers:
                 network_powers[network_name] = np.mean(powers)
@@ -431,8 +489,8 @@ class SourceQC(BaseQC):
         ax.bar(range(len(network_names)), powers, alpha=0.7, edgecolor='black', color='steelblue')
         ax.set_xticks(range(len(network_names)))
         ax.set_xticklabels(network_names, rotation=45, ha='right')
-        ax.set_ylabel('Mean Activation (a.u.)')
-        ax.set_title('Network Activation Summary (CONN 32 ROIs)', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Mean |Signal| (a.u.)')
+        ax.set_title('Network Mean Signal Summary (CONN 32 ROIs)', fontsize=14, fontweight='bold')
         ax.grid(True, alpha=0.3, axis='y')
 
         plt.tight_layout()
@@ -581,7 +639,7 @@ class SourceQC(BaseQC):
             title = f'Source-Level Event-Related Potentials (All {n_rois} ROIs)'
 
         fig.suptitle(title, fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
 
         return fig
 
@@ -730,9 +788,13 @@ class SourceQC(BaseQC):
             cbar = fig.colorbar(im, cax=cbar_ax)
             cbar.set_label('Correlation', rotation=270, labelpad=15, fontsize=10)
 
-        fig.suptitle(f'ROI-to-ROI Correlation Matrix (Sliding Windows: {int(window_size*1000)}ms window, {int(window_step*1000)}ms step)',
-                     fontsize=14, fontweight='bold')
-        plt.tight_layout(rect=[0, 0, 0.92, 0.96])
+        fig.suptitle(
+            f'ROI-to-ROI Correlation Matrix (Sliding Windows: {int(window_size*1000)}ms window, {int(window_step*1000)}ms step)',
+            fontsize=14,
+            fontweight='bold'
+        )
+        # Avoid tight_layout with a manually added colorbar axis.
+        fig.subplots_adjust(left=0.08, right=0.94, top=0.95, bottom=0.05, hspace=0.35, wspace=0.15)
 
         return fig
 
@@ -1130,6 +1192,9 @@ ROI pairs requiring correction.
         builder.add_text(f"Method: {method}")
         builder.add_text(f"Parcellation: {parcellation}")
         builder.add_text(f"Conditions: {n_conditions}")
+        conditions = result.metadata.get('conditions', [])
+        if conditions:
+            builder.add_text(f"Condition names: {', '.join(map(str, conditions))}")
 
         # Metrics section
         if result.metrics:
@@ -1142,16 +1207,16 @@ ROI pairs requiring correction.
             builder.add_raw_html(f'<div class="figure-container"><img src="data:image/png;base64,{result.figures["source_power"]}" alt="Source Power"><div class="figure-caption">Source amplitudes across all source points</div></div>')
 
         if 'roi_coverage' in result.figures:
-            builder.add_header("ROI Coverage", level=2)
-            builder.add_raw_html(f'<div class="figure-container"><img src="data:image/png;base64,{result.figures["roi_coverage"]}" alt="ROI Coverage"><div class="figure-caption">Which ROIs have valid data</div></div>')
+            builder.add_header("ROI Time Series Present", level=2)
+            builder.add_raw_html(f'<div class="figure-container"><img src="data:image/png;base64,{result.figures["roi_coverage"]}" alt="ROI Time Series Present"><div class="figure-caption">ROIs with finite, non-zero time-series samples in at least one condition. This confirms ROI time-course presence, not anatomical coverage quality.</div></div>')
 
         if 'roi_timecourses' in result.figures:
             builder.add_header("ROI Time Courses", level=2)
-            builder.add_raw_html(f'<div class="figure-container"><img src="data:image/png;base64,{result.figures["roi_timecourses"]}" alt="ROI Time Courses"><div class="figure-caption">Time courses for top ROIs by power</div></div>')
+            builder.add_raw_html(f'<div class="figure-container"><img src="data:image/png;base64,{result.figures["roi_timecourses"]}" alt="ROI Time Courses"><div class="figure-caption">Time courses for top ROIs by mean absolute signal.</div></div>')
 
         if 'network_summary' in result.figures:
             builder.add_header("Network Summary", level=2)
-            builder.add_raw_html(f'<div class="figure-container"><img src="data:image/png;base64,{result.figures["network_summary"]}" alt="Network Summary"><div class="figure-caption">Average activation per network (CONN)</div></div>')
+            builder.add_raw_html(f'<div class="figure-container"><img src="data:image/png;base64,{result.figures["network_summary"]}" alt="Network Summary"><div class="figure-caption">Average absolute ROI signal per CONN network.</div></div>')
 
         if 'source_erp' in result.figures:
             builder.add_header("Source-Level Event-Related Potentials", level=2)

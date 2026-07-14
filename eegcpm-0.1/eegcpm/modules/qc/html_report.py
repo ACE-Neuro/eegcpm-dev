@@ -285,7 +285,14 @@ class HTMLReportBuilder:
 
         for metric in metrics:
             status_class = f"status-{metric.status}"
-            value_str = f"{metric.value:.2f}"
+            value = metric.value
+            if isinstance(value, (int, float)):
+                if value != 0 and abs(value) < 0.01:
+                    value_str = f"{value:.2e}"
+                else:
+                    value_str = f"{value:.2f}"
+            else:
+                value_str = str(value)
             if metric.unit:
                 value_str += f" {metric.unit}"
 
