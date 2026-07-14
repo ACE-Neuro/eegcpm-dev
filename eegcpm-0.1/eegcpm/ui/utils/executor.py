@@ -1,6 +1,7 @@
 """Utilities for executing EEGCPM commands from the UI."""
 
 import subprocess
+import sys
 import threading
 import queue
 import time
@@ -135,7 +136,7 @@ def run_eegcpm_command(
         True if command completed successfully
     """
     # Build command
-    cmd = ['eegcpm', command]
+    cmd = [sys.executable, '-m', 'eegcpm.cli.main', command]
 
     for key, value in args.items():
         if isinstance(value, bool):

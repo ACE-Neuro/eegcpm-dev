@@ -358,7 +358,9 @@ def main():
                     # Prepare command arguments
                     args = {
                         'project': str(project_root),
-                        'config': str(config_path)
+                        'config': str(config_path),
+                        'preprocessing': preprocessing,
+                        'task': task,
                     }
 
                     if not process_all and selected_subjects:
