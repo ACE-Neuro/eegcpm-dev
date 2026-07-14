@@ -95,10 +95,6 @@ def read_raw_eeg(input_file: Path):
                 'HEOG': 'eog',
                 'EKG': 'ecg',
                 'EMG': 'emg',
-                'F11': 'misc',
-                'F12': 'misc',
-                'FT11': 'misc',
-                'FT12': 'misc',
             }
             channels_to_set = {ch: t for ch,
                                t in misc_channels.items() if ch in raw.ch_names}
@@ -120,6 +116,17 @@ def read_raw_eeg(input_file: Path):
                 input_file, preload=True, verbose=False)
         case _:
             raise ValueError(f"Unsupported EEG file extension: .{extension}")
+
+    extra_eeg_channels = {
+        'F11': 'eeg',
+        'F12': 'eeg',
+        'FT11': 'eeg',
+        'FT12': 'eeg',
+    }
+    channels_to_set = {ch: t for ch, t in extra_eeg_channels.items() if ch in raw.ch_names}
+    if channels_to_set:
+        raw.set_channel_types(channels_to_set)
+
     return raw
 
 
