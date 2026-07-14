@@ -302,13 +302,14 @@ def batch_config_section(bids_root: Path, eegcpm_path: Path):
         if hpc_eegcpm_root:
             st.session_state['hpc_eegcpm_root'] = hpc_eegcpm_root
 
-        hpc_conda_env = st.text_input(
-            "Conda environment name",
-            value=st.session_state.get('hpc_conda_env', 'eegcpm'),
-            help="Name of conda environment with eegcpm installed"
+        hpc_venv_path = st.text_input(
+            "Venv activate script on HPC",
+            value=st.session_state.get('hpc_venv_path', ''),
+            placeholder="/share/ps_clivewong/eegcpm-dev/eegcpm-0.1/venv/bin/activate",
+            help="Path to the Python venv activate script on HPC"
         )
-        if hpc_conda_env:
-            st.session_state['hpc_conda_env'] = hpc_conda_env
+        if hpc_venv_path:
+            st.session_state['hpc_venv_path'] = hpc_venv_path
 
         hpc_email = st.text_input(
             "Email for notifications (optional)",
@@ -359,7 +360,7 @@ def batch_config_section(bids_root: Path, eegcpm_path: Path):
         'hpc': {
             'bids_root': hpc_bids_root,
             'eegcpm_root': hpc_eegcpm_root,
-            'conda_env': hpc_conda_env,
+            'venv_path': hpc_venv_path,
             'email': hpc_email,
             'partition': hpc_partition,
             'time': hpc_time,
@@ -450,19 +451,22 @@ def generate_slurm_script(config: dict, bids_root: Path, eegcpm_root: Path) -> s
     hpc = config.get('hpc', {})
     hpc_bids = hpc.get('bids_root', '') or '/path/to/your/bids/on/hpc'
     hpc_eegcpm = hpc.get('eegcpm_root', '') or '/path/to/eegcpm-0.1/on/hpc'
-    hpc_conda_env = hpc.get('conda_env', 'eegcpm')
     hpc_email = hpc.get('email', '')
     hpc_partition = hpc.get('partition', 'shared_cpu')
     hpc_time = hpc.get('time', '02:00:00')
     hpc_mem = hpc.get('mem', '16G')
     hpc_cpus = hpc.get('cpus', 4)
 
-    # Determine config file path on HPC
-    config_filename = Path(str(config['config_file'])).name
-    hpc_config_file = f"{hpc_eegcpm}/eegcpm/config/preprocessing/{config_filename}"
-
     # Derive project root (parent of bids/)
     hpc_project_root = hpc_bids.rstrip('/').removesuffix('/bids') if hpc_bids.rstrip('/').endswith('/bids') else hpc_bids
+
+    # Determine config file path on HPC
+    # Use project-level configs (eegcpm/configs/) not repo-level (eegcpm/config/)
+    config_filename = Path(str(config['config_file'])).name
+    hpc_config_file = f"{hpc_project_root}/eegcpm/configs/preprocessing/{config_filename}"
+
+    # Venv path (use user-specified or derive from eegcpm root)
+    hpc_venv = hpc.get('venv_path', '') or f'{hpc_eegcpm}/venv/bin/activate'
 
     # Email line
     email_line = f"#SBATCH --mail-user={hpc_email}" if hpc_email else "# #SBATCH --mail-user=your_email@eduhk.hk"
@@ -504,13 +508,13 @@ TASKS=({tasks_str})
 # ============================================================
 # Environment Setup
 # ============================================================
-source /usr/share/modules/init/profile.sh
-module purge
-module load anaconda/25.1.1
+# Activate Python venv (not conda)
+source "{hpc_venv}"
 
-# Activate conda environment (conda activate not available in scripts)
-CONDA_ENV_PATH="${{HOME}}/.conda/envs"
-export PATH="${{CONDA_ENV_PATH}}/{hpc_conda_env}/bin:$PATH"
+# ============================================================
+# Pre-flight: Clear Python cache to ensure fresh code is loaded
+# ============================================================
+find "$EEGCPM_ROOT" -type d -name "__pycache__" -exec rm -rf {{}} + 2>/dev/null || true
 
 # ============================================================
 # Create output directory (SLURM fails if log dir doesn't exist)
