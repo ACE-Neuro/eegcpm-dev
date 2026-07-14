@@ -90,6 +90,21 @@ class MontageStep(ProcessingStep):
                 if not np.isfinite(loc).all():
                     channels_without_positions.append(raw.ch_names[pick])
 
+            if channels_without_positions:
+                # Try supplementing from bundled Neuroscan .locs file
+                locs_path = Path(__file__).parents[3] / 'data' / 'neuroscan_64ch.locs'
+                if locs_path.exists():
+                    extra_montage = mne.channels.read_custom_montage(str(locs_path))
+                    still_missing = []
+                    for ch_name in channels_without_positions:
+                        if ch_name in extra_montage.ch_names:
+                            idx = raw.ch_names.index(ch_name)
+                            pos = extra_montage.get_positions()['ch_pos'][ch_name]
+                            raw.info['chs'][idx]['loc'][:3] = pos
+                        else:
+                            still_missing.append(ch_name)
+                    channels_without_positions = still_missing
+
             # Drop channels without valid positions
             if channels_without_positions:
                 print(f"[MONTAGE DEBUG] Dropping {len(channels_without_positions)} channels: {channels_without_positions}")
@@ -147,8 +162,7 @@ class MontageStep(ProcessingStep):
             verbose=False,
         )
 
-        # After setting montage, drop channels with NaN/Inf positions
-        # This happens when the montage doesn't include all channels (e.g., E129 in GSN-HydroCel-129)
+        # Try to supplement missing positions from bundled Neuroscan .locs file
         import numpy as np
 
         eeg_picks = mne.pick_types(raw.info, eeg=True, exclude=[])
@@ -156,11 +170,25 @@ class MontageStep(ProcessingStep):
 
         for pick in eeg_picks:
             ch_info = raw.info['chs'][pick]
-            loc = ch_info['loc'][:3]  # x, y, z positions
+            loc = ch_info['loc'][:3]
             if not np.isfinite(loc).all():
                 channels_without_positions.append(raw.ch_names[pick])
 
-        # Drop channels without valid positions
+        if channels_without_positions:
+            locs_path = Path(__file__).parents[3] / 'data' / 'neuroscan_64ch.locs'
+            if locs_path.exists():
+                extra_montage = mne.channels.read_custom_montage(str(locs_path))
+                still_missing = []
+                for ch_name in channels_without_positions:
+                    if ch_name in extra_montage.ch_names:
+                        idx = raw.ch_names.index(ch_name)
+                        pos = extra_montage.get_positions()['ch_pos'][ch_name]
+                        raw.info['chs'][idx]['loc'][:3] = pos
+                    else:
+                        still_missing.append(ch_name)
+                channels_without_positions = still_missing
+
+        # Drop channels still without valid positions
         if channels_without_positions:
             raw.drop_channels(channels_without_positions)
 
