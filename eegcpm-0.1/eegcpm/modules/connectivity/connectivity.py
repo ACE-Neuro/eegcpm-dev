@@ -99,6 +99,47 @@ def compute_cross_spectrum(
     return S[:, :, band_mask], f[band_mask]
 
 
+def compute_cross_spectrum_segments(
+    data: np.ndarray,
+    sfreq: float,
+    band: Tuple[float, float],
+    nperseg: Optional[int] = None,
+    overlap: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-segment complex cross-spectra for all channel pairs.
+
+    The phase-lag estimators (wPLI/dwPLI) need the PER-OBSERVATION
+    cross-spectra: Welch-averaging first and treating frequency bins as
+    observations leaves too few observations for the debiasing to work
+    (inflated values on independent channels — ENG-EEG3R-009).
+
+    data: (n_channels, n_times)
+    Returns: S of shape (n_segments, n_channels, n_channels, n_freqs)
+             and the band-limited frequency vector.
+    """
+    if nperseg is None:
+        nperseg = min(data.shape[-1], int(sfreq))
+    filtered = bandpass(data, sfreq, band)
+    n_ch, n_times = filtered.shape
+    step = max(1, int(nperseg * (1 - overlap)))
+    starts = list(range(0, n_times - nperseg + 1, step))
+    if not starts:
+        raise ValueError(
+            f"recording too short ({n_times} samples) for nperseg={nperseg}"
+        )
+    win = signal.windows.hann(nperseg, sym=False)
+    seg = np.stack([filtered[:, s:s + nperseg] * win for s in starts])
+    seg = seg - seg.mean(axis=-1, keepdims=True)
+    Xf = np.fft.rfft(seg, axis=-1)  # (n_seg, n_ch, n_freqs_rfft)
+    freqs = np.fft.rfftfreq(nperseg, d=1.0 / sfreq)
+    band_mask = (freqs >= band[0]) & (freqs <= band[1])
+    Xf = Xf[:, :, band_mask]
+    freqs = freqs[band_mask]
+    # Cross-spectra per segment: S_ij = X_i * conj(X_j)
+    S = np.einsum("scn,sdn->scdn", Xf, np.conj(Xf))  # (n_seg, ch, ch, F)
+    return S, freqs
+
+
 def compute_wpli(
     data: np.ndarray,
     sfreq: float,
@@ -106,19 +147,20 @@ def compute_wpli(
 ) -> np.ndarray:
     """Weighted Phase Lag Index (Vinck et al. 2011).
 
-    wPLI = |E[sign(Im(S_xy))]| / E[|Im(S_xy)|]
-    where the expectation is over time/frequency bins.
+    wPLI = |E[Im(S_xy)]| / E[|Im(S_xy)|]
+    (equivalently |E[|Im|*sign(Im)]| / E[|Im|]), expectation over
+    independent observations (segments x frequency bins).
+    Bounded in [0, 1].
     """
-    S, f = compute_cross_spectrum(data, sfreq, band)
-    n_channels = S.shape[0]
+    S, f = compute_cross_spectrum_segments(data, sfreq, band)
+    n_channels = S.shape[1]
     M = np.zeros((n_channels, n_channels), dtype=float)
     for i in range(n_channels):
         for j in range(i + 1, n_channels):
-            imag = np.imag(S[i, j])
-            num = np.abs(np.mean(np.sign(imag)))
+            imag = np.imag(S[:, i, j, :]).ravel()
             denom = np.mean(np.abs(imag))
             if denom > 0:
-                M[i, j] = num / denom
+                M[i, j] = np.abs(np.mean(imag)) / denom
                 M[j, i] = M[i, j]
     return M
 
@@ -128,19 +170,22 @@ def compute_dwpli(
     sfreq: float,
     band: Tuple[float, float],
 ) -> np.ndarray:
-    """Debiased wPLI (Vinck et al. 2011).
+    """Debiased squared wPLI (Vinck et al. 2011, eq. 8).
 
-    dwPLI = (sum |Im(S)| * sign(Im(S))) / sum |Im(S)|
+    dwPLI^2 = [ (sum Im_k)^2 - sum Im_k^2 ] / [ (sum |Im_k|)^2 - sum Im_k^2 ]
+    over independent observations (segments x frequency bins).
+    Bounded in [0, 1]; the debiasing removes the small-sample inflation.
     """
-    S, f = compute_cross_spectrum(data, sfreq, band)
-    n_channels = S.shape[0]
+    S, f = compute_cross_spectrum_segments(data, sfreq, band)
+    n_channels = S.shape[1]
     M = np.zeros((n_channels, n_channels), dtype=float)
     for i in range(n_channels):
         for j in range(i + 1, n_channels):
-            imag = np.imag(S[i, j])
-            denom = np.sum(np.abs(imag))
-            if denom > 0:
-                M[i, j] = np.sum(np.abs(imag) * np.sign(imag)) / denom
+            imag = np.imag(S[:, i, j, :]).ravel()
+            num = np.sum(imag) ** 2 - np.sum(imag ** 2)
+            den = np.sum(np.abs(imag)) ** 2 - np.sum(imag ** 2)
+            if den > 0:
+                M[i, j] = max(num / den, 0.0)
                 M[j, i] = M[i, j]
     return M
 

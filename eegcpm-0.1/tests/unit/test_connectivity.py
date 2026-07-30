@@ -184,36 +184,61 @@ def test_connectivity_module_edges():
 
 
 # --------------------------------------------------------------- mne-connectivity cross-check (METH-022)
+# mne-connectivity is a REQUIRED dependency (pinned in the lockfile);
+# these cross-checks must run, never skip.
 
-def test_wpli_close_to_mne_connectivity_if_available():
+def test_wpli_close_to_mne_connectivity():
     """METH-022: cross-check our wPLI against mne-connectivity on a
-    synthetic known-coupling fixture. mne-connectivity is OPTIONAL
-    (not installed in this venv); when absent, the test is skipped."""
-    mne_conn = pytest.importorskip("mne_connectivity", reason="mne_connectivity not installed")
+    synthetic known-coupling fixture."""
+    from mne_connectivity import spectral_connectivity_epochs
     data, sfreq = _make_2ch_signal(duration_s=5)
-    # Our wPLI
     ours = compute_wpli(data, sfreq, band=(8, 13))
-    # mne-connectivity
-    wpli_mne, _freqs = mne_conn.spectral_connectivity(
-        [data], sfreq=sfreq, method="wpli",
-        fmin=[8], fmax=[13], faverage=True, verbose=False,
+    # mne: split into 1-s epochs
+    n_ep = data.shape[1] // sfreq
+    eps = np.stack([data[:, k * sfreq:(k + 1) * sfreq] for k in range(n_ep)])
+    con = spectral_connectivity_epochs(
+        eps, method="wpli", sfreq=sfreq, fmin=8, fmax=13,
+        faverage=True, verbose=False,
     )
-    # wpli_mne shape: (n_pairs, n_connections)
-    assert abs(ours[0, 1] - wpli_mne[0, 0]) < 0.2, (
+    mne_m = con.get_data(output="dense")[:, :, 0]
+    mne_val = max(mne_m[0, 1], mne_m[1, 0])
+    assert abs(ours[0, 1] - mne_val) < 0.2, (
         f"wPLI diverges from mne-connectivity: ours={ours[0, 1]}, "
-        f"mne={wpli_mne[0, 0]}"
+        f"mne={mne_val}"
     )
 
 
-def test_dwpli_close_to_mne_connectivity_if_available():
-    mne_conn = pytest.importorskip("mne_connectivity", reason="mne_connectivity not installed")
+def test_dwpli_close_to_mne_connectivity():
+    from mne_connectivity import spectral_connectivity_epochs
     data, sfreq = _make_2ch_signal(duration_s=5)
     ours = compute_dwpli(data, sfreq, band=(8, 13))
-    dwpli_mne, _freqs = mne_conn.spectral_connectivity(
-        [data], sfreq=sfreq, method="dwpli",
-        fmin=[8], fmax=[13], faverage=True, verbose=False,
+    n_ep = data.shape[1] // sfreq
+    eps = np.stack([data[:, k * sfreq:(k + 1) * sfreq] for k in range(n_ep)])
+    con = spectral_connectivity_epochs(
+        eps, method="wpli2_debiased", sfreq=sfreq, fmin=8, fmax=13,
+        faverage=True, verbose=False,
     )
-    assert abs(ours[0, 1] - dwpli_mne[0, 0]) < 0.2
+    mne_m = con.get_data(output="dense")[:, :, 0]
+    mne_val = max(mne_m[0, 1], mne_m[1, 0])
+    assert abs(ours[0, 1] - mne_val) < 0.2
+
+
+def test_wpli_bounded_zero_one_on_noise():
+    """ENG-EEG3R-009: wPLI/dwPLI must be bounded and must not inflate
+    on independent channels (the old formula gave max=2449.87)."""
+    rng = np.random.RandomState(1)
+    # short signal: bounds must hold (old formula gave max=2449.87)
+    data = rng.randn(4, 4000) * 1e-6
+    w = compute_wpli(data, 500.0, band=(8, 13))
+    d = compute_dwpli(data, 500.0, band=(8, 13))
+    assert w.max() <= 1.0 and w.min() >= 0.0
+    assert d.max() <= 1.0 and d.min() >= 0.0
+    # debiased on longer independent noise (40 s -> ~474 obs): near zero
+    data_long = rng.randn(4, 20000) * 1e-6
+    d_long = compute_dwpli(data_long, 500.0, band=(8, 13))
+    assert d_long.max() < 0.15, (
+        f"dwPLI inflated on independent noise: {d_long.max()}"
+    )
 
 
 # --------------------------------------------------------------- bandpass
