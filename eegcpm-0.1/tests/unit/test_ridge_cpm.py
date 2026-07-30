@@ -78,7 +78,7 @@ def test_escalation_branch_reachable():
     y_dummy = np.zeros(20)
     bs_seen: list = []
 
-    def fake_null(X, y, cfg, B):
+    def fake_null(X, y, cfg, B, covariates=None):
         bs_seen.append(B)
         # n_above = 19 (fixed). The escalation test asserts the
         # 10,000-perm path executed (bs_seen[-1] == 10000). The
@@ -125,7 +125,7 @@ def test_escalation_does_not_fire_outside_window():
     y_dummy = np.zeros(20)
     bs_seen: list = []
 
-    def fake_null(X, y, cfg, B):
+    def fake_null(X, y, cfg, B, covariates=None):
         bs_seen.append(B)
         # p_hat = (1+0)/(1+1000) = 0.001, BELOW escalation window
         return np.full(B, -1.0)
@@ -326,3 +326,30 @@ def test_get_prediction_dir_rejects_mismatched_hash(tmp_path):
         yaml.dump({"config_hash": "DIFFERENT"}, f)
     with pytest.raises(PermissionError, match="different run"):
         paths.get_prediction_dir("model_a")
+
+
+def test_permutation_null_reruns_full_pipeline():
+    """R-008: the permutation null must rerun the complete nested
+    pipeline (repeated_cv_run with tuning + residualization), not a
+    simplified Ridge(alpha=1.0)."""
+    from unittest.mock import patch
+    from eegcpm.evaluation.prediction import ridge_cpm as rc
+
+    cfg = type("Cfg", (), {})()
+    cfg.permutation_seed = 0
+    cfg.cv_n_folds = 2
+    cfg.cv_n_repeats = 1
+    cfg.cv_seed = 0
+    X = np.random.default_rng(0).normal(size=(20, 8))
+    y = np.random.default_rng(1).normal(size=20)
+
+    calls = []
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get("alpha_grid"))
+        return [0.01], [0.0]
+
+    with patch.object(rc, "repeated_cv_run", side_effect=spy):
+        rc._default_permutation_null(X, y, cfg, B=3)
+
+    assert len(calls) == 3, "repeated_cv_run must be called per permutation"
+    assert calls[0] is not None, "alpha_grid must be forwarded (tuning runs)"

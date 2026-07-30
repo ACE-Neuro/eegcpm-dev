@@ -204,6 +204,7 @@ def adaptive_permutation(
     X: np.ndarray, y: np.ndarray,
     cfg: Any, observed_r: float,
     permutation_fn=None,
+    covariates: Optional[np.ndarray] = None,
 ) -> Tuple[float, Tuple[float, float]]:
     """Adaptive permutation (S02): escalation_p_lo, escalation_p_hi.
 
@@ -211,47 +212,55 @@ def adaptive_permutation(
     `test_escalation_branch_reachable` feeds p_hat = .02 and asserts
     the 10,000-perm path executes.
     """
-    from scipy import stats
-    # Stage 1: screening
     if permutation_fn is None:
         permutation_fn = _default_permutation_null
-    null_r = permutation_fn(X, y, cfg, B=cfg.n_permutations_screening)
-    p_hat = (1 + (null_r >= observed_r).sum()) / (
-        1 + cfg.n_permutations_screening)
-    # Stage 2: escalate if p_hat in decision margin
-    if (cfg.n_permutations_confirmatory > cfg.n_permutations_screening
-            and cfg.escalation_p_lo < p_hat < cfg.escalation_p_hi):
-        null_r_full = permutation_fn(
-            X, y, cfg, B=cfg.n_permutations_confirmatory)
-        p_hat = (1 + (null_r_full >= observed_r).sum()) / (
-            1 + cfg.n_permutations_confirmatory)
-    # MC CI
-    B = cfg.n_permutations_screening if not (
+    # Stage 1: screening
+    null_r = permutation_fn(X, y, cfg, B=cfg.n_permutations_screening,
+                            covariates=covariates)
+    B_used = cfg.n_permutations_screening
+    p_hat = (1 + (null_r >= observed_r).sum()) / (1 + B_used)
+    # Stage 2: escalate if p_hat in the decision margin
+    escalated = (
         cfg.n_permutations_confirmatory > cfg.n_permutations_screening
         and cfg.escalation_p_lo < p_hat < cfg.escalation_p_hi
-    ) else cfg.n_permutations_confirmatory
-    p_lo = max(0.0, p_hat - 1.96 * np.sqrt(p_hat * (1 - p_hat) / B))
-    p_hi = min(1.0, p_hat + 1.96 * np.sqrt(p_hat * (1 - p_hat) / B))
+    )
+    if escalated:
+        null_r = permutation_fn(
+            X, y, cfg, B=cfg.n_permutations_confirmatory,
+            covariates=covariates)
+        B_used = cfg.n_permutations_confirmatory
+        p_hat = (1 + (null_r >= observed_r).sum()) / (1 + B_used)
+    # MC CI on the permutation p (R-008: B tracked at decision time,
+    # not re-evaluated after the final p_hat)
+    p_lo = max(0.0, p_hat - 1.96 * np.sqrt(p_hat * (1 - p_hat) / B_used))
+    p_hi = min(1.0, p_hat + 1.96 * np.sqrt(p_hat * (1 - p_hat) / B_used))
     return p_hat, (p_lo, p_hi)
 
 
 def _default_permutation_null(
     X: np.ndarray, y: np.ndarray, cfg: Any, B: int,
+    covariates: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Default permutation null: shuffle y, recompute observed r."""
-    from sklearn.model_selection import KFold
-    from sklearn.linear_model import Ridge
+    """Permutation null: shuffle y and rerun the COMPLETE nested
+    pipeline (covariate residualization, inner-loop alpha tuning over
+    the pinned grid, R repeats, seed lineage) per permutation — the
+    same pipeline that produced the observed statistic (R-008)."""
     rng = np.random.default_rng(cfg.permutation_seed)
-    kf = KFold(n_splits=cfg.cv_n_folds, shuffle=True,
-               random_state=cfg.cv_seed)
+    n_repeats = getattr(cfg, "cv_n_repeats", CV_N_REPEATS)
+    alpha_grid = getattr(cfg, "alpha_grid", ALPHA_GRID)
+    inner_cv_seed = getattr(cfg, "inner_cv_seed", CV_SEED)
     null_r = np.zeros(B)
     for i in range(B):
         y_perm = rng.permutation(y)
-        y_true, y_pred = [], []
-        for tr, te in kf.split(X):
-            m = Ridge(alpha=1.0, fit_intercept=True)
-            m.fit(X[tr], y_perm[tr])
-            y_true.append(y_perm[te])
-            y_pred.append(m.predict(X[te]))
-        null_r[i] = _pooled_out_of_fold_r(y_true, y_pred)
+        rep_r, _ = repeated_cv_run(
+            X, y_perm,
+            covariates=covariates,
+            n_folds=cfg.cv_n_folds,
+            n_repeats=n_repeats,
+            cv_seed=cfg.cv_seed,
+            alpha_grid=alpha_grid,
+            inner_cv_seed=inner_cv_seed,
+        )
+        # Same statistic reduction as the observed run: mean over repeats
+        null_r[i] = float(np.mean(rep_r))
     return null_r
