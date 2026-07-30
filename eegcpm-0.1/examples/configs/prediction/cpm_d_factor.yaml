@@ -1,0 +1,63 @@
+# GOLDEN CONFIG — CPM prediction (spec §3.b + §3.s)
+stage: prediction
+variant: ridge_all_edges
+is_primary: true
+
+target:
+  file: frozen_d_scores_v1.parquet   # in DUA root only
+  column: d
+  allow_list: [subject_id, d, internalizing, externalizing, adhd_attention,
+               age, sex, site, release_number, frac_channels_passing]
+
+model:
+  type: ridge
+  edge_selection: none           # ridge on ALL edges (METH-001 primary)
+  alpha_grid: [0.01, 0.0334, 0.1115, 0.3723, 1.2426, 4.1463, 13.836,
+               46.174, 154.09, 514.22, 1715.9, 5726.3, 19110.0, 63768.0,
+               212809.0, 710052.0, 2368793.0]   # logspace(-2,6,17) literals
+  boundary_hit_flag_fraction: 0.10
+
+edge_selection_sensitivity:
+  enabled: true                  # labelled sensitivity ONLY
+  method: bh_fdr
+  q: 0.05
+
+cv:
+  strategy: kfold
+  n_folds: 5
+  n_repeats: 10
+  cv_seed: 20260729
+  inner_cv_seed: 20260730
+  statistic: pooled_out_of_fold_pearson
+
+covariates:
+  adjustment_mode: residualize_features_train_only   # pinned primary (S06)
+  unpenalized_columns:            # single source: §3.f lists (S05)
+    - age_spline_1
+    - age_spline_2
+    - age_spline_3
+    - age_spline_4
+    - sex_M
+    - site_RU
+    - site_CBIC
+    - site_CUNY
+    - raw_bad_channel_count
+    - duration_attempted_seconds
+    - alpha_theta_trajectory
+    - alpha_dropout_count
+    - theta_intrusion_index
+    - frac_channels_passing
+
+permutation:
+  n_permutations_screening: 1000
+  n_permutations_confirmatory: 10000
+  escalation_p_lo: 0.005
+  escalation_p_hi: 0.10
+  permutation_seed: 20260731
+  stratification: site
+  full_pipeline_rerun: true      # residualization + tuning + repeats per permutation
+
+dua:
+  prediction_root_required: true
+  refuse_share_paths: true
+  require_mode_0700: true

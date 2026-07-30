@@ -1,0 +1,65 @@
+# GOLDEN CONFIG — preprocessing (spec §3.i + §3.s)
+# Deterministic Langer+ASR chain. Any content change breaks the
+# golden-config-hash CI test — change requires a new parity run.
+stage: preprocessing
+variant: hbn_langer
+is_primary: true
+
+channel_roles:
+  reference_channel: Cz          # typed eeg + is_reference flag
+  eog_channels: [8, 14, 17, 21, 25, 125, 126, 127, 128]  # HydroCel numbers
+  drop_neck_face: true
+  expected_scalp_count: 109
+
+line_noise:
+  method: zapline                # BEFORE low-pass (S19/METH-019)
+  freq: 60.0
+  n_harmonics: 3
+
+filter:
+  type: fir
+  l_freq: 0.1
+  h_freq: 45.0                   # flat passband covers the 2–40 Hz fit band
+  phase: zero
+
+bad_channel_detection:
+  method: langer_stats           # variance + kurtosis + spectrum, >3 SD
+  threshold_sd: 3.0
+  mark_only: true                # interpolation is a separate later step
+  exempt_reference: true         # Cz exempt BEFORE detection
+  max_bad_scalp: 11              # of 109 (per-recording inclusion gate)
+
+interpolate:
+  method: spherical_spline
+  exempt_reference: true
+
+eog_regression:
+  enabled: true
+  solver: lstsq                  # SVD-based, rank/condition diagnostics
+
+robust_pca:
+  enabled: true
+  method: ialm
+  lam: 0.00316227766             # 1/sqrt(max(n_channels=109, n_times=100000)) canonical
+  max_iter: 1000
+  tol: 1.0e-7
+
+asr:
+  enabled: true
+  window_criterion: 0.2          # eegprep WindowCriterion = rejection FRACTION
+  fixed_first_60s: true
+  retain_burst_mask: true        # for the ASR-burden sensitivity covariate
+
+block_rejection:
+  block_seconds: 2.0
+  max_rejected_fraction: 0.20    # hard-fail the recording above this
+
+reref:
+  method: average
+  picks: eeg                     # includes Cz (eeg-typed, is_reference)
+  post_ref_cz_variance_check: true
+  mark_cz_recovered: true
+
+determinism:
+  seed: 20260729
+  fatal_on_required_step_error: true

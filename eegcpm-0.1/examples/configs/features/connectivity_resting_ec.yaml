@@ -1,0 +1,24 @@
+# GOLDEN CONFIG — sensor connectivity (spec §3.k + §3.s)
+stage: features
+variant: connectivity_resting_ec
+condition: resting_ec
+input_mode: sensor               # NOT source (sensor-space locked)
+
+channels: 109                    # scalp only; edges = 5,886 per matrix
+
+methods_primary: [wpli, dwpli, aec_orth]
+methods_replication: [coherence, plv]
+
+frequency_bands:
+  delta: [2.0, 4.0]
+  theta: [4.0, 8.0]
+  alpha: [8.0, 13.0]
+  beta: [13.0, 30.0]
+  gamma: [30.0, 45.0]
+
+estimator:
+  n_per_seg: 1000                # per-segment cross-spectra (observation set)
+  overlap: 0.5
+  window: hann
+
+cross_check: mne_connectivity    # mandatory fixture in tests

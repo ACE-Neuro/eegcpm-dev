@@ -171,6 +171,98 @@ def run_parity_harness(
         print(f"  {stage}: {path}")
 
 
+def compare_parity_dirs(
+    local_dir: Path,
+    hpc_dir: Path,
+) -> "pd.DataFrame":
+    """Execute the parity comparison between a local and an HPC output
+    directory (R-013: executable, not intent-printing).
+
+    Compares, per subject subdirectory: the preprocessed FIF data
+    array (bitwise row), the specparam feature parquet (numeric row),
+    the connectivity NPZ edges (numeric row), ISC scores (numeric
+    row), the CPM out-of-fold r (numeric row), and the fold
+    assignments (bitwise row). Returns a verdict table with one row
+    per (subject, output) and a computed pass column — no hardcoded
+    verdicts (Class 6).
+    """
+    import numpy as np
+    import pandas as pd
+
+    local_dir = Path(local_dir)
+    hpc_dir = Path(hpc_dir)
+    rows = []
+
+    subjects = sorted(
+        p.name for p in local_dir.iterdir()
+        if p.is_dir() and (hpc_dir / p.name).is_dir()
+    )
+    if not subjects:
+        raise FileNotFoundError(
+            f"no common subject directories under {local_dir} and {hpc_dir}"
+        )
+
+    def _cmp(subject, output_name, lv, hv):
+        passed, msg = check_parity_tolerance(output_name, lv, hv)
+        rows.append({
+            "subject": subject, "output": output_name,
+            "pass": bool(passed), "detail": msg,
+        })
+
+    for sid in subjects:
+        ldir, hdir = local_dir / sid, hpc_dir / sid
+
+        # Preprocessed FIF data array (bitwise claim)
+        lf, hf = ldir / "preprocessed_raw.fif", hdir / "preprocessed_raw.fif"
+        if lf.exists() and hf.exists():
+            import mne
+            lraw = mne.io.read_raw_fif(lf, preload=True, verbose=False)
+            hraw = mne.io.read_raw_fif(hf, preload=True, verbose=False)
+            _cmp(sid, "Preprocessed FIF data array",
+                 lraw.get_data(), hraw.get_data())
+
+        # specparam feature parquet
+        lf, hf = ldir / "specparam_features.parquet", hdir / "specparam_features.parquet"
+        if lf.exists() and hf.exists():
+            lp = pd.read_parquet(lf)
+            hp = pd.read_parquet(hf)
+            num_cols = lp.select_dtypes("number").columns
+            _cmp(sid, "specparam feature Parquet",
+                 lp[num_cols].to_numpy(), hp[num_cols].to_numpy())
+
+        # Connectivity NPZ edges
+        lf, hf = ldir / "connectivity_edges.npz", hdir / "connectivity_edges.npz"
+        if lf.exists() and hf.exists():
+            le = np.load(lf)["edges"]
+            he = np.load(hf)["edges"]
+            _cmp(sid, "Connectivity NPZ (edge weights)", le, he)
+
+        # ISC scores
+        lf, hf = ldir / "isc_scores.parquet", hdir / "isc_scores.parquet"
+        if lf.exists() and hf.exists():
+            lp = pd.read_parquet(lf)
+            hp = pd.read_parquet(hf)
+            _cmp(sid, "ISC scores", lp["isc"].to_numpy(),
+                 hp["isc"].to_numpy())
+
+        # CPM out-of-fold r
+        lf, hf = ldir / "cpm_result.npz", hdir / "cpm_result.npz"
+        if lf.exists() and hf.exists():
+            lr = np.load(lf)["oof_r"]
+            hr = np.load(hf)["oof_r"]
+            _cmp(sid, "CPM out-of-fold r", lr, hr)
+
+        # Fold assignments (bitwise)
+        lf, hf = ldir / "fold_assignments.npy", hdir / "fold_assignments.npy"
+        if lf.exists() and hf.exists():
+            _cmp(sid, "lineage_test (fold assignments)",
+                 np.load(lf), np.load(hf))
+
+    verdict = pd.DataFrame(rows)
+    verdict["pass"] = verdict["pass"].astype(bool)
+    return verdict
+
+
 def check_parity_tolerance(
     output_name: str,
     local_value: Any, hpc_value: Any,

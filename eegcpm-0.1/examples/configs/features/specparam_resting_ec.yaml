@@ -1,0 +1,35 @@
+# GOLDEN CONFIG — specparam features (spec §3.j + §3.s)
+stage: features
+variant: specparam_resting_ec
+condition: resting_ec
+
+backend: specparam               # SPECPARAM_BACKEND switch: specparam|fooof
+backend_pin: "2.0.0rc7"
+
+psd:
+  method: welch
+  n_per_seg: 1000                # ABSOLUTE, identical across all conditions
+  overlap: 0.5
+  window: hann
+  detrend: constant
+  record_segment_count: true
+
+model:
+  aperiodic_mode: fixed          # single mode for ALL channels/subjects
+  freq_range: [2.0, 40.0]
+  peak_width_limits: [1.0, 8.0]
+  max_n_peaks: 6
+  min_peak_height: 0.05
+
+knee_arm:
+  enabled: true                  # exploratory only
+  separate_columns: true         # exponent_knee/offset_knee; never pooled
+  bic_margin: 10
+  drop_arm_if_knee_below: 0.20
+
+fit_qc:
+  r_squared_min: 0.90
+  rmse_max: 0.10                 # log10-power units, in-house binding definition
+  rmse_definition: "sqrt(mean((log10(power) - log10(modeled))^2))"
+  flagged_not_dropped: true
+  report_failure_rates_per_condition: true

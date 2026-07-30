@@ -1,0 +1,21 @@
+# GOLDEN CONFIG — drowsiness metrics (spec §3.d + §3.s)
+stage: features
+variant: drowsiness_metrics
+
+metrics:
+  alpha_theta_trajectory:
+    block_seconds: 40
+  alpha_dropout_count:
+    threshold_fraction_of_median: 0.5
+    min_seconds: 3.0
+  theta_intrusion_index:
+    band: [4.0, 8.0]
+
+covariate_role: unconditional    # target-blind, mandatory in primary model
+
+attenuation_verdict:
+  threshold: 0.30                # 30% downgrade rule (A-RT19 restored)
+  bootstrap_B: 1000
+  seed: 20260729
+  inconclusive_band: true
+  precedence: primary            # §3.d verdict primary; §3.e corroborating
