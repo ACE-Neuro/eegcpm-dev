@@ -241,10 +241,10 @@ class SourceConfig(BaseModel):
     """Source reconstruction configuration."""
 
     stage: str = Field(default="source", description="Processing stage")
-    variant: str = Field(..., description="Variant name (e.g., 'dSPM-CONN32')")
+    variant: str = Field(default="sLORETA-CONN32", description="Variant name (e.g., 'dSPM-CONN32')")
 
     depends_on: Dict[str, str] = Field(
-        ...,
+        default_factory=dict,
         description="Dependencies: {preprocessing: variant, task: name, epochs: variant}"
     )
 
