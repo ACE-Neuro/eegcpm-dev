@@ -31,7 +31,7 @@ from eegcpm.modules.preprocessing.steps.channel_roles import (
     EGI_129_REFERENCE_CHANNEL,
 )
 from eegcpm.modules.preprocessing.hbn_langer_chain import (
-    _derive_asr_burst_mask,
+    _derive_asr_burden,
     build_hbn_langer_chain,
 )
 
@@ -132,14 +132,14 @@ def test_derive_asr_burst_mask_non_zero_on_burst():
     post_data = pre_data.copy()
     post_data[:, 5000:6000] = rng.randn(n_channels, 1000) * 1e-6
     post_raw = mne.io.RawArray(post_data, info.copy())
-    mask = _derive_asr_burst_mask(pre_raw, post_raw)
+    mask, rejected, repaired, burden = _derive_asr_burden(pre_raw, post_raw)
     n_burst = int(mask.sum())
     assert n_burst > 0, (
         f"ASR burst mask is empty on a clear burst fixture; "
         f"n_burst={n_burst}"
     )
-    burden = n_burst / len(mask)
     assert burden > 0.0, "ASR burden is zero; mask fabrication detected"
+    assert repaired > 0.0, "repaired fraction is zero on a burst fixture"
 
 
 # --- R-006: block rejection hard-fail ---
