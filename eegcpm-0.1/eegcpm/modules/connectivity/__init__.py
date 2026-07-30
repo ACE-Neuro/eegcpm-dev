@@ -827,3 +827,26 @@ class ConnectivityModule(BaseModule):
         return {
             "connectivity": "Dict of connectivity matrices",
         }
+
+
+# --- New (Stage 4) connectivity exports (per spec §3.k) ---
+# These are the SENSOR-SPACE methods used by the EEG d-factor arm.
+# They supplement the legacy SOURCE-SPACE ConnectivityModule above.
+
+from .connectivity import (
+    ALL_METHODS,
+    FREQUENCY_BANDS,
+    PRIMARY_METHODS,
+    REPLICATION_METHODS,
+    bandpass,
+    compute_aec_orth,
+    compute_connectivity,
+    compute_coherence,
+    compute_cross_spectrum,
+    compute_dwpli,
+    compute_plv,
+    compute_wpli,
+    edges_to_matrix,
+    matrix_to_edges,
+    upper_triangle_indices,
+)

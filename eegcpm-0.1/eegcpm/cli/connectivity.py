@@ -42,6 +42,11 @@ def connectivity_command(args):
     preprocessing = getattr(args, 'preprocessing', None)
     task = getattr(args, 'task', None)
     source_variant = getattr(args, 'source', None)
+    # ENG-008: --space {sensor, source} is the new discriminator
+    # for sensor-input mode. Default to 'source' for backwards
+    # compatibility with the existing CLI; 'sensor' is the new
+    # mode for the EEG d-factor arm.
+    space = getattr(args, 'space', 'source')
 
     # Fall back to config if not specified on CLI
     depends_on = conn_config.get('depends_on', {})
@@ -52,17 +57,30 @@ def connectivity_command(args):
     if not source_variant:
         source_variant = depends_on.get('source')
 
-    if not all([preprocessing, task, source_variant]):
-        raise ValueError("Must specify --preprocessing, --task, and --source (or include in config)")
+    # In sensor mode, --source is NOT required (we compute
+    # connectivity directly on the preprocessed EEG).
+    if space == "source":
+        if not all([preprocessing, task, source_variant]):
+            raise ValueError(
+                "Must specify --preprocessing, --task, and --source "
+                "(or include in config) in source space.")
+    else:
+        if not all([preprocessing, task]):
+            raise ValueError(
+                "Must specify --preprocessing and --task in sensor space.")
 
     print(f"   Methods: {', '.join(conn_config.get('methods', []))}")
     print(f"   Frequency Bands: {', '.join(conn_config.get('frequency_bands', {}).keys())}")
     print(f"   Time Windows: {len(conn_config.get('time_windows', []))}")
+    print(f"   Space: {space}")
 
     print(f"\n📊 Dependencies:")
     print(f"   Preprocessing: {preprocessing}")
     print(f"   Task: {task}")
-    print(f"   Source Variant: {source_variant}")
+    if space == "source":
+        print(f"   Source Variant: {source_variant}")
+    else:
+        print(f"   Space: sensor (no source variant needed)")
 
     # Initialize paths
     paths = EEGCPMPaths(project_root)

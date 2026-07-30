@@ -341,7 +341,8 @@ For more information: https://github.com/clivehywong/eegcpm-dev
     connectivity_parser = subparsers.add_parser(
         'connectivity',
         help='Run connectivity analysis',
-        description='Compute functional connectivity from source ROI timecourses'
+        description='Compute functional connectivity from source ROI timecourses '
+                    'or sensor-space EEG (per ENG-008: --space {sensor, source}).'
     )
     connectivity_parser.add_argument(
         '--project',
@@ -370,8 +371,18 @@ For more information: https://github.com/clivehywong/eegcpm-dev
     connectivity_parser.add_argument(
         '--source',
         type=str,
-        required=True,
-        help='Source variant (e.g., eLORETA-CONN32)'
+        required=False,    # ENG-008: optional in sensor mode
+        default=None,
+        help='Source variant (e.g., eLORETA-CONN32); required in --space source, '
+             'ignored in --space sensor.'
+    )
+    connectivity_parser.add_argument(
+        '--space',
+        type=str,
+        choices=['sensor', 'source'],
+        default='source',    # backwards-compatible default
+        help='Connectivity computation space: "sensor" (direct on EEG) or '
+             '"source" (on ROI timecourses, requires --source).'
     )
     connectivity_parser.add_argument(
         '--subjects',
