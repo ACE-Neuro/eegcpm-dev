@@ -11,6 +11,8 @@ from .import_qc import import_qc_command
 from .epochs import epochs_command, discover_events_command
 from .source_reconstruct import source_reconstruct_command
 from .connectivity import connectivity_command
+from .features import features_command, add_features_parser
+from .predict import predict_command, add_predict_parser
 
 
 def main():
@@ -384,6 +386,11 @@ For more information: https://github.com/clivehywong/eegcpm-dev
         help='Connectivity computation space: "sensor" (direct on EEG) or '
              '"source" (on ROI timecourses, requires --source).'
     )
+
+    # Features and predict commands (R-002: CLI wiring for L2,
+    # primary-config validator, and DUA path enforcement)
+    add_features_parser(subparsers)
+    add_predict_parser(subparsers)
     connectivity_parser.add_argument(
         '--subjects',
         type=str,
@@ -427,6 +434,10 @@ For more information: https://github.com/clivehywong/eegcpm-dev
             source_reconstruct_command(args)
         elif args.command == 'connectivity':
             connectivity_command(args)
+        elif args.command == 'features':
+            features_command(args)
+        elif args.command == 'predict':
+            predict_command(args)
         else:
             parser.print_help()
             sys.exit(1)

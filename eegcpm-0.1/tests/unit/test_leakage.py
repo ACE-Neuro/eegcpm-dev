@@ -45,8 +45,8 @@ def test_l1_load_does_not_raise_on_source_contents(tmp_path):
     what it is; the assertion is the log, not a raise)."""
     tsv = tmp_path / "participants.tsv"
     tsv.write_text(
-        "participant_id\tp_factor\tattention\tinternalizing\n"
-        "sub-01\t0.5\t0.3\t0.4\n"
+        "participant_id\tp_factor\tattention\n"
+        "sub-01\t0.5\t0.3\n"
     )
     # No raise
     df = l1_load_participants_tsv(path=tsv,
@@ -54,22 +54,46 @@ def test_l1_load_does_not_raise_on_source_contents(tmp_path):
     # Only allowed columns present
     assert "p_factor" not in df.columns
     assert "attention" not in df.columns
-    assert "internalizing" in df.columns
     assert "participant_id" in df.columns
 
 
-def test_l1_load_preserves_exploratory_specifics(tmp_path):
-    """R2: un-prefixed specific factors (internalizing, externalizing,
-    adhd_attention) are in the allow-list and survive L1."""
+def test_l1_load_preserves_exploratory_specifics_in_frozen_scores(tmp_path):
+    """R-003: un-prefixed specific factors (internalizing, externalizing,
+    adhd_attention) are in the FROZEN-SCORE allow-list (NOT the
+    participants.tsv allow-list). They are archive factor scores
+    in participants.tsv; they belong to the frozen-score file."""
+    parquet_path = tmp_path / "frozen.parquet"
+    import pandas as pd
+    pd.DataFrame({
+        "subject_id": ["S1", "S2"],
+        "d": [0.5, 0.6],
+        "internalizing": [0.3, 0.4],
+        "externalizing": [0.2, 0.3],
+        "adhd_attention": [0.1, 0.2],
+    }).to_parquet(parquet_path)
+    from eegcpm.core.leakage import l1_load_frozen_scores
+    df = l1_load_frozen_scores(path=parquet_path)
+    assert "internalizing" in df.columns
+    assert "externalizing" in df.columns
+    assert "adhd_attention" in df.columns
+    assert "d" in df.columns
+
+
+def test_l1_drops_specifics_in_participants_tsv(tmp_path):
+    """R-003: internalizing/externalizing/adhd_attention in
+    participants.tsv are dropped (they belong to the frozen-score
+    file, not participants.tsv)."""
     tsv = tmp_path / "participants.tsv"
     tsv.write_text(
         "participant_id\tinternalizing\texternalizing\tadhd_attention\n"
         "sub-01\t0.5\t0.3\t0.4\n"
     )
-    df = l1_load_participants_tsv(path=tsv)
-    assert "internalizing" in df.columns
-    assert "externalizing" in df.columns
-    assert "adhd_attention" in df.columns
+    df = l1_load_participants_tsv(path=tsv,
+                                    allow_list=PARTICIPANTS_TSV_ALLOW_LIST)
+    assert "internalizing" not in df.columns
+    assert "externalizing" not in df.columns
+    assert "adhd_attention" not in df.columns
+    assert "participant_id" in df.columns
 
 
 # --------------------------------------------------------------- L2 tests

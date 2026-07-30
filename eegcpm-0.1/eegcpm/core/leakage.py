@@ -1,18 +1,23 @@
 """
-Leakage guards — three-layer architecture (per S01 + R2 in the spec).
+Leakage guards — three-layer architecture (per S01 + R-003 in the spec).
+
+R-003: provenance separation is by SOURCE FILE, not by column name.
+The participants.tsv allow-list does NOT include internalizing /
+externalizing / adhd_attention (they are archive factor scores
+in that file). The frozen-score target file has its own SEPARATE
+allow-list (`FROZEN_SCORE_ALLOW_LIST`).
 
 L1 READER (`l1_load_participants_tsv`): allow-list projection + logged
-assertion. NEVER raises on source-file contents. The reader preserves
-all data while logging what is dropped.
+assertion for participants.tsv ONLY. NEVER raises on source-file
+contents.
+
+L1b READER (`l1_load_frozen_scores`): separate allow-list for the
+frozen-score target file.
 
 L2 MODEL BOUNDARY (`l2_assert_no_blocked_columns`): hard raise if any
 block-listed name or alias reaches the feature frame or the
-predictor's design matrix. The block patterns no longer include
-`^archive_.*$`; archive_* columns are the OUTPUT of L3, not the
-input to L2. Internalizing/externalizing/adhd_attention are removed
-from the exact block list (R2) — they are allowed un-prefixed (the
-exploratory specific-factors arm) and the archive-origin invariant
-catches un-prefixed archive columns without L3 provenance.
+predictor's design matrix. The archive-origin invariant (L3) is
+the binding guard for un-prefixed archive-origin columns.
 
 L3 SENSITIVITY ENTRY POINT (`l3_load_archive_scores`): single audited
 function that may load archive scores, into archive_-prefixed columns,
@@ -32,9 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------- L1
-# L1 allow-list (the frozen projection). S01: includes the exploratory
-# specific factors; the L2 hard-raise on internalizing/externalizing
-# is REPLACED by the L2 archive-origin invariant (R2).
+# L1 allow-list for participants.tsv (R-003): does NOT include
+# internalizing/externalizing/adhd_attention (those are archive
+# factor scores in participants.tsv per clarified-idea.md:143-146).
 PARTICIPANTS_TSV_ALLOW_LIST: List[str] = [
     # Identity
     "participant_id", "subject_id",
@@ -52,7 +57,19 @@ PARTICIPANTS_TSV_ALLOW_LIST: List[str] = [
     "symbolSearch",
     # Consent
     "commercial_use", "full_pheno",
-    # Exploratory specific factors (S01: now in allow-list)
+]
+
+# L1b allow-list for the FROZEN-SCORE target file (e.g.
+# frozen_d_scores_v1.parquet). The frozen-score file has documented
+# columns {subject_id, d, internalizing, externalizing, adhd_attention}
+# (per clarified-idea.md:36-38). The L1b allow-list matches the
+# frozen-score file's actual content; the L2 leak check is applied
+# after this projection.
+FROZEN_SCORE_ALLOW_LIST: List[str] = [
+    "subject_id",
+    "d",
+    # The specific factors (S01: now allowed in the target allow-list
+    # for the exploratory arm)
     "internalizing", "externalizing", "adhd_attention",
 ]
 
@@ -62,12 +79,13 @@ def l1_load_participants_tsv(
     allow_list: Optional[List[str]] = None,
     log_path: Optional[Path] = None,
 ) -> pd.DataFrame:
-    """L1: load participants.tsv, project to allow-list, log dropped
-    columns. NEVER raises on source contents.
+    """L1 (participants.tsv): load + project to allow-list + log
+    dropped. NEVER raises on source contents.
 
-    The dropped columns are LOGGED to `log_path` (if provided) AND to
-    the module logger. The returned DataFrame contains only the
-    allow-listed columns that are present in the source.
+    R-003: internalizing/externalizing/adhd_attention are NOT in
+    the participants.tsv allow-list (they are archive factor scores
+    in that file). Use `l1_load_frozen_scores` for the frozen-score
+    file.
     """
     allow_list = allow_list if allow_list is not None else PARTICIPANTS_TSV_ALLOW_LIST
     df = pd.read_csv(path, sep="\t")
@@ -76,6 +94,32 @@ def l1_load_participants_tsv(
     dropped = sorted(loaded_cols - allowed)
     if dropped:
         msg = f"[L1 LOAD] {path} dropped columns not in allow-list: {dropped}"
+        logger.warning(msg)
+        if log_path is not None:
+            with open(log_path, "a") as f:
+                f.write(msg + "\n")
+    return df[[c for c in allow_list if c in loaded_cols]]
+
+
+def l1_load_frozen_scores(
+    path: Path,
+    allow_list: Optional[List[str]] = None,
+    log_path: Optional[Path] = None,
+) -> pd.DataFrame:
+    """L1b (frozen-score target file): load + project to allow-list.
+
+    R-003: this is a SEPARATE allow-list for the frozen-score target
+    file. The two L1 readers are SOURCE-FILE-specific; the
+    participants.tsv reader does NOT include internalizing/externalizing
+    /adhd_attention, and the frozen-score reader does.
+    """
+    allow_list = allow_list if allow_list is not None else FROZEN_SCORE_ALLOW_LIST
+    df = pd.read_parquet(Path(path))
+    loaded_cols = set(df.columns)
+    allowed = set(allow_list)
+    dropped = sorted(loaded_cols - allowed)
+    if dropped:
+        msg = f"[L1b LOAD] {path} dropped columns not in frozen-score allow-list: {dropped}"
         logger.warning(msg)
         if log_path is not None:
             with open(log_path, "a") as f:
