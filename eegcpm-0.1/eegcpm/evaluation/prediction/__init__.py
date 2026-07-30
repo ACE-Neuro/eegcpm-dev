@@ -6,6 +6,23 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from scipy import stats
 
+# Re-export the new ridge-CPM (Stage 5)
+from .ridge_cpm import (
+    ALPHA_GRID,
+    ALPHA_GRID_RULE,
+    CV_INNER_FOLDS,
+    CV_N_REPEATS,
+    CV_SEED,
+    ESCALATION_P_HI,
+    ESCALATION_P_LO,
+    MC_CI_LEVEL,
+    N_PERMUTATIONS_CONFIRMATORY,
+    N_PERMUTATIONS_SCREENING,
+    adaptive_permutation,
+    fit_predict_outer_fold,
+    repeated_cv_run,
+)
+
 
 class CPMPredictor:
     """
