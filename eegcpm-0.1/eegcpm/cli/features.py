@@ -78,22 +78,85 @@ def features_command(args):
         from types import SimpleNamespace
         validate_primary_config(SimpleNamespace(**config))
 
-    print(f"[features] feature_type={feature_type} config={config_path}")
-    print(f"[features] project={project_root}")
-    print(f"[features] l2_assert_no_blocked_columns: PASS")
-    if config.get("is_primary") or config.get("variant") in {
-        "ridge_all_edges"
-    }:
-        print(f"[features] validate_primary_config: PASS")
+    # ------------------------------------------------------------------
+    # R2-002: REAL feature extraction
+    # ------------------------------------------------------------------
+    import mne
 
-    # The actual feature extraction would dispatch here; for now
-    # we wire the production path so l2/validator are called every
-    # time a feature command is invoked.
-    return {
-        "config": config,
-        "feature_type": feature_type,
-        "project_root": str(project_root),
-    }
+    input_dir = Path(getattr(args, "input_dir", ""))
+    output_dir = Path(getattr(args, "output_dir", ""))
+    condition = getattr(args, "condition", "resting_ec")
+    sfreq = float(getattr(args, "sfreq", 500.0))
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"--input-dir {input_dir} not found")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fif_files = sorted(input_dir.glob("**/*.fif"))
+    if not fif_files:
+        raise FileNotFoundError(f"no .fif files under {input_dir}")
+
+    frames = []
+    if feature_type == "isc":
+        # Group operation: LOO templates across all subjects
+        from eegcpm.modules.features.isc_cca import loo_transform
+        data = {}
+        for fif in fif_files:
+            raw = mne.io.read_raw_fif(fif, preload=True, verbose=False)
+            data[fif.stem.replace("_raw", "")] = raw.get_data()
+        out_df = loo_transform(data)
+        out_df["condition"] = condition
+        frames.append(out_df)
+    else:
+        for fif in fif_files:
+            raw = mne.io.read_raw_fif(fif, preload=True, verbose=False)
+            subject = fif.stem.replace("_raw", "")
+            data = raw.get_data()
+            if feature_type == "specparam":
+                from eegcpm.modules.features.specparam_features import (
+                    SpecparamFeatureModule,
+                )
+                mod = SpecparamFeatureModule(
+                    subject_id=subject, condition=condition)
+                result = mod.process(data, subject=subject,
+                                     condition=condition, sfreq=sfreq)
+                df = result.data if hasattr(result, "data") else result
+                frames.append(df if isinstance(df, pd.DataFrame)
+                              else pd.DataFrame(df))
+            elif feature_type == "connectivity":
+                from eegcpm.modules.connectivity.connectivity import (
+                    ConnectivityModule,
+                )
+                cm = ConnectivityModule(n_channels=data.shape[0],
+                                        sfreq=sfreq)
+                edge_dict = cm.edges(data)
+                row = {"subject_id": subject, "condition": condition}
+                for method, band_dict in edge_dict.items():
+                    for band, e in band_dict.items():
+                        for k, v in enumerate(e):
+                            row[f"{method}__{band}__e{k}"] = v
+                frames.append(pd.DataFrame([row]))
+            elif feature_type == "drowsiness":
+                from eegcpm.modules.features.drowsiness import (
+                    compute_drowsiness_metrics,
+                )
+                metrics = compute_drowsiness_metrics(data, sfreq)
+                frames.append(pd.DataFrame([{
+                    "subject_id": subject, "condition": condition,
+                    **metrics,
+                }]))
+
+    out_df = pd.concat(frames, ignore_index=True)
+
+    # L2 guard on the OUTPUT frame (before writing anything)
+    l2_assert_no_blocked_columns(
+        out_df, frame_label=f"features output ({feature_type})")
+
+    out_path = output_dir / f"{feature_type}_{condition}.parquet"
+    out_df.to_parquet(out_path, index=False)
+    print(f"[features] {feature_type}/{condition}: "
+          f"{len(fif_files)} recordings -> {out_df.shape} -> {out_path}")
+    return {"output": str(out_path), "n_rows": int(out_df.shape[0]),
+            "n_cols": int(out_df.shape[1])}
 
 
 def add_features_parser(subparsers):
@@ -113,5 +176,21 @@ def add_features_parser(subparsers):
         type=str,
         choices=["specparam", "connectivity", "isc", "drowsiness"],
         default="specparam",
+    )
+    parser.add_argument(
+        "--input-dir", type=Path, required=True,
+        help="Directory of preprocessed .fif recordings"
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, required=True,
+        help="Output directory for feature parquet files"
+    )
+    parser.add_argument(
+        "--condition", type=str, default="resting_ec",
+        help="Condition label (resting_ec, resting_eo, despicable_me, ...)"
+    )
+    parser.add_argument(
+        "--sfreq", type=float, default=500.0,
+        help="Sampling rate in Hz (default 500)"
     )
     return parser

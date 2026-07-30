@@ -51,18 +51,22 @@ def predict_command(args):
 
     config = _load_config(config_path)
 
-    # Validate primary config (R1 gate)
-    if "unpenalized_columns" not in config:
-        from eegcpm.core.covariate_lists import PRIMARY_UNPENALIZED_PROBED
-        config["unpenalized_columns"] = list(PRIMARY_UNPENALIZED_PROBED)
-    # Pad the missing fields the validator expects
-    if "covariate_adjustment_mode" not in config:
-        config["covariate_adjustment_mode"] = "residualize_features_train_only"
-    if "alpha_grid" not in config:
-        import numpy as _np
-        config["alpha_grid"] = list(_np.logspace(-2, 6, 17))
+    # Validate primary config (R1 gate; fires only for primary variants)
     from types import SimpleNamespace
-    validate_primary_config(SimpleNamespace(**config))
+    is_primary = config.get("is_primary") or config.get("variant") in {
+        "ridge_all_edges"}
+    if is_primary:
+        if "unpenalized_columns" not in config:
+            from eegcpm.core.covariate_lists import PRIMARY_UNPENALIZED_PROBED
+            config["unpenalized_columns"] = list(PRIMARY_UNPENALIZED_PROBED)
+        if "covariate_adjustment_mode" not in config:
+            config["covariate_adjustment_mode"] = "residualize_features_train_only"
+        if "alpha_grid" not in config:
+            import numpy as _np
+            config["alpha_grid"] = list(_np.logspace(-2, 6, 17))
+        validate_primary_config(SimpleNamespace(**config))
+    if "unpenalized_columns" not in config:
+        config["unpenalized_columns"] = []
 
     # Load target
     target_df = pd.read_parquet(target_file)
@@ -86,48 +90,131 @@ def predict_command(args):
 
     # Load features
     features_dir = Path(args.features_dir)
-    features_df = pd.read_parquet(features_dir) if features_dir.exists() else pd.DataFrame()
+    pq_files = sorted(features_dir.glob("**/*.parquet"))
+    if not pq_files:
+        raise FileNotFoundError(
+            f"no features parquet under {features_dir}"
+        )
+    features_df = pd.concat(
+        [pd.read_parquet(p) for p in pq_files], ignore_index=True)
 
-    # L2 guard on the loaded features frame (with provenance for
-    # archive columns, if any)
-    if not features_df.empty:
-        # Mark with provenance to allow archive_* columns (L3 invariant)
-        features_df._provenance = "L3_sensitivity_entry_point"
-        l2_assert_no_blocked_columns(
-            features_df, frame_label=f"features {features_dir}")
+    # L2 guard on the loaded features frame. R2-003: provenance is
+    # NEVER manufactured here — archive_* columns are accepted only
+    # with the immutable provenance set by l3_load_archive_scores.
+    l2_assert_no_blocked_columns(
+        features_df, frame_label=f"features {features_dir}")
 
     # L2 guard on the merged features+target frame
-    if not features_df.empty:
-        merged = _merge_features_target(features_df, target_df)
-        l2_assert_no_blocked_columns(
-            merged, frame_label="merged features+target frame")
-    else:
-        merged = target_df
+    merged = _merge_features_target(features_df, target_df)
+    if merged.empty:
+        raise ValueError(
+            "features ∩ target is empty — join-key mismatch (class 11)."
+        )
+    l2_assert_no_blocked_columns(
+        merged, frame_label="merged features+target frame")
 
-    # L2 guard on the target column itself: it MUST NOT appear
-    # un-prefixed in the features frame (target should come from a
-    # separate file with separate allow-list)
-    if not features_df.empty and target_column in features_df.columns:
-        # If target column collides with features, fail loudly
+    # Target column must not also live in the features frame
+    if target_column in features_df.columns:
         raise ValueError(
             f"target_column {target_column!r} already present in "
             f"features; L2 invariant violated."
         )
 
-    print(f"[predict] config={config_path} model={model_name}")
-    print(f"[predict] target={target_file} column={target_column}")
-    print(f"[predict] DUA prediction dir: {prediction_dir}")
-    print(f"[predict] /share aggregates dir: {aggregates_dir}")
-    print(f"[predict] validate_primary_config: PASS")
-    print(f"[predict] l2_assert_no_blocked_columns: PASS")
+    # ------------------------------------------------------------------
+    # R2-002: REAL execution — ridge-CPM with the spec pipeline
+    # ------------------------------------------------------------------
+    from eegcpm.evaluation.prediction.ridge_cpm import (
+        collect_oof_predictions, repeated_cv_run, adaptive_permutation,
+        ALPHA_GRID, CV_N_REPEATS, CV_SEED,
+    )
 
-    return {
-        "config": config,
+    unpenalized = list(config["unpenalized_columns"])
+    present_cov = [c for c in unpenalized if c in merged.columns]
+    missing_cov = sorted(set(unpenalized) - set(present_cov))
+    if missing_cov:
+        raise ValueError(
+            f"unpenalized covariates missing from merged frame: "
+            f"{missing_cov}"
+        )
+    exclude = set(unpenalized) | {"subject_id", target_column}
+    feature_cols = [c for c in merged.columns
+                    if c not in exclude
+                    and pd.api.types.is_numeric_dtype(merged[c])]
+    if not feature_cols:
+        raise ValueError("no numeric feature columns after exclusions")
+
+    X = merged[feature_cols].to_numpy(dtype=float)
+    Z = merged[present_cov].to_numpy(dtype=float)
+    y = merged[target_column].to_numpy(dtype=float)
+    sids = merged["subject_id"].to_numpy()
+    n_folds = int(config.get("cv", {}).get("n_folds", 5))
+    n_repeats = int(config.get("cv", {}).get("n_repeats", CV_N_REPEATS))
+    cv_seed = int(config.get("cv", {}).get("cv_seed", CV_SEED))
+    alpha_grid = list(config.get("alpha_grid", ALPHA_GRID))
+
+    # Observed statistic (mean over repeats, pooled out-of-fold r)
+    rep_r, rep_boundary = repeated_cv_run(
+        X, y, covariates=Z, n_folds=n_folds, n_repeats=n_repeats,
+        cv_seed=cv_seed, alpha_grid=alpha_grid)
+    observed_r = float(np.mean(rep_r))
+
+    # Adaptive permutation p (full-pipeline reruns per permutation)
+    from types import SimpleNamespace
+    perm_cfg = SimpleNamespace(
+        n_permutations_screening=int(
+            config.get("permutation", {}).get("n_permutations_screening", 1000)),
+        n_permutations_confirmatory=int(
+            config.get("permutation", {}).get("n_permutations_confirmatory", 10000)),
+        escalation_p_lo=float(
+            config.get("permutation", {}).get("escalation_p_lo", 0.005)),
+        escalation_p_hi=float(
+            config.get("permutation", {}).get("escalation_p_hi", 0.10)),
+        permutation_seed=int(
+            config.get("permutation", {}).get("permutation_seed", 20260731)),
+        cv_n_folds=n_folds,
+        cv_n_repeats=n_repeats,
+        cv_seed=cv_seed,
+        alpha_grid=alpha_grid,
+    )
+    p_hat, (p_lo, p_hi) = adaptive_permutation(
+        X, y, perm_cfg, observed_r, covariates=Z)
+
+    # Subject-level OOF predictions -> DUA root
+    oof = collect_oof_predictions(
+        X, y, sids, covariates=Z, n_folds=n_folds,
+        n_repeats=n_repeats, cv_seed=cv_seed, alpha_grid=alpha_grid)
+    oof_path = Path(prediction_dir) / "oof_predictions.parquet"
+    Path(prediction_dir).mkdir(parents=True, exist_ok=True)
+    oof.to_parquet(oof_path, index=False)
+
+    # Aggregates only -> /share
+    import json
+    Path(aggregates_dir).mkdir(parents=True, exist_ok=True)
+    summary = {
         "model_name": model_name,
-        "prediction_dir": str(prediction_dir),
-        "aggregates_dir": str(aggregates_dir),
+        "target": target_column,
         "n_subjects": int(merged.shape[0]),
+        "completeness_rule": "features ∩ frozen target, listwise",
+        "n_features": int(X.shape[1]),
+        "n_covariates": int(Z.shape[1]),
+        "observed_r": observed_r,
+        "repeat_r": [float(r) for r in rep_r],
+        "alpha_boundary_hit_fraction": float(np.mean(rep_boundary)),
+        "permutation_p": float(p_hat),
+        "permutation_mc_ci": [float(p_lo), float(p_hi)],
+        "config": str(config_path),
+        "target_file": str(target_file),
     }
+    summary_path = Path(aggregates_dir) / "cpm_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+
+    print(f"[predict] N={merged.shape[0]} features={X.shape[1]} "
+          f"observed_r={observed_r:.4f} p={p_hat:.4f} "
+          f"[{p_lo:.4f}, {p_hi:.4f}]")
+    print(f"[predict] OOF (DUA): {oof_path}")
+    print(f"[predict] summary (/share): {summary_path}")
+
+    return summary
 
 
 def add_predict_parser(subparsers):

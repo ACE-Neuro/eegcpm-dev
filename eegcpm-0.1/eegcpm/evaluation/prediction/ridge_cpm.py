@@ -153,6 +153,48 @@ def _residualize_train_apply(
     return X_train_resid, X_test_resid
 
 
+def collect_oof_predictions(
+    X: np.ndarray, y: np.ndarray,
+    subject_ids: np.ndarray,
+    covariates: Optional[np.ndarray] = None,
+    n_folds: int = 5,
+    n_repeats: int = CV_N_REPEATS,
+    cv_seed: int = CV_SEED,
+    alpha_grid: List[float] = None,
+    inner_cv_seed: int = CV_SEED,
+) -> "pd.DataFrame":
+    """Collect per-subject out-of-fold predictions across repeats
+    (DUA-gated subject-level artifact; same seeds as repeated_cv_run
+    so the r computed from these predictions matches the run's r).
+    """
+    import pandas as pd
+    from sklearn.model_selection import KFold
+    alpha_grid = alpha_grid if alpha_grid is not None else ALPHA_GRID
+    rng = np.random.default_rng(cv_seed)
+    frames = []
+    for run_i in range(n_repeats):
+        kf = KFold(n_splits=n_folds, shuffle=True,
+                   random_state=int(rng.integers(0, 2**31)))
+        for fold_i, (tr, te) in enumerate(kf.split(X)):
+            cov_tr = covariates[tr] if covariates is not None else None
+            cov_te = covariates[te] if covariates is not None else None
+            yp, best_alpha, _ba = fit_predict_outer_fold(
+                X[tr], y[tr], X[te],
+                covariate_train=cov_tr, covariate_test=cov_te,
+                alpha_grid=alpha_grid, inner_cv_seed=inner_cv_seed,
+                random_state=run_i,
+            )
+            frames.append(pd.DataFrame({
+                "subject_id": subject_ids[te],
+                "repeat": run_i,
+                "fold": fold_i,
+                "y_true": y[te],
+                "y_pred": yp,
+                "alpha": best_alpha,
+            }))
+    return pd.concat(frames, ignore_index=True)
+
+
 def repeated_cv_run(
     X: np.ndarray, y: np.ndarray,
     covariates: Optional[np.ndarray] = None,
