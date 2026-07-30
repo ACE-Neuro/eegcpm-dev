@@ -61,9 +61,17 @@ def test_specparam_rmse_uses_in_house_not_mae():
 
 # --------------------------------------------------------------- six-fixture suite (S22)
 
+
+def _stable_seed(scenario: str) -> int:
+    """Process-independent seed (R3-001: hash() varies with
+    PYTHONHASHSEED across processes -> flaky fixtures)."""
+    import hashlib
+    return int.from_bytes(
+        hashlib.md5(scenario.encode()).digest()[:4], "little") % 2**31
+
 def _generate_spectrum(scenario: str, sr: int = 500, n: int = 100_000):
     """Return (freqs, power) at 500 Hz for the named scenario."""
-    rng = np.random.RandomState(hash(scenario) % 2**31)
+    rng = np.random.RandomState(_stable_seed(scenario))
     log_base = -1.5 - 1.0 * np.log10(np.linspace(1, 45, 200))
     if scenario == "fixed_1f":
         log_p = log_base + 0.05 * rng.randn(200)

@@ -154,14 +154,37 @@ def run_parity_harness(
             f"Unknown stage {stage!r}; must be one of {GOLDEN_CONFIG_NAMES}"
         )
     if verify_golden_hashes:
-        from eegcpm.core.config_hash import load_golden_hashes
+        from eegcpm.core.config_hash import (
+            load_golden_hashes, check_golden_config_hashes,
+        )
         hashes = load_golden_hashes()
         assert set(hashes) == set(GOLDEN_CONFIG_NAMES), (
             f"golden hash set mismatch: {sorted(hashes)}"
         )
         for stage, h in hashes.items():
             print(f"  golden {stage}: sha256={h[:16]}...")
-    return compare_parity_dirs(local_dir, hpc_dir)
+        # R3-002: validate each side's RECORDED stage lineage against
+        # the golden hashes — the outputs must have been produced by
+        # the golden configs, verified by hash not inspection.
+        for side, root in (("local", Path(local_dir)),
+                           ("hpc", Path(hpc_dir))):
+            lineage_file = root / "stage_config_hashes.json"
+            if not lineage_file.exists():
+                raise FileNotFoundError(
+                    f"{side}: stage_config_hashes.json missing at "
+                    f"{root} — cannot verify the outputs were produced "
+                    f"with the golden configs (R3-002)."
+                )
+            import json
+            recorded = json.loads(lineage_file.read_text())
+            # Accept flat {stage: hash} or nested {stage: {config_hash: h}}
+            normalized = {
+                stage: (v if isinstance(v, dict) else {"config_hash": v})
+                for stage, v in recorded.items()
+            }
+            check_golden_config_hashes(normalized, normalized,
+                                       expected_hashes=hashes)
+    return compare_parity_dirs(local_dir, hpc_dir, subjects=subjects)
 
 
 REQUIRED_OUTPUTS: Dict[str, str] = {
@@ -177,13 +200,15 @@ REQUIRED_OUTPUTS: Dict[str, str] = {
 def compare_parity_dirs(
     local_dir: Path,
     hpc_dir: Path,
+    subjects: Optional[List[str]] = None,
 ) -> "pd.DataFrame":
     """Execute the parity comparison between a local and an HPC output
-    directory (R-013/R2-006: executable, and COMPLETE).
+    directory (R-013/R2-006/R3-002: executable and COMPLETE).
 
-    Every subject must provide every required output on BOTH sides —
-    a missing file is a hard failure (a parity gate that skips rows is
-    not a gate). Returns a verdict table with one row per
+    If `subjects` is given, the directory contents on BOTH sides must
+    equal it exactly — a subject missing on both sides is NOT silently
+    omitted (R3-002). Every subject must provide every required output
+    on both sides. Returns a verdict table with one row per
     (subject, output) and a computed pass column — no hardcoded
     verdicts (Class 6).
     """
@@ -194,14 +219,23 @@ def compare_parity_dirs(
     hpc_dir = Path(hpc_dir)
     rows = []
 
-    subjects = sorted(
+    found = sorted(
         p.name for p in local_dir.iterdir()
         if p.is_dir() and (hpc_dir / p.name).is_dir()
     )
-    if not subjects:
+    if subjects is not None:
+        requested = sorted(subjects)
+        if found != requested:
+            raise FileNotFoundError(
+                f"subject set mismatch: requested {requested}, "
+                f"present on both sides {found}. A parity gate that "
+                f"omits missing subjects is not a gate (R3-002)."
+            )
+    if not found:
         raise FileNotFoundError(
             f"no common subject directories under {local_dir} and {hpc_dir}"
         )
+    subjects = found
 
     # Completeness gate FIRST: every subject x required output x both sides
     missing = []

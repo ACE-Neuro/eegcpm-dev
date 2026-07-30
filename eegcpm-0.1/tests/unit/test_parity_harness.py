@@ -257,3 +257,24 @@ def test_compare_parity_dirs_passes_on_identical(tmp_path):
     verdict = compare_parity_dirs(tmp_path / "local", tmp_path / "hpc")
     assert len(verdict) == 6
     assert verdict["pass"].all(), verdict[~verdict["pass"]]
+
+
+def test_compare_parity_dirs_subject_set_mismatch_raises(tmp_path):
+    """R3-002: requested subjects must match directory contents exactly."""
+    from eegcpm.core.parity_harness import compare_parity_dirs
+    for side in ("local", "hpc"):
+        (tmp_path / side / "sub-001").mkdir(parents=True)
+    import pytest as _pt
+    with _pt.raises(FileNotFoundError, match="subject set mismatch"):
+        compare_parity_dirs(tmp_path / "local", tmp_path / "hpc",
+                            subjects=["sub-001", "sub-002"])
+
+
+def test_run_parity_harness_requires_lineage_hashes(tmp_path):
+    """R3-002: outputs must carry recorded stage config hashes."""
+    import pytest as _pt
+    with _pt.raises(FileNotFoundError, match="stage_config_hashes"):
+        run_parity_harness(
+            local_dir=tmp_path, hpc_dir=tmp_path,
+            subjects=["sub-001"],
+        )
