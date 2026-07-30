@@ -191,29 +191,37 @@ def compute_drowsiness_metrics(
 
 def trait_state_verdict_bootstrap(
     adjusted_r: float, unadjusted_r: float,
-    X: np.ndarray, y: np.ndarray,
-    cfg: Any,
+    fit_both=None,
+    X: np.ndarray = None, y: np.ndarray = None,
+    cfg: Any = None,
     B: int = 1000, seed: int = 20260729,
 ) -> Tuple[str, str, Tuple[float, float]]:
     """S15: paired bootstrap CI on the attenuation ratio; INCONCLUSIVE
     band straddles 0.30.
 
-    Resamples subjects, refits BOTH models per resample, computes
-    the attenuation ratio per resample, derives 95% CI, places the
-    verdict in one of three bands.
+    R-012: fit_both(X, y) -> (unadjusted_r, adjusted_r) is REQUIRED and
+    is called on every paired resample of the subject rows — both models
+    are refit per resample (the previous version reused the point
+    estimates, giving a zero-width CI). adjusted_r/unadjusted_r are the
+    point estimates on the full data (used for the displayed ratio).
     """
+    if fit_both is None or X is None or y is None:
+        raise ValueError(
+            "trait_state_verdict_bootstrap requires fit_both(X, y) plus "
+            "the data matrices: both models must be refit per paired "
+            "resample (R-012). A zero-width CI from point estimates is "
+            "not a bootstrap."
+        )
     rng = np.random.default_rng(seed)
+    X = np.asarray(X)
+    y = np.asarray(y)
     n = len(y)
-    # Pre-compute the two fitted r's on the original data
-    # (assumed computed by the caller; here we use the passed values)
     boot_attenuations = []
     for b in range(B):
         idx = rng.integers(0, n, size=n)
-        # S15: denominator is max(|unadjusted_r|, 1e-12) — NOT abs(),
-        # to handle negative r correctly
-        denom_b = max(abs(unadjusted_r), 1e-12)
-        attenuation = (unadjusted_r - adjusted_r) / denom_b
-        boot_attenuations.append(attenuation)
+        unadj_b, adj_b = fit_both(X[idx], y[idx])
+        denom_b = max(abs(unadj_b), 1e-12)
+        boot_attenuations.append((unadj_b - adj_b) / denom_b)
     lo, hi = np.percentile(boot_attenuations, [2.5, 97.5])
     if hi < 0.30:
         verdict = "TRAIT"

@@ -121,6 +121,15 @@ def test_compute_drowsiness_metrics_returns_all_three():
 
 # --------------------------------------------------------------- S15: bootstrap verdict
 
+
+def _fit_both_factory(unadj, adj):
+    """fit_both stub: returns the given r pair on any resample
+    (exercises the bootstrap machinery with a controlled value)."""
+    def fit_both(X, y):
+        return unadj, adj
+    return fit_both
+
+
 def test_trait_state_bootstrap_trait_verdict():
     """Attenuation well below 30%: verdict is TRAIT."""
     rng = np.random.default_rng(0)
@@ -129,7 +138,8 @@ def test_trait_state_bootstrap_trait_verdict():
     adj_r, unadj_r = 0.08, 0.10
     # 100 bootstrap samples
     verdict, text, (lo, hi) = trait_state_verdict_bootstrap(
-        adj_r, unadj_r, X=np.zeros((n, 5)), y=np.zeros(n), cfg=None,
+        adj_r, unadj_r, fit_both=_fit_both_factory(unadj_r, adj_r),
+        X=np.zeros((n, 5)), y=np.zeros(n), cfg=None,
         B=100, seed=0)
     # 20% attenuation -> verdict TRAIT (95% CI is entirely below 0.30)
     assert verdict == "TRAIT", f"verdict={verdict}; text={text}"
@@ -139,31 +149,44 @@ def test_trait_state_bootstrap_state_sensitive_verdict():
     """Attenuation well above 30%: verdict is STATE-SENSITIVE."""
     adj_r, unadj_r = 0.04, 0.10
     verdict, text, (lo, hi) = trait_state_verdict_bootstrap(
-        adj_r, unadj_r, X=np.zeros((100, 5)), y=np.zeros(100), cfg=None,
+        adj_r, unadj_r, fit_both=_fit_both_factory(unadj_r, adj_r),
+        X=np.zeros((100, 5)), y=np.zeros(100), cfg=None,
         B=100, seed=0)
     # 60% attenuation -> verdict STATE-SENSITIVE
     assert verdict == "STATE-SENSITIVE", f"verdict={verdict}; text={text}"
 
 
 def test_trait_state_bootstrap_inconclusive_band():
-    """Attenuation near 30%: bootstrap CI straddles 0.30, INCONCLUSIVE."""
-    rng = np.random.default_rng(0)
-    n = 200
-    # The bootstrap we use here is degenerate (no resampling, single
-    # point). Adjust to make the CI straddle 0.30.
-    # We use adjusted=0.06, unadjusted=0.085; attenuation = 0.294
-    # Single point -> CI = [0.294, 0.294] which is entirely below 0.30
-    # so the test won't fire INCONCLUSIVE.
-    # Instead, use a non-degenerate bootstrap: simulate by varying
-    # adjusted_r across samples.
-    # The current implementation uses a single (adjusted, unadjusted)
-    # value, so we can't easily test INCONCLUSIVE without modifying
-    # the function. Skip this test or mark it as "the current
-    # implementation does not support this case" with a note.
-    pytest.skip("The bootstrap function takes a single (adj, unadj) pair; "
-                "INCONCLUSIVE cannot be exercised without a refactor. "
-                "The three-band logic is verified by the point-estimate "
-                "test.")
+    """R-012: noisy attenuation straddling 0.30 -> INCONCLUSIVE, and the
+    bootstrap actually refits per resample (non-degenerate CI)."""
+    rng = np.random.default_rng(3)
+    n = 150
+    calls = {"n": 0}
+
+    def fit_both(X, y):
+        calls["n"] += 1
+        # Attenuation ratio jitters around 0.30 across resamples
+        unadj = 0.10
+        adj = 0.10 - (0.30 + 0.15 * rng.standard_normal()) * unadj
+        return unadj, adj
+
+    verdict, text, (lo, hi) = trait_state_verdict_bootstrap(
+        0.07, 0.10, fit_both=fit_both,
+        X=np.zeros((n, 3)), y=np.zeros(n), cfg=None,
+        B=200, seed=1)
+    assert calls["n"] == 200, "fit_both must be called once per resample"
+    assert lo < 0.30 < hi, f"CI [{lo:.3f}, {hi:.3f}] must straddle 0.30"
+    assert verdict == "INCONCLUSIVE", f"verdict={verdict}; text={text}"
+
+
+def test_trait_state_bootstrap_requires_fit_both():
+    """R-012: calling without fit_both raises (no zero-width CIs)."""
+    try:
+        trait_state_verdict_bootstrap(0.05, 0.10, X=None, y=None)
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError when fit_both is missing")
+
 
 
 # --------------------------------------------------------------- S15: fixed point estimate
