@@ -77,23 +77,25 @@ def compute_cross_spectrum(
         nperseg = min(data.shape[-1], int(sfreq))
     # Bandpass first
     filtered = bandpass(data, sfreq, band)
-    # Welch cross-spectrum
-    f, Pxy = signal.csd(
+    n_channels = data.shape[0]
+    # Welch cross-spectrum: freq grid from the first channel
+    f, _ = signal.csd(
         filtered[0], filtered[0], fs=sfreq, nperseg=nperseg,
         return_onesided=True,
     )
-    n_channels = data.shape[0]
     n_freqs = len(f)
     S = np.zeros((n_channels, n_channels, n_freqs), dtype=complex)
-    S[0, 0] = Pxy
-    for i in range(1, n_channels):
-        for j in range(i + 1, n_channels):
-            f_ij, Pxy_ij = signal.csd(
+    # ALL pairs including diagonal (auto-spectra) and channel-0 pairs
+    # (ENG-EEG3R2-005: the loop previously started at i=1, leaving
+    # channel-0 pairs zero and misplacing the auto-spectrum).
+    for i in range(n_channels):
+        for j in range(i, n_channels):
+            _, Pxy_ij = signal.csd(
                 filtered[i], filtered[j], fs=sfreq, nperseg=nperseg,
                 return_onesided=True,
             )
             S[i, j] = Pxy_ij
-            S[j, i] = np.conj(Pxy_ij)
+            S[j, i] = np.conj(Pxy_ij) if i != j else Pxy_ij
     # Band-pass the cross-spectrum (only keep freqs in the band)
     band_mask = (f >= band[0]) & (f <= band[1])
     return S[:, :, band_mask], f[band_mask]

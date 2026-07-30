@@ -76,10 +76,10 @@ def fit_predict_outer_fold(
     alpha_grid = alpha_grid if alpha_grid is not None else ALPHA_GRID
 
     # 1. Covariate adjustment: residualize features on covariates
-    # (fitted on training only; apply to both train and test).
+    # (fitted on training only; applied to actual train AND test rows).
     if covariate_train is not None and covariate_test is not None:
         X_train, X_test = _residualize_train_apply(
-            X_train, X_test, covariate_train)
+            X_train, X_test, covariate_train, covariate_test)
 
     # 2. Inner CV: tune alpha
     kf = KFold(n_splits=n_inner_folds, shuffle=True,
@@ -132,31 +132,23 @@ def _pooled_out_of_fold_r(
 
 def _residualize_train_apply(
     X_train: np.ndarray, X_test: np.ndarray,
-    covariate_train: np.ndarray,
+    covariate_train: np.ndarray, covariate_test: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Residualize X on covariates, fit on train only, apply to both.
-
-    X is (n_train, p); covariate_train is (n_train, k). Returns
-    (X_train_resid, X_test_resid) where the residualization is fit
-    on the training data and applied to both.
+    """Residualize X on covariates, fit on train only, applied to the
+    ACTUAL train and test covariate rows (R2-001: test rows must use
+    their own covariates, never the training mean).
     """
-    # Add intercept
     Z_train = np.hstack([np.ones((X_train.shape[0], 1)), covariate_train])
-    # Beta = (Z^T Z)^{-1} Z^T X (per feature column)
-    ZtZ = Z_train.T @ Z_train
-    ZtZ_inv = np.linalg.inv(ZtZ + np.eye(ZtZ.shape[0]) * 1e-8)
-    beta = ZtZ_inv @ Z_train.T @ X_train   # (k+1, p)
-    # Apply to train
+    Z_test = np.hstack([np.ones((X_test.shape[0], 1)), covariate_test])
+    if Z_test.shape[1] != Z_train.shape[1]:
+        raise ValueError(
+            f"covariate_test has {Z_test.shape[1] - 1} columns but "
+            f"covariate_train has {Z_train.shape[1] - 1}; schemas must match."
+        )
+    # Beta per feature column, fitted on training only (lstsq: stable
+    # for collinear covariates, no explicit inverse)
+    beta, *_ = np.linalg.lstsq(Z_train, X_train, rcond=None)
     X_train_resid = X_train - Z_train @ beta
-    # For test, use the SAME beta (fit on train only)
-    n_test = X_test.shape[0]
-    Z_test = np.hstack([np.ones((n_test, 1)),
-                       covariate_train.mean(axis=0, keepdims=True).repeat(
-                           n_test, axis=0)])
-    # We don't have test covariates in this signature; use train
-    # mean for the intercept and assume covariates are similar.
-    # In a full implementation, the caller would pass test_covariate.
-    # Here we approximate using train covariates.
     X_test_resid = X_test - Z_test @ beta
     return X_train_resid, X_test_resid
 

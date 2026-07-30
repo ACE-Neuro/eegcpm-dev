@@ -353,3 +353,41 @@ def test_permutation_null_reruns_full_pipeline():
 
     assert len(calls) == 3, "repeated_cv_run must be called per permutation"
     assert calls[0] is not None, "alpha_grid must be forwarded (tuning runs)"
+
+
+def test_residualize_uses_actual_test_covariates():
+    """R2-001: test-fold features must be residualized with the actual
+    test-fold covariates (distinct +10/-10 probe must give different
+    residuals)."""
+    from eegcpm.evaluation.prediction.ridge_cpm import _residualize_train_apply
+    rng = np.random.default_rng(0)
+    X_train = rng.normal(size=(30, 4))
+    cov_train = rng.normal(size=(30, 2))
+    X_test = np.ones((2, 4))
+    cov_test_a = np.full((2, 2), 10.0)
+    cov_test_b = np.full((2, 2), -10.0)
+    _, resid_a = _residualize_train_apply(X_train, X_test, cov_train, cov_test_a)
+    _, resid_b = _residualize_train_apply(X_train, X_test, cov_train, cov_test_b)
+    assert not np.allclose(resid_a, resid_b), (
+        "residuals identical for +10 vs -10 test covariates — the test "
+        "covariates are not being used"
+    )
+    # Known projection: with identity mapping, residuals subtract Z@beta
+    X_train2 = cov_train @ np.array([[2.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+    _, resid = _residualize_train_apply(
+        X_train2, X_test, cov_train, cov_test_a)
+    expected = X_test - np.hstack([np.ones((2, 1)), cov_test_a]) @ \
+        np.linalg.lstsq(np.hstack([np.ones((30, 1)), cov_train]),
+                        X_train2, rcond=None)[0]
+    assert np.allclose(resid, expected, atol=1e-8)
+
+
+def test_residualize_schema_mismatch_raises():
+    from eegcpm.evaluation.prediction.ridge_cpm import _residualize_train_apply
+    try:
+        _residualize_train_apply(
+            np.zeros((10, 3)), np.zeros((5, 3)),
+            np.zeros((10, 2)), np.zeros((5, 3)))
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError on covariate schema mismatch")
