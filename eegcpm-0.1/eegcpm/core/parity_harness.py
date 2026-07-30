@@ -137,38 +137,41 @@ def run_parity_harness(
     hpc_dir: Path,
     subjects: List[str],
     config_paths: Optional[Dict[str, Path]] = None,
-) -> None:
-    """Run the parity harness with thread pins and 5 golden configs
-    named explicitly.
+    verify_golden_hashes: bool = True,
+) -> "pd.DataFrame":
+    """Run the parity harness: thread pins, golden-config hash
+    verification (R2-006), then the executable comparison.
 
-    config_paths: {stage_name: path_to_config} for the 5 stages.
-    If None, the harness uses the names without explicit paths (the
-    caller is expected to construct the CLI commands with the
-    GOLDEN_CONFIGS paths).
+    Returns the verdict table from compare_parity_dirs. Raises on any
+    golden-hash mismatch or missing artifact.
     """
     apply_thread_pins()
-    # The launcher asserts config_hash on BOTH sides; see
-    # check_golden_config_hashes in eegcpm.core.config_hash
     if config_paths is None:
-        # Default paths
-        config_paths = {
-            "preprocessing": Path("examples/configs/preprocessing/hbn_langer.yaml"),
-            "drowsiness":    Path("examples/configs/features/drowsiness_metrics.yaml"),
-            "specparam":     Path("examples/configs/features/specparam_resting_ec.yaml"),
-            "connectivity":  Path("examples/configs/features/connectivity_resting_ec.yaml"),
-            "prediction":    Path("examples/configs/prediction/cpm_d_factor.yaml"),
-        }
-    # This function is a CLI launcher; the actual subprocess calls
-    # are in the bash script. The Python entry point just records
-    # the intent.
-    print(f"Parity harness launching with {len(subjects)} subjects")
-    print(f"Thread-count pins applied: {THREAD_COUNT_PINS}")
-    print(f"Golden configs (5): {GOLDEN_CONFIG_NAMES}")
-    for stage, path in config_paths.items():
+        from eegcpm.core.config_hash import GOLDEN_CONFIG_PATHS
+        config_paths = {k: Path(v) for k, v in GOLDEN_CONFIG_PATHS.items()}
+    for stage in config_paths:
         assert stage in GOLDEN_CONFIG_NAMES, (
             f"Unknown stage {stage!r}; must be one of {GOLDEN_CONFIG_NAMES}"
         )
-        print(f"  {stage}: {path}")
+    if verify_golden_hashes:
+        from eegcpm.core.config_hash import load_golden_hashes
+        hashes = load_golden_hashes()
+        assert set(hashes) == set(GOLDEN_CONFIG_NAMES), (
+            f"golden hash set mismatch: {sorted(hashes)}"
+        )
+        for stage, h in hashes.items():
+            print(f"  golden {stage}: sha256={h[:16]}...")
+    return compare_parity_dirs(local_dir, hpc_dir)
+
+
+REQUIRED_OUTPUTS: Dict[str, str] = {
+    "Preprocessed FIF data array": "preprocessed_raw.fif",
+    "specparam feature Parquet": "specparam_features.parquet",
+    "Connectivity NPZ (edge weights)": "connectivity_edges.npz",
+    "ISC scores": "isc_scores.parquet",
+    "CPM out-of-fold r": "cpm_result.npz",
+    "lineage_test (fold assignments)": "fold_assignments.npy",
+}
 
 
 def compare_parity_dirs(
@@ -176,14 +179,12 @@ def compare_parity_dirs(
     hpc_dir: Path,
 ) -> "pd.DataFrame":
     """Execute the parity comparison between a local and an HPC output
-    directory (R-013: executable, not intent-printing).
+    directory (R-013/R2-006: executable, and COMPLETE).
 
-    Compares, per subject subdirectory: the preprocessed FIF data
-    array (bitwise row), the specparam feature parquet (numeric row),
-    the connectivity NPZ edges (numeric row), ISC scores (numeric
-    row), the CPM out-of-fold r (numeric row), and the fold
-    assignments (bitwise row). Returns a verdict table with one row
-    per (subject, output) and a computed pass column — no hardcoded
+    Every subject must provide every required output on BOTH sides —
+    a missing file is a hard failure (a parity gate that skips rows is
+    not a gate). Returns a verdict table with one row per
+    (subject, output) and a computed pass column — no hardcoded
     verdicts (Class 6).
     """
     import numpy as np
@@ -202,6 +203,19 @@ def compare_parity_dirs(
             f"no common subject directories under {local_dir} and {hpc_dir}"
         )
 
+    # Completeness gate FIRST: every subject x required output x both sides
+    missing = []
+    for sid in subjects:
+        for output_name, fname in REQUIRED_OUTPUTS.items():
+            for side, d in (("local", local_dir / sid), ("hpc", hpc_dir / sid)):
+                if not (d / fname).exists():
+                    missing.append(f"{sid}/{fname} [{side}]")
+    if missing:
+        raise FileNotFoundError(
+            f"parity gate incomplete: {len(missing)} required artifacts "
+            f"missing: {missing[:10]}{'...' if len(missing) > 10 else ''}"
+        )
+
     def _cmp(subject, output_name, lv, hv):
         passed, msg = check_parity_tolerance(output_name, lv, hv)
         rows.append({
@@ -212,51 +226,36 @@ def compare_parity_dirs(
     for sid in subjects:
         ldir, hdir = local_dir / sid, hpc_dir / sid
 
-        # Preprocessed FIF data array (bitwise claim)
-        lf, hf = ldir / "preprocessed_raw.fif", hdir / "preprocessed_raw.fif"
-        if lf.exists() and hf.exists():
-            import mne
-            lraw = mne.io.read_raw_fif(lf, preload=True, verbose=False)
-            hraw = mne.io.read_raw_fif(hf, preload=True, verbose=False)
-            _cmp(sid, "Preprocessed FIF data array",
-                 lraw.get_data(), hraw.get_data())
+        import mne
+        lraw = mne.io.read_raw_fif(ldir / "preprocessed_raw.fif",
+                                   preload=True, verbose=False)
+        hraw = mne.io.read_raw_fif(hdir / "preprocessed_raw.fif",
+                                   preload=True, verbose=False)
+        _cmp(sid, "Preprocessed FIF data array",
+             lraw.get_data(), hraw.get_data())
 
-        # specparam feature parquet
-        lf, hf = ldir / "specparam_features.parquet", hdir / "specparam_features.parquet"
-        if lf.exists() and hf.exists():
-            lp = pd.read_parquet(lf)
-            hp = pd.read_parquet(hf)
-            num_cols = lp.select_dtypes("number").columns
-            _cmp(sid, "specparam feature Parquet",
-                 lp[num_cols].to_numpy(), hp[num_cols].to_numpy())
+        lp = pd.read_parquet(ldir / "specparam_features.parquet")
+        hp = pd.read_parquet(hdir / "specparam_features.parquet")
+        num_cols = lp.select_dtypes("number").columns
+        _cmp(sid, "specparam feature Parquet",
+             lp[num_cols].to_numpy(), hp[num_cols].to_numpy())
 
-        # Connectivity NPZ edges
-        lf, hf = ldir / "connectivity_edges.npz", hdir / "connectivity_edges.npz"
-        if lf.exists() and hf.exists():
-            le = np.load(lf)["edges"]
-            he = np.load(hf)["edges"]
-            _cmp(sid, "Connectivity NPZ (edge weights)", le, he)
+        le = np.load(ldir / "connectivity_edges.npz")["edges"]
+        he = np.load(hdir / "connectivity_edges.npz")["edges"]
+        _cmp(sid, "Connectivity NPZ (edge weights)", le, he)
 
-        # ISC scores
-        lf, hf = ldir / "isc_scores.parquet", hdir / "isc_scores.parquet"
-        if lf.exists() and hf.exists():
-            lp = pd.read_parquet(lf)
-            hp = pd.read_parquet(hf)
-            _cmp(sid, "ISC scores", lp["isc"].to_numpy(),
-                 hp["isc"].to_numpy())
+        lp = pd.read_parquet(ldir / "isc_scores.parquet")
+        hp = pd.read_parquet(hdir / "isc_scores.parquet")
+        _cmp(sid, "ISC scores", lp["isc"].to_numpy(),
+             hp["isc"].to_numpy())
 
-        # CPM out-of-fold r
-        lf, hf = ldir / "cpm_result.npz", hdir / "cpm_result.npz"
-        if lf.exists() and hf.exists():
-            lr = np.load(lf)["oof_r"]
-            hr = np.load(hf)["oof_r"]
-            _cmp(sid, "CPM out-of-fold r", lr, hr)
+        lr = np.load(ldir / "cpm_result.npz")["oof_r"]
+        hr = np.load(hdir / "cpm_result.npz")["oof_r"]
+        _cmp(sid, "CPM out-of-fold r", lr, hr)
 
-        # Fold assignments (bitwise)
-        lf, hf = ldir / "fold_assignments.npy", hdir / "fold_assignments.npy"
-        if lf.exists() and hf.exists():
-            _cmp(sid, "lineage_test (fold assignments)",
-                 np.load(lf), np.load(hf))
+        _cmp(sid, "lineage_test (fold assignments)",
+             np.load(ldir / "fold_assignments.npy"),
+             np.load(hdir / "fold_assignments.npy"))
 
     verdict = pd.DataFrame(rows)
     verdict["pass"] = verdict["pass"].astype(bool)

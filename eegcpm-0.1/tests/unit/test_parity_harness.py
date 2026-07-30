@@ -161,13 +161,15 @@ def test_apply_thread_pins_sets_env():
 # --------------------------------------------------------------- harness launcher
 
 def test_run_parity_harness_prints_5_golden_configs(tmp_path, capsys):
-    """The harness launcher prints the 5 golden configs explicitly."""
-    run_parity_harness(
-        local_dir=tmp_path, hpc_dir=tmp_path,
-        subjects=["S1", "S2", "S3"],
-    )
+    """R2-006: the harness verifies golden hashes (prints each stage's
+    hash) and EXECUTES the comparison — empty dirs raise."""
+    import pytest as _pt
+    with _pt.raises(FileNotFoundError):
+        run_parity_harness(
+            local_dir=tmp_path, hpc_dir=tmp_path,
+            subjects=["S1", "S2", "S3"],
+        )
     out = capsys.readouterr().out
-    assert "Golden configs (5)" in out
     for stage in GOLDEN_CONFIG_NAMES:
         assert stage in out
 
@@ -207,3 +209,51 @@ def test_check_golden_config_hashes_raises_on_local_mismatch():
     hpc = {k: {"config_hash": v} for k, v in expected.items()}
     with pytest.raises(ValueError, match="Local preprocessing"):
         check_golden_config_hashes(local, hpc, expected_hashes=expected)
+
+
+def test_compare_parity_dirs_hard_fails_on_missing(tmp_path):
+    """R2-006: missing required artifact = hard failure, not a skip."""
+    import numpy as np, pandas as pd, mne
+    from eegcpm.core.parity_harness import compare_parity_dirs
+
+    for side in ("local", "hpc"):
+        d = tmp_path / side / "sub-001"
+        d.mkdir(parents=True)
+        info = mne.create_info(["E1", "E2"], 500.0, "eeg")
+        mne.io.RawArray(np.zeros((2, 100)), info).save(
+            d / "preprocessed_raw.fif", verbose=False)
+        pd.DataFrame({"offset": [1.0]}).to_parquet(
+            d / "specparam_features.parquet")
+        np.savez(d / "connectivity_edges.npz", edges=np.zeros(3))
+        pd.DataFrame({"isc": [0.1]}).to_parquet(d / "isc_scores.parquet")
+        np.savez(d / "cpm_result.npz", oof_r=np.array([0.1]))
+        # fold_assignments.npy deliberately missing on hpc side
+        if side == "local":
+            np.save(d / "fold_assignments.npy", np.array([0, 1]))
+    try:
+        compare_parity_dirs(tmp_path / "local", tmp_path / "hpc")
+    except FileNotFoundError as e:
+        assert "fold_assignments" in str(e)
+        return
+    raise AssertionError("expected FileNotFoundError on missing artifact")
+
+
+def test_compare_parity_dirs_passes_on_identical(tmp_path):
+    import numpy as np, pandas as pd, mne
+    from eegcpm.core.parity_harness import compare_parity_dirs
+
+    for side in ("local", "hpc"):
+        d = tmp_path / side / "sub-001"
+        d.mkdir(parents=True)
+        info = mne.create_info(["E1", "E2"], 500.0, "eeg")
+        mne.io.RawArray(np.zeros((2, 100)), info).save(
+            d / "preprocessed_raw.fif", overwrite=True, verbose=False)
+        pd.DataFrame({"offset": [1.0]}).to_parquet(
+            d / "specparam_features.parquet")
+        np.savez(d / "connectivity_edges.npz", edges=np.zeros(3))
+        pd.DataFrame({"isc": [0.1]}).to_parquet(d / "isc_scores.parquet")
+        np.savez(d / "cpm_result.npz", oof_r=np.array([0.1]))
+        np.save(d / "fold_assignments.npy", np.array([0, 1]))
+    verdict = compare_parity_dirs(tmp_path / "local", tmp_path / "hpc")
+    assert len(verdict) == 6
+    assert verdict["pass"].all(), verdict[~verdict["pass"]]
