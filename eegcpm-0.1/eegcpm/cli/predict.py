@@ -193,6 +193,9 @@ def predict_command(args):
     summary = {
         "model_name": model_name,
         "target": target_column,
+        "prediction_dir": str(prediction_dir),
+        "aggregates_dir": str(aggregates_dir),
+        "oof_path": str(oof_path),
         "n_subjects": int(merged.shape[0]),
         "completeness_rule": "features ∩ frozen target, listwise",
         "n_features": int(X.shape[1]),

@@ -41,6 +41,34 @@ def _predict_config() -> dict:
     }
 
 
+
+def _tiny_fif_dir(tmp_path, n_subjects=2, n_times=2500):
+    """Create a tiny preprocessed-FIF input dir for real dispatch."""
+    import mne
+    inp = tmp_path / "prep"
+    inp.mkdir(exist_ok=True)
+    rng = np.random.RandomState(0)
+    for i in range(n_subjects):
+        info = mne.create_info([f"E{k}" for k in range(4)], 500.0, "eeg")
+        data = rng.normal(size=(4, n_times)) * 1e-6
+        mne.io.RawArray(data, info).save(
+            inp / f"sub-{i:03d}_raw.fif", overwrite=True, verbose=False)
+    return inp
+
+
+def _tiny_features_parquet(tmp_path, n=30, covariates=(), feature_cols=("alpha_power",)):
+    """Tiny features parquet with all required covariate columns."""
+    rng = np.random.RandomState(1)
+    df = pd.DataFrame({"subject_id": [f"S{i}" for i in range(n)]})
+    for c in feature_cols:
+        df[c] = rng.normal(size=n)
+    for c in covariates:
+        df[c] = rng.normal(size=n)
+    feat_dir = tmp_path / "features"
+    feat_dir.mkdir(exist_ok=True)
+    df.to_parquet(feat_dir / "features.parquet")
+    return feat_dir
+
 def test_features_command_runs_l2_guard(tmp_path):
     """R-002: features_command invokes l2_assert_no_blocked_columns."""
     config_path = tmp_path / "features.yaml"
@@ -48,10 +76,13 @@ def test_features_command_runs_l2_guard(tmp_path):
     args = type("Args", (), {})()
     args.config = config_path
     args.project = tmp_path
-    args.feature_type = "specparam"
+    args.feature_type = "drowsiness"
+    args.input_dir = _tiny_fif_dir(tmp_path)
+    args.output_dir = tmp_path / "feat_out"
+    args.condition = "resting_ec"
+    args.sfreq = 500.0
     result = features_command(args)
-    assert result["feature_type"] == "specparam"
-    assert "config" in result
+    assert "output" in result
 
 
 def test_features_command_blocks_p_factor_in_columns(tmp_path):
@@ -76,10 +107,14 @@ def test_features_command_validates_primary_config(tmp_path):
     args = type("Args", (), {})()
     args.config = config_path
     args.project = tmp_path
-    args.feature_type = "specparam"
+    args.feature_type = "drowsiness"
+    args.input_dir = _tiny_fif_dir(tmp_path)
+    args.output_dir = tmp_path / "feat_out"
+    args.condition = "resting_ec"
+    args.sfreq = 500.0
     # primary config; validator pads unpenalized_columns from defaults
     result = features_command(args)
-    assert "config" in result
+    assert "output" in result
 
 
 def test_features_command_rejects_wrong_unpenalized_set(tmp_path):
@@ -105,11 +140,14 @@ def test_predict_command_enforces_dua_paths(tmp_path):
         "subject_id": ["S1", "S2"],
         "d": [0.5, 0.6],
     }).to_parquet(target)
-    # Create features dir
-    feat_dir = tmp_path / "features"
-    feat_dir.mkdir()
+    # Create features dir with all primary covariates + features
+    feat_dir = _tiny_features_parquet(
+        tmp_path, n=30,
+        covariates=_predict_config()["unpenalized_columns"],
+        feature_cols=("alpha_power", "beta_power"))
     # Run with explicit dua_root
     dua_root = tmp_path / "dua"
+    dua_root.mkdir(mode=0o700)
     args = type("Args", (), {})()
     args.config = tmp_path / "predict.yaml"
     args.project = tmp_path
@@ -119,11 +157,22 @@ def test_predict_command_enforces_dua_paths(tmp_path):
     args.dua_root = dua_root
     args.current_run_config_hash = "abc123"
     config_path = tmp_path / "predict.yaml"
-    config_path.write_text(json.dumps(_predict_config()))
+    small = _predict_config()
+    small["cv"] = {"n_folds": 5, "n_repeats": 2}
+    small["permutation"] = {"n_permutations_screening": 20,
+                            "n_permutations_confirmatory": 20,
+                            "escalation_p_lo": 0.005,
+                            "escalation_p_hi": 0.10,
+                            "permutation_seed": 1}
+    config_path.write_text(json.dumps(small))
     args.config = config_path
+    target = pd.DataFrame({"subject_id": [f"S{i}" for i in range(30)],
+                           "d": np.random.RandomState(2).normal(size=30)})
+    target.to_parquet(args.target_file)
     result = predict_command(args)
     assert "prediction_dir" in result
     assert "aggregates_dir" in result
+    assert "observed_r" in result
     assert "DUA prediction dir" in result["prediction_dir"] or \
         dua_root.name in result["prediction_dir"]
 
@@ -158,10 +207,14 @@ def test_predict_command_requires_dual_paths(tmp_path):
     """R-002: prediction_dir is under DUA (mode 0700); aggregates
     under /share."""
     target = tmp_path / "frozen.parquet"
-    pd.DataFrame({"subject_id": ["S1"], "d": [0.5]}).to_parquet(target)
-    feat_dir = tmp_path / "features"
-    feat_dir.mkdir()
+    pd.DataFrame({"subject_id": [f"S{i}" for i in range(30)],
+                  "d": np.random.RandomState(3).normal(size=30)}).to_parquet(target)
+    feat_dir = _tiny_features_parquet(
+        tmp_path, n=30,
+        covariates=_predict_config()["unpenalized_columns"],
+        feature_cols=("alpha_power",))
     dua_root = tmp_path / "dua"
+    dua_root.mkdir(mode=0o700)
     args = type("Args", (), {})()
     args.config = tmp_path / "predict.yaml"
     args.project = tmp_path
@@ -170,7 +223,14 @@ def test_predict_command_requires_dual_paths(tmp_path):
     args.features_dir = feat_dir
     args.dua_root = dua_root
     args.current_run_config_hash = "abc123"
-    (tmp_path / "predict.yaml").write_text(json.dumps(_predict_config()))
+    small = _predict_config()
+    small["cv"] = {"n_folds": 5, "n_repeats": 1}
+    small["permutation"] = {"n_permutations_screening": 5,
+                            "n_permutations_confirmatory": 5,
+                            "escalation_p_lo": 0.005,
+                            "escalation_p_hi": 0.10,
+                            "permutation_seed": 1}
+    (tmp_path / "predict.yaml").write_text(json.dumps(small))
     result = predict_command(args)
     # prediction_dir is under dua_root (DUA-gated)
     assert str(dua_root) in result["prediction_dir"]
