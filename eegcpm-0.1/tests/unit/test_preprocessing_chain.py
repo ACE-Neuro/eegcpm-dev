@@ -33,9 +33,15 @@ def _make_egi_129_raw(duration_s=10, sfreq=500, seed=42):
     ch_names = [f"E{i}" for i in range(1, 129)] + ["Cz"]
     n_channels = len(ch_names)
     n_times = int(duration_s * sfreq)
-    data = rng.randn(n_channels, n_times) * 1e-6  # microvolts
+    data = rng.randn(n_channels, n_times) * 1e-6
     info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
-    return mne.io.RawArray(data, info)
+    raw = mne.io.RawArray(data, info)
+    # Set up a montage with digitization (R-004: the pinned detector
+    # correctly identifies bad channels, and the interpolation step
+    # requires digitization to interpolate them).
+    montage = mne.channels.make_standard_montage("GSN-HydroCel-129")
+    raw.set_montage(montage, match_case=False, on_missing="ignore")
+    return raw
 
 
 # --- channel_roles tests ---

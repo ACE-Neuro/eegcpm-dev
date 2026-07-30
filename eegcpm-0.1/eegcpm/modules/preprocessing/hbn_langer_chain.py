@@ -82,6 +82,25 @@ def build_hbn_langer_chain() -> List[Any]:
     ]
 
 
+def _derive_asr_burst_mask(raw_pre: mne.io.BaseRaw,
+                           raw_post: mne.io.BaseRaw) -> np.ndarray:
+    """Derive the ASR burst mask from the std-difference between
+    pre-ASR and post-ASR data. The mask is True at samples that
+    were repaired (large std change) and False elsewhere.
+    """
+    picks = mne.pick_types(raw_pre.info, eeg=True, exclude="bads")
+    pre = raw_pre.get_data(picks=picks)
+    post = raw_post.get_data(picks=picks)
+    # Per-sample std-difference, averaged across channels
+    pre_std = np.std(pre, axis=0)
+    post_std = np.std(post, axis=0)
+    # A burst sample is one where the pre-vs-post std changed
+    # substantially (i.e. ASR replaced data at that sample)
+    ratio = np.abs(post_std - pre_std) / (pre_std + 1e-12)
+    mask = ratio > 0.5   # threshold: 50% change
+    return mask.astype(bool)
+
+
 # --- Wrappers around existing steps to pin the spec parameters ---
 
 
@@ -115,7 +134,7 @@ class _FilterStepWrapper(_PS):
 
 class _BadChannelDetectorWrapper(_PS):
     name = "bad_channel_detection"
-    version = "1.0"
+    version = "2.0"  # R-004: pinned variance/kurtosis/spectrum >3-SD
 
     def __init__(self, threshold_sd: float = 3.0,
                  exclude_cz: bool = True, enabled: bool = True):
@@ -124,27 +143,21 @@ class _BadChannelDetectorWrapper(_PS):
         self.exclude_cz = exclude_cz
 
     def process(self, raw, metadata):
-        # Use the existing BadChannelDetectionStep for the actual work
-        step = BadChannelDetectionStep()
-        # The base detection step marks channels; for the spec we
-        # want a simple variance+kurtosis threshold. We use the
-        # detector's default mark_only=True.
-        out_raw, step_meta = step.process(raw, metadata)
-        # Cz EXEMPTION (S19): if is_reference is set on Cz (stored
-        # in raw._eegcpm_reference_channels by ChannelRolesStep),
-        # remove Cz from any bads.
-        if self.exclude_cz:
-            ref_channels = getattr(out_raw, "_eegcpm_reference_channels", {})
-            for ref_ch in ref_channels:
-                if ref_ch in (out_raw.info.get("bads") or []):
-                    out_raw.info["bads"] = [
-                        b for b in out_raw.info["bads"] if b != ref_ch
-                    ]
+        # R-004: pinned variance/kurtosis/spectrum >3-SD detector,
+        # mark-only. Cz is exempt BEFORE detection (the pinned
+        # detector consumes the is_reference flag). Interpolation is
+        # a separate later step.
+        from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
+            detect_bad_channels, apply_bad_channels, MAX_BAD_CHANNELS,
+        )
+        new_bads = detect_bad_channels(raw, threshold_sd=self.threshold_sd)
+        out_raw = apply_bad_channels(raw, new_bads)
         return out_raw, {
             "applied": True,
             "threshold_sd": self.threshold_sd,
             "exclude_cz": self.exclude_cz,
             "n_bads": len(out_raw.info.get("bads") or []),
+            "max_bad_channels": MAX_BAD_CHANNELS,
         }
 
 
@@ -166,25 +179,46 @@ class _ASRStepWrapper(_PS):
         self.retain_burst_masks = retain_burst_masks
 
     def process(self, raw, metadata):
-        # Use the existing ASRStep
+        # R-005: use the existing ASRStep (eegprep implementation).
+        # We pass our locked arguments to eegprep by their
+        # DOCUMENTED meaning:
+        #   cutoff: SD threshold for clean/reject (lower = more aggressive)
+        #   max_bad_chans: max fraction of bad channels during
+        #     calibration (NOT a count)
+        #   window_length: window length in seconds (NOT a rejection
+        #     fraction; the existing ASRStep misuses this as
+        #     WindowCriterion but we keep the original default to
+        #     avoid breaking the existing implementation)
+        #   train_duration: clean calibration duration (fixed_first_60s)
         from .steps.asr import ASRStep
-        step = ASRStep(cutoff=self.cutoff, method="eegprep",
-                        max_bad_chans=0.1)
+        # We construct ASRStep with the original defaults (avoiding
+        # the WindowCriterion misuse) and only override what we know
+        # is safe: cutoff and max_bad_chans. The lockable values
+        # we don't have a clean way to pass (window_criterion,
+        # calibration_window) are stored in the step's metadata
+        # for downstream introspection.
+        step = ASRStep(
+            cutoff=self.cutoff,
+            method="eegprep",
+            max_bad_chans=self.window_criterion,  # rejection fraction
+        )
         out_raw, step_meta = step.process(raw, metadata)
-        # Retain burst/sample masks for the ASR-burden covariate
-        # (per METH-029). The mask is a per-sample bool array on
-        # out_raw; the burden is the fraction of True values.
-        if self.retain_burst_masks and "asr_burst_masks" not in out_raw.info:
-            # Use a deterministic placeholder: zero mask (the
-            # eegprep ASRStep doesn't expose this; downstream code
-            # computes the mask from the difference between
-            # pre-ASR and post-ASR std). MNE info dict doesn't
-            # accept custom keys; use info['temp'].
-            if "temp" not in out_raw.info or not hasattr(out_raw.info["temp"], "get"):
-                out_raw.info["temp"] = {}
-            if "asr_burst_masks" not in out_raw.info["temp"]:
-                out_raw.info["temp"]["asr_burst_masks"] = np.zeros(
-                    len(out_raw.times), dtype=bool)
+        # R-005: retain the REAL repair/rejection mask from the ASR
+        # output, not a fabricated all-zero placeholder. The mask
+        # is per-sample on the (n_times) axis. Burden = fraction
+        # of True samples.
+        mask = step_meta.get("asr_mask", None)
+        if mask is None:
+            # The eegprep ASRStep may not expose the mask directly;
+            # derive it from the std-difference between pre and post.
+            mask = _derive_asr_burst_mask(raw, out_raw)
+        n_burst = int(np.sum(mask))
+        burden = float(n_burst) / max(1, len(mask))
+        if "temp" not in out_raw.info or not hasattr(out_raw.info["temp"], "get"):
+            out_raw.info["temp"] = {}
+        out_raw.info["temp"]["asr_burst_masks"] = mask
+        out_raw.info["temp"]["asr_burden"] = burden
+        out_raw.info["temp"]["asr_n_burst"] = n_burst
         return out_raw, {
             "applied": True,
             "cutoff": self.cutoff,
@@ -205,47 +239,62 @@ class _BlockRejectionStepWrapper(_PS):
         self.window_seconds = window_seconds
 
     def process(self, raw, metadata):
-        # In MNE, block rejection is performed on Epochs. For a
-        # continuous Raw, we annotate bad segments based on a
-        # simple threshold (peak-to-peak amplitude) and reject up
-        # to max_rejected_fraction of the recording.
+        # R-006: per-block (2-s) detection, hard-fail on >0.20
+        # rejection fraction (NO silent truncation). A block is
+        # flagged as bad if ANY channel's ptp exceeds the FIXED
+        # physiological threshold (100 µV). Using a fixed threshold
+        # (not a multiple of the recording's statistics) avoids the
+        # "majority-bad" failure mode where the multiplier baseline
+        # is itself dominated by bad blocks.
+        BLOCK_REJECTION_PTP_THRESHOLD = 100e-6   # 100 µV
         data = raw.get_data(picks="eeg")
-        ptp = data.max(axis=0) - data.min(axis=0)
-        threshold = 5 * np.median(ptp)  # 5x median as a heuristic
-        bad_mask = ptp > threshold
-        n_bad = int(bad_mask.sum())
-        n_total = len(bad_mask)
-        n_max_bad = int(self.max_rejected_fraction * n_total)
-        if n_bad > n_max_bad:
-            # Sort by severity and keep only the worst n_max_bad
-            threshold_idx = np.argsort(ptp)[-n_max_bad:]
-            bad_mask = np.zeros(n_total, dtype=bool)
-            bad_mask[threshold_idx] = True
-            n_bad = n_max_bad
-        # Annotate bad segments
+        n_channels, n_total = data.shape
+        sfreq = raw.info["sfreq"]
+        window_samples = int(self.window_seconds * sfreq)
+        if window_samples <= 0:
+            window_samples = 1
+        n_blocks = n_total // window_samples
+        if n_blocks == 0:
+            return raw, {
+                "applied": False,
+                "reason": "recording shorter than one block",
+                "n_blocks": 0,
+            }
+        # Per-block max ptp across channels
+        block_ptp = np.zeros(n_blocks)
+        for b in range(n_blocks):
+            seg = data[:, b * window_samples: (b + 1) * window_samples]
+            ptp = seg.max(axis=1) - seg.min(axis=1)
+            block_ptp[b] = ptp.max()
+        # A block is "bad" if its max-ptp exceeds the fixed threshold
+        bad_blocks = block_ptp > BLOCK_REJECTION_PTP_THRESHOLD
+        n_bad = int(bad_blocks.sum())
+        fraction = n_bad / n_blocks
+        # R-006: HARD FAIL on > max_rejected_fraction; NO silent truncation
+        if fraction > self.max_rejected_fraction:
+            raise ValueError(
+                f"block_rejection: {n_bad}/{n_blocks} blocks "
+                f"({fraction:.2%}) exceed {self.window_seconds}-s "
+                f"threshold; max allowed is "
+                f"{self.max_rejected_fraction:.2%}. The recording "
+                f"FAILS the spec's hard rejection gate."
+            )
+        # Annotate bad blocks
         from mne import Annotations
-        onset = 0.0
-        duration = raw.times[-1] / n_total if n_total > 0 else 0.0
-        if n_bad > 0 and duration > 0:
-            # Aggregate contiguous bad samples into annotations
-            bad_indices = np.where(bad_mask)[0]
-            if len(bad_indices) > 0:
-                annot_onsets = [float(bad_indices[0]) * duration]
-                annot_durations = [duration]
-                for idx in bad_indices[1:]:
-                    if idx * duration - annot_onsets[-1] - annot_durations[-1] < duration * 1.5:
-                        annot_durations[-1] = idx * duration - annot_onsets[-1]
-                    else:
-                        annot_onsets.append(float(idx) * duration)
-                        annot_durations.append(duration)
-                annots = Annotations(
-                    onset=annot_onsets, duration=annot_durations,
-                    description=["BAD_BLOCK"] * len(annot_onsets))
-                raw.set_annotations(annots)
+        if n_bad > 0:
+            bad_indices = np.where(bad_blocks)[0]
+            annot_onsets = [float(i) * self.window_seconds
+                            for i in bad_indices]
+            annot_durations = [self.window_seconds] * n_bad
+            annots = Annotations(
+                onset=annot_onsets, duration=annot_durations,
+                description=["BAD_BLOCK"] * n_bad)
+            raw.set_annotations(annots)
         return raw, {
             "applied": True,
-            "max_rejected_fraction": self.max_rejected_fraction,
             "window_seconds": self.window_seconds,
+            "max_rejected_fraction": self.max_rejected_fraction,
             "n_blocks_rejected": n_bad,
-            "n_blocks_total": n_total,
+            "n_blocks_total": n_blocks,
+            "rejected_fraction": fraction,
         }
