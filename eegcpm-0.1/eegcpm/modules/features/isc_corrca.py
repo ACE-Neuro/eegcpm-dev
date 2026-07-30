@@ -56,34 +56,27 @@ def isc_effective_sample_ratio(
 
 
 def ledoit_wolf_shrinkage(X: np.ndarray) -> float:
-    """Ledoit-Wolf-style shrinkage intensity in [0, 1].
+    """Ledoit-Wolf optimal shrinkage intensity in [0, 1], via sklearn's
+    audited estimator (ENG-EEG3R2-004: the hand-rolled formula deviated
+    materially from the reference implementation).
 
-    X: (n_samples, n_features). Scalar intensity toward scaled identity.
+    X: (n_samples, n_features).
     """
+    from sklearn.covariance import LedoitWolf
     n, p = X.shape
     if n < 2:
         return 1.0
-    S = np.cov(X, rowvar=False, bias=False)
-    mu = np.trace(S) / p
-    diff = S - mu * np.eye(p)
-    var_offdiag = np.sum(diff ** 2) / p
-    var_diag = np.sum((np.diag(S) - mu) ** 2) / p
-    denom = var_offdiag + var_diag * p / n
-    if denom <= 0:
-        return 0.0
-    return float(min(1.0, var_offdiag / denom))
+    return float(LedoitWolf().fit(X).shrinkage_)
 
 
 def regularized_covariance(X: np.ndarray,
                             regularization: str = "ledoit_wolf"
                             ) -> np.ndarray:
-    """LW-shrunk covariance of X (n_samples, n_features)."""
-    n, p = X.shape
-    S = np.cov(X, rowvar=False, bias=False) * (n - 1) / n
+    """LW-shrunk covariance of X (n_samples, n_features), via sklearn."""
     if regularization == "ledoit_wolf":
-        alpha = ledoit_wolf_shrinkage(X)
-        mu = np.trace(S) / p
-        return (1 - alpha) * S + alpha * mu * np.eye(p)
+        from sklearn.covariance import ledoit_wolf
+        shrunk, _alpha = ledoit_wolf(X)
+        return shrunk
     raise ValueError(f"Unknown regularization: {regularization!r}")
 
 
