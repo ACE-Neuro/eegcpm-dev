@@ -88,11 +88,11 @@ def test_fit_template_and_transform_produces_one_row_per_subject():
     for i in range(n_subj):
         subj_signal = common + 0.5 * rng.randn(n_ch, n_times)
         data[f"S{i}"] = subj_signal
-    template = fit_template(data, sfreq=sfreq)
-    df = transform(data, template)
+    df = process(data, sfreq=sfreq)  # LOO templates (primary quantity)
     assert len(df) == n_subj
     assert "isc" in df.columns
-    assert "n_zeroed" in df.columns
+    assert "n_zeroed_channels" in df.columns
+    assert "zeroed_topography_diversity" in df.columns
     assert "subject_id" in df.columns
 
 
@@ -110,8 +110,7 @@ def test_isc_high_with_shared_signal():
         subj_signal = np.broadcast_to(common, (n_ch, n_times)).copy()
         subj_signal += 0.01 * rng.randn(n_ch, n_times)
         data[f"S{i}"] = subj_signal
-    template = fit_template(data, sfreq=sfreq)
-    df = transform(data, template)
+    df = process(data, sfreq=sfreq)  # LOO
     # ISC should be very high
     assert df["isc"].mean() > 0.8, (
         f"ISC mean={df['isc'].mean()}; expected > 0.8 with shared signal"
@@ -126,8 +125,7 @@ def test_isc_low_with_independent_signals():
     n_times = 1000
     sfreq = 100.0
     data = {f"S{i}": rng.randn(n_ch, n_times) for i in range(n_subj)}
-    template = fit_template(data, sfreq=sfreq)
-    df = transform(data, template)
+    df = process(data, sfreq=sfreq)  # LOO
     # ISC should be near zero (independent)
     assert abs(df["isc"].mean()) < 0.3, (
         f"ISC mean={df['isc'].mean()}; expected ~0 with independent signals"
@@ -145,9 +143,9 @@ def test_n_zeroed_recorded_in_dataframe():
     bad_channels = {"S0": [0, 1, 2], "S1": [5], "S2": []}
     template = fit_template(data, sfreq=sfreq)
     df = transform(data, template, bad_channels=bad_channels)
-    assert df.set_index("subject_id").loc["S0", "n_zeroed"] == 3
-    assert df.set_index("subject_id").loc["S1", "n_zeroed"] == 1
-    assert df.set_index("subject_id").loc["S2", "n_zeroed"] == 0
+    assert df.set_index("subject_id").loc["S0", "n_zeroed_channels"] == 3
+    assert df.set_index("subject_id").loc["S1", "n_zeroed_channels"] == 1
+    assert df.set_index("subject_id").loc["S2", "n_zeroed_channels"] == 0
 
 
 # --------------------------------------------------------------- lower-tail (S13a)
