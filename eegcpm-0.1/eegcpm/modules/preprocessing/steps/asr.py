@@ -72,6 +72,7 @@ class ASRStep(ProcessingStep):
         window_length: float = 0.5,
         train_duration: float = 60.0,
         max_bad_chans: float = 0.1,
+        window_criterion: float = None,
         enabled: bool = True,
     ):
         """Initialize ASR step."""
@@ -83,6 +84,10 @@ class ASRStep(ProcessingStep):
         self.window_length = window_length
         self.train_duration = train_duration
         self.max_bad_chans = max_bad_chans
+        # eegprep WindowCriterion is a window REJECTION FRACTION in
+        # [0, 1] (ENG-010) — distinct from window_length. Backward
+        # compatible: falls back to window_length when unset.
+        self.window_criterion = window_criterion
 
         # Validate method
         if method not in ['eegprep', 'asrpy']:
@@ -162,7 +167,9 @@ class ASRStep(ProcessingStep):
         result = eegprep.clean_artifacts(
             eeg,
             BurstCriterion=self.cutoff,               # ASR cutoff
-            WindowCriterion=self.window_length,       # Window length
+            WindowCriterion=(self.window_criterion
+                             if self.window_criterion is not None
+                             else self.window_length),  # rejection FRACTION
             FlatlineCriterion='off',                  # Already handled
             Highpass='off',                           # Already filtered
             ChannelCriterion='off',                   # Already handled bad channels

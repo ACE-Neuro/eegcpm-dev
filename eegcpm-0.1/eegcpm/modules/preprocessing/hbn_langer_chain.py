@@ -82,23 +82,36 @@ def build_hbn_langer_chain() -> List[Any]:
     ]
 
 
-def _derive_asr_burst_mask(raw_pre: mne.io.BaseRaw,
-                           raw_post: mne.io.BaseRaw) -> np.ndarray:
-    """Derive the ASR burst mask from the std-difference between
-    pre-ASR and post-ASR data. The mask is True at samples that
-    were repaired (large std change) and False elsewhere.
+def _derive_asr_burden(raw_pre: mne.io.BaseRaw,
+                       raw_post: mne.io.BaseRaw):
+    """Derive the ASR burden honestly from pre/post recordings.
+
+    Returns (mask, rejected_fraction, repaired_fraction, burden).
+    - rejected_fraction: samples dropped by window rejection
+      (length difference) / n_pre.
+    - repaired_fraction: when lengths match, fraction of samples whose
+      cross-channel std changed >50% (ASR repair); 0 when the length
+      differs (retained-sample alignment is unknowable without the
+      eegprep window mask — recorded as a limitation, never guessed).
+    - burden: rejected + repaired * (n_post / n_pre).
+    - mask: per-sample boolean over the POST-recording samples.
     """
     picks = mne.pick_types(raw_pre.info, eeg=True, exclude="bads")
-    pre = raw_pre.get_data(picks=picks)
-    post = raw_post.get_data(picks=picks)
-    # Per-sample std-difference, averaged across channels
-    pre_std = np.std(pre, axis=0)
-    post_std = np.std(post, axis=0)
-    # A burst sample is one where the pre-vs-post std changed
-    # substantially (i.e. ASR replaced data at that sample)
-    ratio = np.abs(post_std - pre_std) / (pre_std + 1e-12)
-    mask = ratio > 0.5   # threshold: 50% change
-    return mask.astype(bool)
+    n_pre = raw_pre.n_times
+    n_post = raw_post.n_times
+    rejected = max(0, n_pre - n_post) / max(n_pre, 1)
+    mask = np.zeros(n_post, dtype=bool)
+    repaired = 0.0
+    if n_post == n_pre:
+        pre = raw_pre.get_data(picks=picks)
+        post = raw_post.get_data(picks=picks)
+        pre_std = np.std(pre, axis=0)
+        post_std = np.std(post, axis=0)
+        ratio = np.abs(post_std - pre_std) / (pre_std + 1e-12)
+        mask = ratio > 0.5
+        repaired = float(mask.mean())
+    burden = rejected + repaired * (n_post / max(n_pre, 1))
+    return mask, float(rejected), repaired, float(burden)
 
 
 # --- Wrappers around existing steps to pin the spec parameters ---
@@ -200,25 +213,21 @@ class _ASRStepWrapper(_PS):
         step = ASRStep(
             cutoff=self.cutoff,
             method="eegprep",
-            max_bad_chans=self.window_criterion,  # rejection fraction
+            window_criterion=self.window_criterion,  # rejection fraction
+            train_duration=60.0,   # fixed_first_60s calibration
         )
         out_raw, step_meta = step.process(raw, metadata)
-        # R-005: retain the REAL repair/rejection mask from the ASR
-        # output, not a fabricated all-zero placeholder. The mask
-        # is per-sample on the (n_times) axis. Burden = fraction
-        # of True samples.
-        mask = step_meta.get("asr_mask", None)
-        if mask is None:
-            # The eegprep ASRStep may not expose the mask directly;
-            # derive it from the std-difference between pre and post.
-            mask = _derive_asr_burst_mask(raw, out_raw)
+        # R-005: honest ASR burden (rejected + repaired fractions;
+        # never an all-zero placeholder, never a misaligned std-diff).
+        mask, rejected, repaired, burden = _derive_asr_burden(raw, out_raw)
         n_burst = int(np.sum(mask))
-        burden = float(n_burst) / max(1, len(mask))
         if "temp" not in out_raw.info or not hasattr(out_raw.info["temp"], "get"):
             out_raw.info["temp"] = {}
         out_raw.info["temp"]["asr_burst_masks"] = mask
         out_raw.info["temp"]["asr_burden"] = burden
         out_raw.info["temp"]["asr_n_burst"] = n_burst
+        out_raw.info["temp"]["asr_rejected_fraction"] = rejected
+        out_raw.info["temp"]["asr_repaired_fraction"] = repaired
         return out_raw, {
             "applied": True,
             "cutoff": self.cutoff,

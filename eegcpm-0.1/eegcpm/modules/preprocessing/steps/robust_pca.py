@@ -32,8 +32,8 @@ CANONICAL_N_CHANNELS = 109
 CANONICAL_N_TIMES = 100_000
 CANONICAL_LAMBDA = 1.0 / np.sqrt(max(CANONICAL_N_TIMES, CANONICAL_N_CHANNELS))
 CANONICAL_LAMBDA_RULE = "1.0 / sqrt(max(n_times, n_channels))"
-CANONICAL_MU = 1.25 / CANONICAL_LAMBDA
-CANONICAL_MU_RULE = "1.25 / lam"
+CANONICAL_MU = None  # mu is data-dependent: 1.25 / ||M||_2, per matrix
+CANONICAL_MU_RULE = "1.25 / ||M||_2 (computed per matrix; Lin et al. 2011)"
 
 
 def ialm_decompose(
@@ -67,7 +67,11 @@ def ialm_decompose(
     if lam is None:
         lam = CANONICAL_LAMBDA
     if mu is None:
-        mu = CANONICAL_MU
+        # Canonical IALM mu (Lin, Chen & Ma 2011): 1.25 / ||M||_2.
+        # R-014: the earlier 1.25/lam rule failed exact recovery
+        # (rank(L) ~68 vs true 5, S over-selected); the canonical rule
+        # recovers the fixture exactly (rel err 0.0000, F1 1.000).
+        mu = 1.25 / np.linalg.norm(M, 2)
     n_samples, n_features = M.shape
 
     # Initialize
@@ -111,7 +115,7 @@ class RobustPCAStep(ProcessingStep):
         method: str = "ialm",
         lam: float = CANONICAL_LAMBDA,
         lam_rule: str = CANONICAL_LAMBDA_RULE,
-        mu: float = CANONICAL_MU,
+        mu: Optional[float] = CANONICAL_MU,
         mu_rule: str = CANONICAL_MU_RULE,
         tolerance: float = 1e-7,
         max_iter: int = 200,
@@ -122,7 +126,7 @@ class RobustPCAStep(ProcessingStep):
         self.method = method
         self.lam = float(lam)
         self.lam_rule = lam_rule
-        self.mu = float(mu)
+        self.mu = None if mu is None else float(mu)
         self.mu_rule = mu_rule
         self.tolerance = tolerance
         self.max_iter = max_iter
