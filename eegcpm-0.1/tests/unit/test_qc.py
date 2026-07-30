@@ -153,12 +153,13 @@ class TestBaseQC:
         fig, ax = plt.subplots(figsize=(4, 3))
         ax.plot([1, 2, 3], [1, 4, 9])
 
-        png_bytes = BaseQC.fig_to_base64(fig)
+        png_str = BaseQC.fig_to_base64(fig)
 
-        assert isinstance(png_bytes, bytes)
-        assert len(png_bytes) > 0
-        # PNG signature
-        assert png_bytes[:8] == b'\x89PNG\r\n\x1a\n'
+        # Documented contract: base64-encoded PNG *string* (data-URI embeddable)
+        assert isinstance(png_str, str)
+        import base64
+        assert base64.b64decode(png_str)[:8] == b"\x89PNG\r\n\x1a\n"  # valid PNG
+        assert len(png_str) > 0
 
         plt.close(fig)
 

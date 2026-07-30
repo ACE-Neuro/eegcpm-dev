@@ -570,6 +570,14 @@ class PreprocessedQC(BaseQC):
 
 
         try:
+            # Power spectral density
+            fig_psd = self._plot_psd(raw, eeg_picks_good)
+            result.add_figure("psd", self.fig_to_base64(fig_psd, self.dpi))
+            plt.close(fig_psd)
+        except Exception as e:
+            result.add_note(f"PSD plot failed: {str(e)}")
+
+        try:
             # Amplitude distribution
             fig_dist = self._plot_amplitude_distribution(raw, eeg_picks_good)
             result.add_figure("amplitude_dist", self.fig_to_base64(fig_dist, self.dpi))

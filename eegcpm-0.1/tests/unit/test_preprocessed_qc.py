@@ -394,9 +394,10 @@ class TestPreprocessedQCEdgeCases:
             qc = PreprocessedQC(Path(tmpdir))
             result = qc.compute(raw, "sub-001")
 
-            # Should not have bad segment metrics
-            metric_names = [m.name for m in result.metrics]
-            assert "Bad Segments" not in metric_names
+            # No annotations -> Bad Segments metric reports zero (schema is
+            # stable: metric always emitted, value 0 when none)
+            bad = [m for m in result.metrics if m.name == "Bad Segments"]
+            assert len(bad) == 1 and bad[0].value == 0
 
     def test_ica_few_components(self):
         """Test with ICA having very few components."""
