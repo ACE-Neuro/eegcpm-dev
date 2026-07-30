@@ -71,6 +71,12 @@ For more information: https://github.com/clivehywong/eegcpm-dev
         help='Filter by status'
     )
     status_parser.add_argument(
+        '--stage',
+        type=str,
+        choices=['preprocessing', 'epochs', 'source', 'features', 'prediction'],
+        help='Filter by current pipeline stage'
+    )
+    status_parser.add_argument(
         '--verbose',
         '-v',
         action='store_true',

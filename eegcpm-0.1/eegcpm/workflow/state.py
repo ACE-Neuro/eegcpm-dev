@@ -89,6 +89,13 @@ class WorkflowState:
     current_stage: str = "preprocessing"  # preprocessing, epochs, source, features, prediction
     metadata: Dict[str, Any] = field(default_factory=dict)  # Stage-specific metadata
 
+    # R-015: condition-level and run-level identity. `condition` separates
+    # feature conditions (resting_ec / resting_eo / despicable_me ...) for
+    # subject-level stages; `run_id` separates batch runs (e.g. prediction
+    # runs) that have no natural subject. Both default to "" (legacy rows).
+    condition: Optional[str] = None
+    run_id: Optional[str] = None
+
     @property
     def is_combined(self) -> bool:
         """Check if this is a combined workflow (aggregates multiple runs)."""
@@ -147,6 +154,42 @@ class WorkflowStateManager:
     def _init_db(self):
         """Initialize database schema."""
         with sqlite3.connect(self.db_path) as conn:
+            # R-015 migration: the identity key must include condition and
+            # run_id. SQLite cannot alter a table-level UNIQUE constraint,
+            # so migrate by rebuild when the columns are missing.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(workflows)")}
+            if cols and "condition" not in cols:
+                conn.execute("ALTER TABLE workflows RENAME TO workflows_old")
+                conn.execute("""
+                    CREATE TABLE workflows (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        subject_id TEXT NOT NULL,
+                        session TEXT,
+                        task TEXT NOT NULL,
+                        run TEXT,
+                        pipeline TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        config_hash TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        current_stage TEXT DEFAULT 'preprocessing',
+                        metadata TEXT,
+                        condition TEXT NOT NULL DEFAULT '',
+                        run_id TEXT NOT NULL DEFAULT '',
+                        UNIQUE(subject_id, session, task, run, pipeline, condition, run_id)
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO workflows (id, subject_id, session, task, run,
+                        pipeline, status, config_hash, created_at, updated_at,
+                        current_stage, metadata, condition, run_id)
+                    SELECT id, subject_id, session, task, run, pipeline,
+                        status, config_hash, created_at, updated_at,
+                        current_stage, metadata, '', ''
+                    FROM workflows_old
+                """)
+                conn.execute("DROP TABLE workflows_old")
+
             # Create workflows table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS workflows (
@@ -162,7 +205,9 @@ class WorkflowStateManager:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     current_stage TEXT DEFAULT 'preprocessing',
                     metadata TEXT,
-                    UNIQUE(subject_id, session, task, run, pipeline)
+                    condition TEXT NOT NULL DEFAULT '',
+                    run_id TEXT NOT NULL DEFAULT '',
+                    UNIQUE(subject_id, session, task, run, pipeline, condition, run_id)
                 )
             """)
 
@@ -176,6 +221,13 @@ class WorkflowStateManager:
                 conn.execute("ALTER TABLE workflows ADD COLUMN metadata TEXT")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+            for col, ddl in (("condition", "TEXT NOT NULL DEFAULT ''"),
+                             ("run_id", "TEXT NOT NULL DEFAULT ''")):
+                try:
+                    conn.execute(f"ALTER TABLE workflows ADD COLUMN {col} {ddl}")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS steps (
@@ -226,9 +278,9 @@ class WorkflowStateManager:
             # Insert or update workflow
             cursor = conn.execute("""
                 INSERT INTO workflows (subject_id, session, task, run, pipeline, status, config_hash,
-                                      created_at, updated_at, current_stage, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(subject_id, session, task, run, pipeline)
+                                      created_at, updated_at, current_stage, metadata, condition, run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(subject_id, session, task, run, pipeline, condition, run_id)
                 DO UPDATE SET
                     status=excluded.status,
                     config_hash=excluded.config_hash,
@@ -238,16 +290,20 @@ class WorkflowStateManager:
                 RETURNING id
             """, (
                 state.subject_id,
-                state.session,
+                # NULL session/run defeat the UNIQUE key (SQLite treats
+                # NULLs as distinct) — store '' instead (R-015).
+                state.session if state.session is not None else "",
                 state.task,
-                state.run,
+                state.run if state.run is not None else "",
                 state.pipeline,
                 state.status.value,
                 state.config_hash,
                 state.created_at,
                 state.updated_at,
                 state.current_stage,
-                metadata_json
+                metadata_json,
+                state.condition or "",
+                state.run_id or "",
             ))
 
             workflow_id = cursor.fetchone()[0]
@@ -289,7 +345,9 @@ class WorkflowStateManager:
         task: str,
         pipeline: str,
         session: Optional[str] = None,
-        run: Optional[str] = None
+        run: Optional[str] = None,
+        condition: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> Optional[WorkflowState]:
         """
         Load workflow state from database.
@@ -319,9 +377,13 @@ class WorkflowStateManager:
             cursor = conn.execute("""
                 SELECT * FROM workflows
                 WHERE subject_id = ? AND task = ? AND pipeline = ?
-                AND (session = ? OR (session IS NULL AND ? IS NULL))
-                AND (run = ? OR (run IS NULL AND ? IS NULL))
-            """, (subject_id, task, pipeline, session, session, run, run))
+                AND (session = ? OR (session IS NULL AND ? IS NULL)
+                     OR (session = '' AND ? IS NULL))
+                AND (run = ? OR (run IS NULL AND ? IS NULL)
+                     OR (run = '' AND ? IS NULL))
+                AND condition = ? AND run_id = ?
+            """, (subject_id, task, pipeline, session, session, session,
+                  run, run, run, condition or "", run_id or ""))
 
             row = cursor.fetchone()
             if row is None:
@@ -352,15 +414,17 @@ class WorkflowStateManager:
 
             return WorkflowState(
                 subject_id=row['subject_id'],
-                session=row['session'],
+                session=row['session'] if row['session'] else None,
                 task=row['task'],
-                run=row['run'],
+                run=row['run'] if row['run'] else None,
                 pipeline=row['pipeline'],
                 status=ProcessingStatus(row['status']),
                 config_hash=row['config_hash'],
                 created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None,
                 updated_at=datetime.fromisoformat(row['updated_at']) if row['updated_at'] else None,
                 current_stage=row['current_stage'] if 'current_stage' in row.keys() else 'preprocessing',
+                condition=row['condition'] if 'condition' in row.keys() else None,
+                run_id=row['run_id'] if 'run_id' in row.keys() else None,
                 metadata=metadata,
                 steps=steps
             )
@@ -372,7 +436,10 @@ class WorkflowStateManager:
         task: Optional[str] = None,
         run: Optional[str] = None,
         pipeline: Optional[str] = None,
-        status: Optional[ProcessingStatus] = None
+        status: Optional[ProcessingStatus] = None,
+        condition: Optional[str] = None,
+        run_id: Optional[str] = None,
+        stage: Optional[str] = None,
     ) -> List[WorkflowState]:
         """
         Get all workflow states matching filters.
@@ -418,6 +485,15 @@ class WorkflowStateManager:
         if status:
             query += " AND status = ?"
             params.append(status.value)
+        if condition is not None:
+            query += " AND condition = ?"
+            params.append(condition)
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        if stage is not None:
+            query += " AND current_stage = ?"
+            params.append(stage)
 
         query += " ORDER BY subject_id, session, task, run"
 
@@ -432,7 +508,9 @@ class WorkflowStateManager:
                     row['task'],
                     row['pipeline'],
                     session=row['session'],
-                    run=row['run']
+                    run=row['run'],
+                    condition=row['condition'],
+                    run_id=row['run_id'],
                 )
                 if state:
                     states.append(state)

@@ -62,7 +62,8 @@ def status_command(args):
         subject_id=args.subject,
         task=args.task,
         pipeline=args.pipeline,
-        status=status_filter
+        status=status_filter,
+        stage=getattr(args, "stage", None),
     )
 
     if not workflows:
