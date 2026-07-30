@@ -225,7 +225,7 @@ class SpecparamFeatureModule(BaseModule):
     """specparam feature extraction (per-channel, per-condition)."""
 
     name = "specparam_features"
-    version = "0.1.0"
+    version = "0.2.0"  # R-010: complete BaseModule contract
 
     def __init__(self, config: dict, output_dir):
         super().__init__(config, output_dir)
@@ -236,13 +236,40 @@ class SpecparamFeatureModule(BaseModule):
                 f"'fixed' or 'knee'."
             )
         self.freq_range = tuple(config.get("freq_range", (2.0, 40.0)))
+        self.subject_id = config.get("subject_id", "unknown")
+        self.session = config.get("session", "01")
+        self.condition = config.get("condition", "resting_ec")
+        self.input_file_sha256 = config.get("input_file_sha256", None)
+
+    def validate_input(self, data) -> bool:
+        """R-010: validate that data is a 2D (n_channels, n_times)
+        RawArray-compatible array. Reject MNE Epochs (we operate on
+        continuous Raw) and any non-array input.
+        """
+        import numpy as np
+        if not isinstance(data, np.ndarray):
+            return False
+        if data.ndim != 2:
+            return False
+        if data.shape[0] < 2 or data.shape[1] < 256:
+            return False
+        return True
 
     def process(self, data, subject=None, condition="resting_ec",
-                **kwargs):
-        """Compute PSD per channel, fit specparam, return feature row.
+                session="01", **kwargs):
+        """Compute PSD per channel, fit specparam, return ModuleResult
+        (R-010: BaseModule contract).
 
-        `data` is (n_channels, n_times) array.
+        `data` is (n_channels, n_times) array. The output DataFrame
+        has the SPECPARAM_COLUMNS schema and metadata per row.
         """
+        import time
+        start = time.time()
+        # R-010: subject/condition/session from kwargs OVERRIDE
+        # constructor defaults (so per-call arguments win).
+        subj = subject if subject is not None else self.subject_id
+        sess = session or self.session
+        cond = condition or self.condition
         sfreq = kwargs.get("sfreq", 500.0)
         n_per_seg = PINNED_WELCH["n_per_seg_samples"]
         n_overlap = PINNED_WELCH["overlap_samples"]
@@ -260,10 +287,39 @@ class SpecparamFeatureModule(BaseModule):
             row = fit_one_channel(freqs, psd, self.aperiodic_mode)
             row["channel"] = f"ch_{ch}"
             row["region"] = "unknown"   # caller can update
+            row["subject_id"] = subj
+            row["session"] = sess
+            row["condition"] = cond
             row["n_epochs_used"] = n_segs
             row["duration_seconds"] = data.shape[-1] / sfreq
+            row["input_file_sha256"] = self.input_file_sha256
+            row["extraction_timestamp"] = time.time()
+            # Band-limited power (computed from the PSD)
+            bw = lambda lo, hi: float(np.mean(
+                psd[(freqs >= lo) & (freqs <= hi)]))
+            row["bandpower_delta"] = bw(2, 4)
+            row["bandpower_theta"] = bw(4, 8)
+            row["bandpower_alpha"] = bw(8, 13)
+            row["bandpower_beta"] = bw(13, 30)
+            row["bandpower_gamma"] = bw(30, 45)
             rows.append(row)
-        return {
-            "outputs": {"features": rows},
-            "output_files": [],
-        }
+        # R-010: return ModuleResult (BaseModule contract) with
+        # the binding schema in outputs["features"] as a list of
+        # dicts (each row is a SPECPARAM_COLUMNS dict).
+        from eegcpm.pipeline.base import ModuleResult
+        return ModuleResult(
+            module_name=self.name,
+            execution_time_seconds=time.time() - start,
+            success=True,
+            outputs={"features": rows},
+            output_files=[],
+            metadata={
+                "n_channels": n_channels,
+                "aperiodic_mode": self.aperiodic_mode,
+                "freq_range": list(self.freq_range),
+                "n_rows": len(rows),
+                "columns": list(SPECPARAM_COLUMNS),
+                "pinned_welch": dict(PINNED_WELCH),
+                "realized_segment_counts": dict(REALIZED_SEGMENT_COUNTS),
+            },
+        )
