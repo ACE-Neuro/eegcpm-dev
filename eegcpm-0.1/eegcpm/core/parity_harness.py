@@ -327,14 +327,15 @@ def check_parity_tolerance(
             f"FINDING, not an auto re-label. Investigate thread count, "
             f"BLAS build, FFT library, MNE version mismatch."
         )
-    # Numeric tolerance
+    # Numeric tolerance (equal_nan: QC-flagged dead channels carry NaN
+    # on both sides; NaN==NaN is a match, not a failure)
     import numpy as np
     arr_local = np.asarray(local_value, dtype=float)
     arr_hpc = np.asarray(hpc_value, dtype=float)
     if np.allclose(arr_local, arr_hpc,
-                    rtol=row["rtol"], atol=row["atol"]):
+                    rtol=row["rtol"], atol=row["atol"], equal_nan=True):
         return True, f"within rtol={row['rtol']}, atol={row['atol']}"
     return False, (
         f"exceeds rtol={row['rtol']}, atol={row['atol']}: "
-        f"max abs diff = {np.max(np.abs(arr_local - arr_hpc))}"
+        f"max abs diff = {np.nanmax(np.abs(arr_local - arr_hpc))}"
     )
