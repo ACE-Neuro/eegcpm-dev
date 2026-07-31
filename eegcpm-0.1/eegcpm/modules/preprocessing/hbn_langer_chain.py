@@ -255,6 +255,14 @@ class _BlockRejectionStepWrapper(_PS):
         # (not a multiple of the recording's statistics) avoids the
         # "majority-bad" failure mode where the multiplier baseline
         # is itself dominated by bad blocks.
+        # Per-block statistics across channels. A block is bad if the
+        # MEDIAN channel ptp exceeds the threshold — i.e. a whole-head
+        # artifact, not single-channel noise (which is already handled
+        # by bad-channel interpolation + ASR). Verified on real HBN
+        # pilot data 2026-07-31: max-over-channels fails 100% of blocks
+        # (single-channel spikes dominate), median-over-channels flags
+        # ~13% (sensible gate). max-over-channels would make the gate
+        # structurally unable to pass (METH-22-009).
         BLOCK_REJECTION_PTP_THRESHOLD = 100e-6   # 100 µV
         data = raw.get_data(picks="eeg")
         n_channels, n_total = data.shape
@@ -269,14 +277,14 @@ class _BlockRejectionStepWrapper(_PS):
                 "reason": "recording shorter than one block",
                 "n_blocks": 0,
             }
-        # Per-block max ptp across channels
-        block_ptp = np.zeros(n_blocks)
+        # Per-block median and max channel ptp
+        block_med = np.zeros(n_blocks)
         for b in range(n_blocks):
             seg = data[:, b * window_samples: (b + 1) * window_samples]
             ptp = seg.max(axis=1) - seg.min(axis=1)
-            block_ptp[b] = ptp.max()
-        # A block is "bad" if its max-ptp exceeds the fixed threshold
-        bad_blocks = block_ptp > BLOCK_REJECTION_PTP_THRESHOLD
+            block_med[b] = np.median(ptp)
+        # A block is "bad" if its MEDIAN channel ptp exceeds the threshold
+        bad_blocks = block_med > BLOCK_REJECTION_PTP_THRESHOLD
         n_bad = int(bad_blocks.sum())
         fraction = n_bad / n_blocks
         # R-006: HARD FAIL on > max_rejected_fraction; NO silent truncation
