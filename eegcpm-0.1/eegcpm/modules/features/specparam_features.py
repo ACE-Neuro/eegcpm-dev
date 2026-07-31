@@ -135,6 +135,27 @@ def fit_one_channel(
     Returns a dict with the specparam columns for the row, plus
     a fit_qc dict carrying realized values.
     """
+    # Guard: specparam logs the PSD — zero/negative/NaN powers (dead or
+    # fully-interpolated channels) produce NaN/Inf in log space and a
+    # DataError. Floor at a tiny positive value and mark QC-fail when
+    # the floor was engaged on >5% of bins (dead channel).
+    psd = np.asarray(psd, dtype=float)
+    bad_bins = ~np.isfinite(psd) | (psd <= 0)
+    floor_engaged = float(bad_bins.mean())
+    if floor_engaged > 0:
+        psd = psd.copy()
+        psd[bad_bins] = 1e-20
+    if floor_engaged > 0.05:
+        return {
+            "offset": np.nan, "exponent": np.nan,
+            "aperiodic_mode": aperiodic_mode,
+            "exponent_knee": None, "offset_knee": None, "knee_freq": None,
+            "n_peaks": 0, "peak_alpha_freq": np.nan,
+            "peak_alpha_power": np.nan,
+            "r_squared": 0.0, "rmse": np.inf, "qc_pass": False,
+            "library_mae_for_reference_only": np.nan,
+            "dead_channel_fraction": floor_engaged,
+        }
     if aperiodic_mode == "fixed":
         model = _fit_spectrum(
             freqs, psd, freq_range=(2.0, 40.0),
