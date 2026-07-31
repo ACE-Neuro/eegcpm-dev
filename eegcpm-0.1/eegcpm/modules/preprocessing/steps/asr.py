@@ -178,6 +178,18 @@ class ASRStep(ProcessingStep):
 
         eeg_cleaned = result[0]
 
+        # Kept-sample mask (for event/annotation remapping after window
+        # rejection): 1 = kept, 0 = dropped, over the ORIGINAL samples.
+        # Downstream consumers (condition segmentation, epochs) MUST
+        # remap original sample indices through this mask.
+        sample_mask = None
+        try:
+            etc = eeg_cleaned.get("etc", {})
+            if isinstance(etc, dict) and "clean_sample_mask" in etc:
+                sample_mask = np.asarray(etc["clean_sample_mask"]).astype(bool)
+        except Exception:
+            sample_mask = None
+
         # Convert back to MNE Raw
         # IMPORTANT: eegprep stores data in µV, MNE expects Volts
         # eeg_mne2eeg() multiplied by 1e6 (V → µV), so we must divide by 1e6 here
@@ -302,8 +314,21 @@ class ASRStep(ProcessingStep):
             **nan_inf_metadata,  # Include NaN/Inf statistics if any
             'n_channels_before': len(raw.ch_names),
             'n_channels_after': len(raw_cleaned.ch_names),
+            'n_samples_before': int(raw.n_times),
+            'n_samples_after': int(raw_cleaned.n_times),
+            'window_rejected_fraction': (
+                float(1.0 - raw_cleaned.n_times / raw.n_times)
+                if raw.n_times else 0.0),
             'montage_restored': montage_restored,
         }
+
+        # Persist the kept-sample mask for event remapping (R-fix:
+        # events.tsv indices refer to the ORIGINAL timeline)
+        if sample_mask is not None:
+            if "temp" not in raw_cleaned.info or not isinstance(
+                    raw_cleaned.info.get("temp"), dict):
+                raw_cleaned.info["temp"] = {}
+            raw_cleaned.info["temp"]["clean_sample_mask"] = sample_mask
 
         return raw_cleaned, metadata
 
