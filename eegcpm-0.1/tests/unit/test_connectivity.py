@@ -262,3 +262,42 @@ def test_bandpass_filters_correctly():
         f"Bandpass did not concentrate power in [8, 13] Hz: "
         f"{power_in / power_total:.2%} in band"
     )
+
+
+def test_scalp_picks_excludes_eog_channels():
+    """METH-EEGFULL-020: connectivity is computed on 109 scalp channels
+    only; the 9 EOG channels are excluded at the feature step (and the
+    edge count per matrix is exactly 5,886)."""
+    from eegcpm.modules.connectivity.connectivity import (
+        ConnectivityModule, scalp_picks, EOG_HYDROCEL_NAMES,
+    )
+    picks = scalp_picks(118)
+    assert len(picks) == 109
+    # documented positional mapping: EOG HydroCel numbers in the
+    # 118-array (129 minus 11 neck/face drops)
+    from eegcpm.modules.connectivity.connectivity import _egi_118_eog_positions
+    assert not any(pos in picks for pos in _egi_118_eog_positions())
+    # name-based mapping
+    names = [f"E{i}" for i in range(1, 129)] + ["Cz"]
+    kept = [c for c in names if c not in {
+        "E38","E43","E44","E48","E49","E56","E63","E68","E73","E81","E117"}]
+    picks_named = scalp_picks(118, ch_names=kept)
+    np.testing.assert_array_equal(picks, picks_named)
+    eog_kept = [kept[i] for i in picks]
+    assert not any(c in EOG_HYDROCEL_NAMES for c in eog_kept)
+
+    cm = ConnectivityModule(n_channels=109, sfreq=500.0)
+    rng = np.random.RandomState(0)
+    data = rng.randn(118, 2000) * 1e-6
+    edges = cm.edges(data)
+    for method, band_dict in edges.items():
+        for band, e in band_dict.items():
+            assert e.shape == (5886,), (
+                f"{method}/{band}: {e.shape[0]} edges != 5,886 "
+                f"(EOG channels leaked into the edge set)"
+            )
+
+
+def test_scalp_picks_identity_for_109():
+    from eegcpm.modules.connectivity.connectivity import scalp_picks
+    assert len(scalp_picks(109)) == 109

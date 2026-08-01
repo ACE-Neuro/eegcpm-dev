@@ -325,20 +325,85 @@ def edges_to_matrix(edges: np.ndarray, n_channels: int) -> np.ndarray:
     return M
 
 
+# EGI HydroCel 129 montage: the 9 EOG channels (HydroCel numbers
+# 8, 14, 17, 21, 25, 125, 126, 127, 128) are EXCLUDED from
+# connectivity estimation (METH-EEGFULL-020): EOG-scalp edges carry
+# the ocular signal EOG regression exists to remove, and blink/saccade
+# rate covaries with age and inattention — a confound channel, not
+# brain connectivity. EOG channels REMAIN in the recording (residual-
+# ocular QC needs them); they are excluded at the feature step only.
+# With 109 scalp channels: edges per matrix = 5,886; x 15 = 88,290.
+EOG_HYDROCEL_NAMES = ("E8", "E14", "E17", "E21", "E25",
+                      "E125", "E126", "E127", "E128")
+NECK_FACE_HYDROCEL_NAMES = ("E38", "E43", "E44", "E48", "E49", "E56",
+                            "E63", "E68", "E73", "E81", "E117")
+
+
+def _egi_118_eog_positions() -> np.ndarray:
+    """0-indexed EOG positions in the 118-channel array produced by the
+    canonical chain (129 = E1..E128 + Cz, minus the 11 neck/face drops).
+    Computed from the documented name mapping — not guessed."""
+    full = [f"E{i}" for i in range(1, 129)] + ["Cz"]
+    kept = [c for c in full if c not in NECK_FACE_HYDROCEL_NAMES]
+    return np.array([kept.index(c) for c in EOG_HYDROCEL_NAMES])
+
+
+def scalp_picks(n_channels: int,
+                ch_names=None,
+                ) -> np.ndarray:
+    """Indices of scalp (non-EOG) channels. Name-based when ch_names is
+    given; documented positional mapping for the canonical 118-channel
+    EGI array; no-op when the array is already 109 scalp channels."""
+    if ch_names is not None:
+        return np.array([i for i, c in enumerate(ch_names)
+                         if c not in EOG_HYDROCEL_NAMES])
+    if n_channels == 118:
+        eog_pos = set(_egi_118_eog_positions().tolist())
+        picks = np.array([i for i in range(n_channels)
+                          if i not in eog_pos])
+        return picks
+    if n_channels == 109:
+        return np.arange(n_channels)
+    import warnings
+    warnings.warn(
+        f"scalp_picks: n_channels={n_channels} is not the canonical EGI "
+        f"118-array and no ch_names given; returning identity (no EOG "
+        f"exclusion possible). Pass ch_names for EOG exclusion.",
+        UserWarning)
+    return np.arange(n_channels)
+
+
 class ConnectivityModule:
-    """Sensor-space connectivity orchestration (109 ch, 5 bands, 5 methods)."""
+    """Sensor-space connectivity orchestration (109 scalp ch, 5 bands,
+    5 methods)."""
 
     def __init__(self, n_channels: int = 109, sfreq: float = 500.0,
                  methods: Tuple[str, ...] = PRIMARY_METHODS,
-                 bands: Optional[Dict[str, Tuple[float, float]]] = None):
+                 bands: Optional[Dict[str, Tuple[float, float]]] = None,
+                 scalp_only: bool = True, ch_names=None):
         self.n_channels = n_channels
         self.sfreq = sfreq
         self.methods = methods
         self.bands = bands if bands is not None else FREQUENCY_BANDS
+        self.scalp_only = scalp_only
+        self.ch_names = ch_names
+
+    def _apply_picks(self, data: np.ndarray) -> np.ndarray:
+        if self.scalp_only:
+            picks = scalp_picks(data.shape[0], ch_names=self.ch_names)
+            if len(picks) != self.n_channels:
+                import warnings
+                warnings.warn(
+                    f"scalp picks give {len(picks)} channels, expected "
+                    f"{self.n_channels}; using the picks anyway.",
+                    UserWarning)
+            return data[picks]
+        return data
 
     def compute(self, data: np.ndarray) -> Dict[str, Dict[str, np.ndarray]]:
         return compute_connectivity(
-            data, self.sfreq, methods=self.methods, bands=self.bands)
+            self._apply_picks(data), self.sfreq, methods=self.methods,
+            bands=self.bands)
 
     def edges(self, data: np.ndarray) -> Dict[str, Dict[str, np.ndarray]]:
         """Compute and convert to edge vectors (long format)."""
