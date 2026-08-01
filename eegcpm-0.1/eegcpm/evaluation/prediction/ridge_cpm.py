@@ -96,8 +96,11 @@ def fit_predict_outer_fold(
                     or best_alpha == alpha_grid[-1])
 
     # 4. Fit on full training fold
+    # solver='lsqr': at p >> n (88k-103k edges) cholesky on X'X needs
+    # O(p^2) memory (~86 GB) and would OOM; lsqr is iterative and
+    # memory-safe (0.6 s/fit at n=916, p=103,545).
     model = Ridge(alpha=best_alpha, fit_intercept=True,
-                  random_state=random_state)
+                  solver="lsqr", random_state=random_state)
     model.fit(X_train, y_train)
 
     # 5. Predict on test
@@ -112,7 +115,7 @@ def _pooled_out_of_fold_r_for_alpha(
     from sklearn.linear_model import Ridge
     y_true_all, y_pred_all = [], []
     for tr, te in kf.split(X):
-        m = Ridge(alpha=alpha, fit_intercept=True)
+        m = Ridge(alpha=alpha, fit_intercept=True, solver="lsqr")
         m.fit(X[tr], y[tr])
         y_true_all.append(y[te])
         y_pred_all.append(m.predict(X[te]))
