@@ -222,3 +222,61 @@ def test_post_reference_cz_variance_greater_than_zero():
         "Post-reference Cz variance is 0; reference recovery failed; "
         "Cz was not included in the average."
     )
+
+
+# --- Toolbox QC module + named-chain CLI wiring (2026-08-04) ---
+
+def test_recording_qc_metrics_emits_schema():
+    """The promoted QC module emits the full per-recording schema."""
+    import mne
+    from eegcpm.modules.qc.hbn_recording_qc import (
+        recording_qc_metrics, EOG_HYDROCEL_NAMES,
+    )
+    ch_names = [f"E{i}" for i in range(1, 129)] + ["Cz"]
+    rng = np.random.RandomState(0)
+    data = rng.normal(size=(129, 5000)) * 1e-6
+    info = mne.create_info(ch_names, 500.0, "eeg")
+    raw = mne.io.RawArray(data, info)
+    row = recording_qc_metrics(raw, task="RestingState",
+                               subject_id="sub-test")
+    for key in ["duration_post_s", "line_noise_residual_ratio",
+                "residual_ocular_maxcorr", "residual_ocular_pass",
+                "emg_proxy_30_45_ratio", "bad_channels_n", "task",
+                "subject_id"]:
+        assert key in row, f"missing QC key: {key}"
+    assert row["residual_ocular_maxcorr"] < 0.30  # independent noise
+    assert row["residual_ocular_pass"] is True
+
+
+def test_recording_qc_ocular_detection():
+    """A recording with strong EOG->scalp leakage must fail the
+    residual-ocular gate."""
+    import mne
+    from eegcpm.modules.qc.hbn_recording_qc import recording_qc_metrics
+    ch_names = [f"E{i}" for i in range(1, 129)] + ["Cz"]
+    rng = np.random.RandomState(1)
+    data = rng.normal(size=(129, 5000)) * 1e-6
+    eog1 = ch_names.index("E8")
+    # leak E8 into all scalp channels strongly
+    for i in range(129):
+        if i != eog1:
+            data[i] = data[i] * 0.1 + data[eog1] * 0.9
+    info = mne.create_info(ch_names, 500.0, "eeg")
+    raw = mne.io.RawArray(data, info)
+    row = recording_qc_metrics(raw, task="X")
+    assert row["residual_ocular_pass"] is False
+
+
+def test_named_chain_resolves():
+    """The named canonical chain resolves to prebuilt steps in the
+    pinned order."""
+    from eegcpm.modules.preprocessing.pipeline_builder import (
+        PreprocessingPipeline,
+    )
+    pipe = PreprocessingPipeline("hbn_langer")
+    names = [s.name for s in pipe.steps]
+    assert names[0] == "channel_roles"
+    assert "zapline" in names
+    assert names.index("zapline") < names.index("filter")  # S19/METH-019
+    assert names[-1] == "reference"
+    assert "block_rejection" in names

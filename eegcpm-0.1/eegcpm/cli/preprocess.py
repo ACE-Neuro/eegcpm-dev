@@ -232,7 +232,13 @@ def preprocess_command(args):
                     run_output.mkdir(parents=True, exist_ok=True)
 
                     # Run preprocessing
-                    module = PreprocessingPipeline(config['steps'], run_output)
+                    # Named canonical chains take precedence over a
+                    # steps list: config may carry `variant: hbn_langer`
+                    # (or `steps: hbn_langer`) to build the locked chain.
+                    steps_spec = config.get('steps', [])
+                    if config.get('variant') == 'hbn_langer' or steps_spec == 'hbn_langer':
+                        steps_spec = 'hbn_langer'
+                    module = PreprocessingPipeline(steps_spec, run_output)
                     result = module.process(raw, subject_id=subject_id)
 
                     if result.success:

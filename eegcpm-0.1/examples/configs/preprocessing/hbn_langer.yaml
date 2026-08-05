@@ -3,6 +3,7 @@
 # golden-config-hash CI test — change requires a new parity run.
 stage: preprocessing
 variant: hbn_langer
+steps: hbn_langer        # named chain -> build_hbn_langer_chain()
 is_primary: true
 
 channel_roles:

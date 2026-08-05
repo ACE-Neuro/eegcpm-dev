@@ -16,6 +16,18 @@ from eegcpm.pipeline.base import ModuleResult
 from .steps import STEP_REGISTRY, ProcessingStep
 
 
+def _resolve_named_chain(name: str):
+    """Resolve a named canonical chain to prebuilt step instances."""
+    if name == "hbn_langer":
+        from eegcpm.modules.preprocessing.hbn_langer_chain import (
+            build_hbn_langer_chain,
+        )
+        return build_hbn_langer_chain()
+    raise ValueError(
+        f"Unknown named chain {name!r}. Available: ['hbn_langer']"
+    )
+
+
 class PreprocessingPipeline:
     """
     Flexible preprocessing pipeline builder.
@@ -56,7 +68,7 @@ class PreprocessingPipeline:
 
     def __init__(
         self,
-        steps: List[Dict[str, Any]],
+        steps,
         output_dir: Optional[Path] = None
     ):
         """
@@ -64,14 +76,21 @@ class PreprocessingPipeline:
 
         Parameters
         ----------
-        steps : list of dict
-            Step configurations
+        steps : list of dict, or str
+            Step configurations, OR the name of a named canonical chain
+            (currently: "hbn_langer" — the deterministic Langer+ASR
+            chain; built via build_hbn_langer_chain()).
         output_dir : Path, optional
             Output directory
         """
+        if isinstance(steps, str):
+            steps = _resolve_named_chain(steps)
         self.step_configs = steps
         self.output_dir = output_dir
-        self.steps = self._build_steps(steps)
+        if steps and isinstance(steps[0], ProcessingStep):
+            self.steps = steps  # prebuilt instances (named chains)
+        else:
+            self.steps = self._build_steps(steps)
 
     def _build_steps(self, step_configs: List[Dict]) -> List[ProcessingStep]:
         """
