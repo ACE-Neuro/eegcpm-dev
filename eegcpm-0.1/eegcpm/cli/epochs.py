@@ -260,12 +260,27 @@ def epochs_command(args):
                     event_dict = None
                     print(f"   ✓ Found {len(events)} events from stim channel")
 
-                # Fallback: load events from BIDS events.tsv if no annotations/stim events
-                if len(events) == 0:
-                    run_id = run_dirs[0].name.replace("run-", "") if run_dirs[0].name.startswith("run-") else None
-                    events_tsv = find_events_tsv(
-                        paths.bids_root, subject_id, session_id, task, run=run_id
-                    )
+                # Event codes defined in task config conditions
+                event_codes_to_epoch = task_config.get_event_codes_to_epoch()
+
+                # Locate BIDS events.tsv (onsets + trial_type labels)
+                run_id = run_dirs[0].name.replace("run-", "") if run_dirs[0].name.startswith("run-") else None
+                events_tsv = find_events_tsv(
+                    paths.bids_root, subject_id, session_id, task, run=run_id
+                )
+
+                # Prefer BIDS events.tsv when the task config uses semantic codes
+                # that don't match the annotation descriptions (e.g. raw
+                # BrainVision 'Stimulus/S  1' markers preserved in the FIF),
+                # or when no events were found at all.
+                semantic_codes = [
+                    c for c in event_codes_to_epoch
+                    if isinstance(c, str) and not c.isdigit()
+                ]
+                annotations_match = bool(event_dict) and any(
+                    c in event_dict for c in event_codes_to_epoch
+                )
+                if len(events) == 0 or (semantic_codes and not annotations_match and events_tsv):
                     if events_tsv:
                         tsv_events, tsv_event_id = load_events_from_bids_tsv(
                             events_tsv,
@@ -279,8 +294,6 @@ def epochs_command(args):
                             print(f"   ✓ Loaded {len(events)} events from BIDS events.tsv ({list(event_dict.keys())})")
 
                 # Build event_id from task config to filter which events to epoch
-                # Get event codes defined in task config conditions
-                event_codes_to_epoch = task_config.get_event_codes_to_epoch()
 
                 # Load event mapping from BIDS to translate semantic names to numeric codes
                 event_mapping = get_event_mapping_for_run(
@@ -300,9 +313,10 @@ def epochs_command(args):
                 else:
                     # Check if event codes look like semantic names (strings, not numeric)
                     semantic_codes = [c for c in event_codes_to_epoch if isinstance(c, str) and not c.isdigit()]
-                    if semantic_codes and event_dict:
+                    unmatched = [c for c in semantic_codes if not event_dict or c not in event_dict]
+                    if unmatched and event_dict:
                         print(f"   ⚠️  No BIDS events.tsv mapping found for this run.")
-                        print(f"      String event codes {semantic_codes} cannot match numeric annotation descriptions.")
+                        print(f"      String event codes {unmatched} cannot match numeric annotation descriptions.")
                         print(f"      Available annotations: {list(event_dict.keys())}")
 
                 # Build event_id dict filtering only the events we want
