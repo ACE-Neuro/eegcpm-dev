@@ -5,9 +5,15 @@ Unified QC report generation for epochs, used by both interactive and batch mode
 
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+import base64
+import io
 import numpy as np
 import mne
 from datetime import datetime
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 
 def generate_epochs_qc_report(
@@ -132,7 +138,7 @@ def _generate_html_template(
             config_details += f"<li>{cond.get('name', 'Unknown')}: {cond.get('event_codes', [])}</li>"
         config_details += "</ul>"
 
-    # Generate ERP plots as base64 (simple placeholder for now)
+    # Generate ERP plots as base64 images
     erp_plots_html = _generate_erp_plots_html(epochs, condition_counts.keys())
 
     html = f"""
@@ -288,26 +294,134 @@ def _generate_html_template(
     return html
 
 
-def _generate_erp_plots_html(epochs: mne.Epochs, conditions: List[str]) -> str:
+def _fig_to_base64(fig: plt.Figure) -> str:
+    """Convert matplotlib figure to base64-encoded PNG data URI."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    buf.close()
+    plt.close(fig)
+    return f"data:image/png;base64,{img_base64}"
+
+
+def _spatial_colors(locs: np.ndarray) -> np.ndarray:
+    """Map 3D channel positions to RGB colors (same scheme as MNE spatial_colors)."""
+    rgb = np.array(locs, dtype=float)
+    rgb -= np.nanmin(rgb, axis=0)
+    rgb /= np.maximum(np.nanmax(rgb, axis=0), 1e-16)  # avoid div by zero
+    # Reduce RGB intensity for overly light colors
+    mask = rgb.sum(axis=1) > 2.5
+    rgb[mask] = rgb[mask] - 0.3
+    return rgb
+
+
+def _plot_condition_butterfly(evoked: mne.Evoked, condition: str, n_trials: int) -> plt.Figure:
+    """Plot ERP butterfly (all channels) with a sensor-location head inset.
+
+    Traces and sensor spots are colored by channel position (MNE
+    spatial_colors scheme), so each trace matches its head spot.
+    """
+    fig = plt.figure(figsize=(10, 4))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1, 4], wspace=0.15)
+
+    # Per-channel colors from 3D positions
+    eeg_picks = mne.pick_types(evoked.info, eeg=True)
+    eeg_names = [evoked.ch_names[i] for i in eeg_picks]
+    locs = np.array([evoked.info['chs'][i]['loc'][:3] for i in eeg_picks])
+    colors = _spatial_colors(locs)
+    color_by_name = dict(zip(eeg_names, colors))
+
+    # Sensor-location head with the project EEGLAB-style outline
+    from eegcpm.modules.qc.preprocessed_qc import _draw_head_outline, _load_neuroscan_locs
+
+    locs_pos = _load_neuroscan_locs()
+    ax_head = fig.add_subplot(gs[0])
+    _draw_head_outline(ax_head, head_radius=0.5, linewidth=1.5)
+    for name in eeg_names:
+        if name in locs_pos:
+            x, y = locs_pos[name]
+            ax_head.plot(x, y, 'o', markersize=3.5, color=color_by_name[name])
+    ax_head.set_xlim(-0.65, 0.65)
+    ax_head.set_ylim(-0.65, 0.72)
+    ax_head.set_aspect('equal')
+    ax_head.axis('off')
+
+    # Butterfly traces (EEG channels only, in µV), colored by position
+    ax = fig.add_subplot(gs[1])
+    data_uv = evoked.data[eeg_picks] * 1e6
+    for i, name in enumerate(eeg_names):
+        ax.plot(evoked.times, data_uv[i], color=color_by_name[name], linewidth=0.5)
+    ax.axvline(0, color='k', linewidth=0.8, linestyle='--', alpha=0.5)
+    ax.axhline(0, color='k', linewidth=0.5, alpha=0.3)
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Amplitude (µV)')
+    ax.set_xlim(evoked.times[0], evoked.times[-1])
+    ax.set_title(f'ERP: {condition} ({n_trials} trials, butterfly, {len(eeg_picks)} channels)',
+                 fontsize=11)
+    return fig
+
+
+def _generate_erp_plots_html(epochs: mne.Epochs, conditions) -> str:
     """Generate HTML with ERP plots for each condition.
 
-    For now, returns placeholder. Full implementation would use matplotlib
-    to generate plots and convert to base64 images.
+    Creates a butterfly plot per condition plus an overlaid condition
+    comparison plot, embedded as base64 PNG images.
     """
+    valid_conditions = [c for c in conditions if c in epochs.event_id and len(epochs[c]) > 0]
 
+    # Trial-count summary (kept as caption above the plots)
     plots_html = '<div class="info-box">'
-    plots_html += '<p><em>ERP plots would be displayed here for each condition:</em></p>'
+    plots_html += '<p><strong>Trials per condition:</strong></p>'
     plots_html += '<ul>'
-
-    for condition in conditions:
-        if condition in epochs.event_id:
-            evoked = epochs[condition].average()
-            n_channels = len(evoked.ch_names)
-            times = evoked.times
-            plots_html += f'<li><strong>{condition}</strong>: {len(epochs[condition])} trials, {n_channels} channels, {times[0]:.2f} to {times[-1]:.2f} s</li>'
-
+    for condition in valid_conditions:
+        evoked = epochs[condition].average()
+        times = evoked.times
+        plots_html += (
+            f'<li><strong>{condition}</strong>: {len(epochs[condition])} trials, '
+            f'{len(evoked.ch_names)} channels, {times[0]:.2f} to {times[-1]:.2f} s</li>'
+        )
     plots_html += '</ul>'
-    plots_html += '<p><em>Note: To add actual ERP plots, install matplotlib and update this function.</em></p>'
     plots_html += '</div>'
+
+    if not valid_conditions:
+        return plots_html
+
+    # Per-condition butterfly plots (custom drawing so the sensor head
+    # matches the project EEGLAB-style outline used in preprocessed QC)
+    for condition in valid_conditions:
+        evoked = epochs[condition].average()
+        try:
+            fig = _plot_condition_butterfly(evoked, condition, len(epochs[condition]))
+            plots_html += (
+                f'<h3>{condition}</h3>'
+                f'<img src="{_fig_to_base64(fig)}" style="max-width:100%;">'
+            )
+        except Exception as e:
+            plots_html += f'<p><em>Could not plot {condition}: {e}</em></p>'
+
+    # Condition comparison plot (overlaid)
+    if len(valid_conditions) > 1:
+        try:
+            evokeds = {c: epochs[c].average() for c in valid_conditions}
+            fig = mne.viz.plot_compare_evokeds(evokeds, show=False)
+            figs = fig if isinstance(fig, list) else [fig]
+            # Move legends outside the axes so they don't overlap the traces
+            for f in figs:
+                for ax in f.axes:
+                    leg = ax.get_legend()
+                    if leg is not None:
+                        leg.set_loc('upper left')
+                        leg.set_bbox_to_anchor((1.02, 1.0))
+                        leg.set_frame_on(True)
+            for i, f in enumerate(figs):
+                title = 'Condition comparison' if len(figs) == 1 else \
+                    f'Condition comparison (channel group {i + 1})'
+                plots_html += (
+                    f'<h3>{title}</h3>'
+                    f'<img src="{_fig_to_base64(f)}" style="max-width:100%;">'
+                )
+        except Exception as e:
+            plots_html += f'<p><em>Could not generate comparison plot: {e}</em></p>'
 
     return plots_html
