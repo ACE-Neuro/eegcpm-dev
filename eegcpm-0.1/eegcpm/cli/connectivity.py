@@ -82,6 +82,8 @@ def connectivity_command(args):
     else:
         print(f"   Space: sensor (no source variant needed)")
 
+    output_pipeline = getattr(args, 'output_pipeline', None) or preprocessing
+
     # Initialize paths
     paths = EEGCPMPaths(project_root)
 
@@ -191,7 +193,7 @@ def connectivity_command(args):
                 output_dir = (
                     paths.derivatives_root
                     / "connectivity"
-                    / preprocessing
+                    / output_pipeline
                     / task
                     / source_variant_dir
                     / f"sub-{subject_id}"
