@@ -1,0 +1,71 @@
+# Optimized Preprocessing Configuration
+# Improved artifact removal with less aggressive bad channel detection
+#
+# Key differences from standard.yaml:
+# 1. ICLabel threshold: 0.8 → 0.5 (catches more artifact components)
+# 2. Bad channels: variance method, threshold 7.0 (less aggressive than PREP)
+# 3. Bad channels: interpolate instead of drop (consistent channel count)
+# 4. Added 'heart' to ICLabel reject labels
+#
+# Pipeline: Highpass → Bad Channels → Zapline → ASR → Reference → ICA → ICLabel → Lowpass
+#
+preprocessing:
+  steps:
+  - name: montage
+    params:
+      type: standard_1005
+      on_missing: warn
+  - name: filter
+    params:
+      l_freq: 1.0
+      h_freq: null
+      method: fir
+      fir_window: hamming
+      phase: zero
+  - name: drop_flat
+    params:
+      variance_threshold: 1.0e-15
+  - name: bad_channels
+    params:
+      method: variance
+      variance_threshold: 7.0
+      drop: false
+  - name: zapline
+    params:
+      fline: null
+      adaptive: true
+      noiseCompDetectSigma: 2.5
+      fixedNremove: 2
+  - name: asr
+    params:
+      cutoff: 20
+      mode: single
+      method: eegprep
+      train_duration: 60.0
+  - name: reference
+    params:
+      type: average
+      projection: true
+  - name: ica
+    params:
+      method: infomax
+      fit_params:
+        extended: true
+      n_components: rank-1
+      random_state: 42
+      l_freq_fit: 1.0
+      auto_detect_artifacts: true
+      reject_by_annotation: true
+  - name: iclabel
+    params:
+      threshold: 0.5
+      reject_labels:
+      - eye
+      - muscle
+      - heart
+      remove_components: true
+  - name: lowpass
+    params:
+      h_freq: 40.0
+      method: fir
+      phase: zero
