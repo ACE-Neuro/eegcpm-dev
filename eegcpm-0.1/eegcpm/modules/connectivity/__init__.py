@@ -34,7 +34,7 @@ class ConnectivityModule(BaseModule):
     """
 
     name = "connectivity"
-    version = "0.2.0"
+    version = "0.3.0"
     description = "Functional connectivity analysis"
 
     SUPPORTED_METHODS = [
@@ -138,54 +138,68 @@ class ConnectivityModule(BaseModule):
                         # Extract window for all trials: (n_trials, n_rois, n_times_window)
                         tc_window = tc[:, :, t_mask]
 
-                        # Process each trial and aggregate
                         for method in self.methods:
-                            trial_matrices = []
-
-                            for trial_idx in range(n_trials):
-                                trial_tc = tc_window[trial_idx, :, :]  # (n_rois, n_times_window)
-
-                                if method in ["plv", "pli", "wpli", "dwpli", "coherence", "icoh", "aec", "aec_orth", "pdc", "dtf"]:
-                                    # Phase/spectral/directional - need frequency bands
-                                    for band_name, (fmin, fmax) in self.frequency_bands.items():
-                                        conn_matrix = self._compute_connectivity(
-                                            trial_tc, method, sfreq, fmin, fmax
+                            if method in ["plv", "pli", "wpli", "dwpli", "coherence", "icoh"]:
+                                # Phase/spectral methods: estimate cross-spectra
+                                # across ALL trials (not per-trial Hilbert on
+                                # short windows, which is degenerate).
+                                for band_name, (fmin, fmax) in self.frequency_bands.items():
+                                    mean_matrix, std_matrix, var_matrix = \
+                                        self._compute_spectral_trials(
+                                            tc_window, method, sfreq, fmin, fmax
                                         )
-                                        trial_matrices.append((f"{band_name}", conn_matrix))
-                                else:
-                                    # Amplitude-based (correlation, etc.)
-                                    conn_matrix = self._compute_connectivity(
-                                        trial_tc, method, sfreq
-                                    )
-                                    trial_matrices.append((None, conn_matrix))
-
-                            # Aggregate across trials
-                            # Group by band (for frequency-based methods)
-                            from collections import defaultdict
-                            matrices_by_band = defaultdict(list)
-
-                            for band_name, matrix in trial_matrices:
-                                matrices_by_band[band_name].append(matrix)
-
-                            # Compute statistics for each band
-                            for band_name, matrices in matrices_by_band.items():
-                                stacked = np.stack(matrices, axis=0)  # (n_trials, n_rois, n_rois)
-
-                                # Compute mean, std, variance
-                                mean_matrix = np.mean(stacked, axis=0)
-                                std_matrix = np.std(stacked, axis=0)
-                                var_matrix = np.var(stacked, axis=0)
-
-                                if band_name:
-                                    # Frequency-based method
                                     key_base = f"{condition}_{window['name']}_{method}_{band_name}"
-                                else:
-                                    # Amplitude-based method
-                                    key_base = f"{condition}_{window['name']}_{method}"
+                                    connectivity[f"{key_base}_mean"] = mean_matrix
+                                    connectivity[f"{key_base}_std"] = std_matrix
+                                    connectivity[f"{key_base}_variance"] = var_matrix
+                            else:
+                                # Amplitude/directional methods: per-trial then aggregate
+                                trial_matrices = []
 
-                                connectivity[f"{key_base}_mean"] = mean_matrix
-                                connectivity[f"{key_base}_std"] = std_matrix
-                                connectivity[f"{key_base}_variance"] = var_matrix
+                                for trial_idx in range(n_trials):
+                                    trial_tc = tc_window[trial_idx, :, :]  # (n_rois, n_times_window)
+
+                                    if method in ["aec", "aec_orth", "pdc", "dtf"]:
+                                        # Phase/spectral/directional - need frequency bands
+                                        for band_name, (fmin, fmax) in self.frequency_bands.items():
+                                            conn_matrix = self._compute_connectivity(
+                                                trial_tc, method, sfreq, fmin, fmax
+                                            )
+                                            trial_matrices.append((f"{band_name}", conn_matrix))
+                                    else:
+                                        # Amplitude-based (correlation, etc.)
+                                        conn_matrix = self._compute_connectivity(
+                                            trial_tc, method, sfreq
+                                        )
+                                        trial_matrices.append((None, conn_matrix))
+
+                                # Aggregate across trials
+                                # Group by band (for frequency-based methods)
+                                from collections import defaultdict
+                                matrices_by_band = defaultdict(list)
+
+                                for band_name, matrix in trial_matrices:
+                                    matrices_by_band[band_name].append(matrix)
+
+                                # Compute statistics for each band
+                                for band_name, matrices in matrices_by_band.items():
+                                    stacked = np.stack(matrices, axis=0)  # (n_trials, n_rois, n_rois)
+
+                                    # Compute mean, std, variance
+                                    mean_matrix = np.mean(stacked, axis=0)
+                                    std_matrix = np.std(stacked, axis=0)
+                                    var_matrix = np.var(stacked, axis=0)
+
+                                    if band_name:
+                                        # Frequency-based method
+                                        key_base = f"{condition}_{window['name']}_{method}_{band_name}"
+                                    else:
+                                        # Amplitude-based method
+                                        key_base = f"{condition}_{window['name']}_{method}"
+
+                                    connectivity[f"{key_base}_mean"] = mean_matrix
+                                    connectivity[f"{key_base}_std"] = std_matrix
+                                    connectivity[f"{key_base}_variance"] = var_matrix
 
                     else:
                         # Evoked mode: (n_rois, n_times)
@@ -241,6 +255,106 @@ class ConnectivityModule(BaseModule):
                 execution_time_seconds=time.time() - start_time,
                 errors=[str(e)],
             )
+
+    def _compute_spectral_trials(
+        self,
+        X: np.ndarray,
+        method: str,
+        sfreq: float,
+        fmin: float,
+        fmax: float,
+        n_bootstrap: int = 100,
+        random_state: int = 42,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Across-trials spectral connectivity (phase/spectral methods).
+
+        Estimates per-trial cross-spectra (Hann window + rFFT) and computes
+        metrics from trial-averaged spectra. This replaces per-trial
+        Hilbert-based estimation, which is degenerate on short windows
+        (~200-500 samples): narrowband filtfilt+hilbert on such windows
+        yields near-saturated values even for independent noise.
+
+        Metrics (Vinck et al. 2011; Nolte et al. 2004), with sample
+        dimension = trials x band frequencies:
+        - plv: |E[S/|S|]|
+        - pli: |E[sign(Im S)]|
+        - wpli: |E[Im S]| / E[|Im S|]
+        - dwpli: debiased wPLI, ((sum Im)^2 - sum Im^2) / ((sum|Im|)^2 - sum Im^2)
+        - coherence: |E[S]|^2 / (E[Pii] E[Pjj])
+        - icoh: |Im E[S]| / sqrt(E[Pii] E[Pjj])
+
+        Std is estimated by bootstrap over trials.
+
+        Args:
+            X: ROI time courses (n_trials, n_rois, n_times)
+            method: Connectivity method
+            sfreq: Sampling frequency
+            fmin, fmax: Frequency band
+            n_bootstrap: Bootstrap resamples for std estimation
+            random_state: RNG seed for bootstrap
+
+        Returns:
+            (mean_matrix, std_matrix, var_matrix), each (n_rois, n_rois)
+        """
+        n_trials, n_rois, n_times = X.shape
+        win = np.hanning(n_times)
+        F = np.fft.rfft(X * win, axis=2)  # (trials, rois, freqs)
+        freqs = np.fft.rfftfreq(n_times, d=1.0 / sfreq)
+        bmask = (freqs >= fmin) & (freqs <= fmax)
+        Fb = F[:, :, bmask]  # (trials, rois, band_freqs)
+
+        # Per-trial cross-spectra: (trials, i, j, freqs)
+        S = Fb[:, :, None, :] * np.conj(Fb[:, None, :, :])
+
+        def _metric(Sx: np.ndarray) -> np.ndarray:
+            # Sx: (n_samples, i, j, freqs)
+            Im = Sx.imag
+            if method == "plv":
+                m = np.abs((Sx / np.maximum(np.abs(Sx), 1e-20)).mean(axis=(0, 3)))
+            elif method == "pli":
+                m = np.abs(np.sign(Im).mean(axis=(0, 3)))
+            elif method == "wpli":
+                m = (np.abs(Im.mean(axis=(0, 3)))
+                     / np.maximum(np.abs(Im).mean(axis=(0, 3)), 1e-20))
+            elif method == "dwpli":
+                sum_im = Im.sum(axis=(0, 3))
+                sum_im2 = (Im ** 2).sum(axis=(0, 3))
+                sum_abs = np.abs(Im).sum(axis=(0, 3))
+                num = sum_im ** 2 - sum_im2
+                den = sum_abs ** 2 - sum_im2
+                m = np.where(den > 0, num / np.maximum(den, 1e-20), 0.0)
+                m = np.clip(m, 0.0, 1.0)
+            elif method == "coherence":
+                cs = Sx.mean(axis=(0, 3))
+                p = Sx.real.diagonal(axis1=1, axis2=2).mean(axis=(0, 2))  # (i,)
+                m = (np.abs(cs) ** 2
+                     / np.maximum(np.outer(p, p), 1e-20))
+            elif method == "icoh":
+                cs = Sx.mean(axis=(0, 3))
+                p = Sx.real.diagonal(axis1=1, axis2=2).mean(axis=(0, 2))
+                m = (np.abs(cs.imag)
+                     / np.maximum(np.sqrt(np.outer(p, p)), 1e-20))
+            else:
+                raise ValueError(f"Unsupported spectral method: {method}")
+            return np.nan_to_num(m)
+
+        mean_matrix = _metric(S)
+
+        # Bootstrap over trials for variability
+        rng = np.random.default_rng(random_state)
+        boot = np.empty((n_bootstrap, n_rois, n_rois))
+        for b in range(n_bootstrap):
+            idx = rng.integers(0, n_trials, n_trials)
+            boot[b] = _metric(S[idx])
+        std_matrix = boot.std(axis=0)
+        var_matrix = boot.var(axis=0)
+
+        # Diagonal carries no information; keep 0 for consistency with
+        # previous outputs and feature extraction via upper triangle.
+        for mtx in (mean_matrix, std_matrix, var_matrix):
+            np.fill_diagonal(mtx, 0.0)
+
+        return mean_matrix, std_matrix, var_matrix
 
     def _compute_connectivity(
         self,

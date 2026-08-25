@@ -392,6 +392,11 @@ For more information: https://github.com/clivehywong/eegcpm-dev
         help='Connectivity computation space: "sensor" (direct on EEG) or '
              '"source" (on ROI timecourses, requires --source).'
     )
+    connectivity_parser.add_argument(
+        '--output-pipeline',
+        type=str,
+        help='Write connectivity under derivatives/connectivity/{output-pipeline} while reading source from --preprocessing'
+    )
 
     # Features and predict commands (R-002: CLI wiring for L2,
     # primary-config validator, and DUA path enforcement)
