@@ -89,3 +89,50 @@ def test_migration_from_legacy_schema(tmp_path):
     mgr.save_state(_state(subject="sub-legacy", condition="resting_ec"))
     mgr.save_state(_state(subject="sub-legacy", condition="resting_eo"))
     assert len(mgr.get_all_states()) == 3
+
+
+# ---------------------------------------------------------------- encoder (B3)
+
+def test_json_encoder_keeps_none_and_converts_numpy():
+    """The sidecar encoder keeps None and converts numpy types (B1-rev1 cond. 4)."""
+    import json
+    import numpy as np
+    from eegcpm.workflow.state import _make_json_serializable
+
+    payload = {
+        "n_calibration_samples": None,
+        "counts": np.array([1, 2, 3], dtype=np.int64),
+        "flag": np.bool_(True),
+        "ratio": np.float32(0.5),
+        "nested": {"value": np.int64(7), "nothing": None, "items": [None, np.float64(1.5)]},
+        "path": Path("/tmp/x"),
+    }
+    out = _make_json_serializable(payload)
+
+    assert out["n_calibration_samples"] is None
+    assert out["counts"] == [1, 2, 3]
+    assert out["flag"] is True
+    assert out["ratio"] == 0.5
+    assert out["nested"] == {"value": 7, "nothing": None, "items": [None, 1.5]}
+    assert out["path"] == "/tmp/x"
+
+    # Strict JSON round-trip: no NaN/Infinity tokens, None survives.
+    text = json.dumps(out, allow_nan=False)
+    assert "Infinity" not in text and "NaN" not in text
+    assert json.loads(text)["n_calibration_samples"] is None
+
+
+def test_json_encoder_non_finite_floats_become_strings():
+    """±inf/nan must not produce non-strict JSON tokens."""
+    import json
+    import math
+    import numpy as np
+    from eegcpm.workflow.state import _make_json_serializable
+
+    out = _make_json_serializable(
+        {"tol": (float("-inf"), 7.0), "plus": np.float64(np.inf), "nan": float("nan")}
+    )
+    assert out["tol"] == ["-inf", 7.0]
+    assert out["plus"] == "inf"
+    assert out["nan"] == "nan"
+    json.dumps(out, allow_nan=False)  # must not raise

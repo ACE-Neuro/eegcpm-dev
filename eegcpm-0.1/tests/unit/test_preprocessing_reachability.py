@@ -7,7 +7,8 @@ R-004: pinned variance/kurtosis/spectrum >3-SD detector must:
   - NOT immediately interpolate (mark-only)
 
 R-005: ASR must:
-  - pass the real repair/rejection mask to the manifest
+  - report the real repair/rejection fractions and burden in its step
+    metadata (B3: full-length repair; no info['temp'], no pre/post guess)
   - assert non-zero burden on a burst fixture (NOT all-zero)
 
 R-006: block rejection must:
@@ -30,10 +31,7 @@ from eegcpm.modules.preprocessing.steps.channel_roles import (
     ChannelRolesStep,
     EGI_129_REFERENCE_CHANNEL,
 )
-from eegcpm.modules.preprocessing.hbn_langer_chain import (
-    _derive_asr_burden,
-    build_hbn_langer_chain,
-)
+from eegcpm.modules.preprocessing.steps.asr import ASRStep
 
 
 def _make_egi_129_raw_with_montage(duration_s=10, sfreq=500, seed=42,
@@ -114,32 +112,44 @@ def test_pinned_detector_apply_does_not_interpolate():
     assert np.array_equal(pre_data, raw._data)
 
 
-# --- R-005: ASR real mask ---
+# --- R-005: ASR real burden metadata ---
 
-def test_derive_asr_burst_mask_non_zero_on_burst():
-    """A burst signal in pre-ASR that is removed in post-ASR
-    produces a non-zero mask."""
+def test_asr_step_reports_burst_repair():
+    """R-005 (rewritten in B3): a burst that ASR repairs produces a
+    non-zero repaired fraction in the ASRStep metadata.
+
+    The old ``_derive_asr_burden`` helper guessed the burden from pre/post
+    std ratios; ASRStep now reports eegprep's real rejected-window fraction
+    and its own repaired-sample detector, at full length.
+    """
     rng = np.random.RandomState(0)
     sfreq = 500
     n_channels, n_times = 5, 10000
     ch_names = [f"E{i}" for i in range(1, n_channels + 1)]
     info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
     pre_data = rng.randn(n_channels, n_times) * 1e-6
-    # Inject a burst: large amplitude in the middle
+    # Inject a burst: large amplitude in the middle (10-12 s).
     pre_data[:, 5000:6000] *= 100.0
-    pre_raw = mne.io.RawArray(pre_data.copy(), info.copy())
-    # Post-ASR: burst is repaired (data is back to baseline)
-    post_data = pre_data.copy()
-    post_data[:, 5000:6000] = rng.randn(n_channels, 1000) * 1e-6
-    post_raw = mne.io.RawArray(post_data, info.copy())
-    mask, rejected, repaired, burden = _derive_asr_burden(pre_raw, post_raw)
-    n_burst = int(mask.sum())
-    assert n_burst > 0, (
-        f"ASR burst mask is empty on a clear burst fixture; "
-        f"n_burst={n_burst}"
+    raw = mne.io.RawArray(pre_data.copy(), info.copy(), verbose=False)
+
+    out, meta = ASRStep(cutoff=20.0).process(raw, {})
+
+    assert meta["applied"] is True
+    assert meta["n_samples_before"] == meta["n_samples_after"] == n_times, (
+        "ASR changed the sample count; it must repair at full length"
     )
-    assert burden > 0.0, "ASR burden is zero; mask fabrication detected"
-    assert repaired > 0.0, "repaired fraction is zero on a burst fixture"
+    assert meta["repaired_fraction"] > 0.0, (
+        "repaired fraction is zero on a clear burst fixture; "
+        "the ASR repair was not detected"
+    )
+    assert meta["asr_burden"] > 0.0, "ASR burden is zero; mask fabrication detected"
+    assert meta["window_rejected_fraction"] > 0.0, (
+        "the burst window was not flagged by clean_windows"
+    )
+    assert out is raw, "ASR must write back into the original Raw"
+    # The burst is repaired (reduced), not merely annotated.
+    assert np.std(out.get_data()[:, 5000:6000]) < \
+        0.5 * np.std(pre_data[:, 5000:6000])
 
 
 # --- R-006: block rejection hard-fail ---

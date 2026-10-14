@@ -7,6 +7,8 @@ enabling resume functionality, progress monitoring, and workflow coordination.
 import sqlite3
 import json
 import copy
+import math
+import numpy as np
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -14,12 +16,32 @@ from typing import List, Dict, Optional, Any
 from enum import Enum
 
 
-def _make_json_serializable(obj: Any) -> Any:
-    """Recursively remove non-JSON-serializable objects from nested structures.
+def _finite_float(value: float) -> Any:
+    """Return a strict-JSON-safe representation of a float.
 
-    Removes:
-    - MNE ICA objects
-    - Any other non-serializable objects (converted to type name string)
+    Non-finite values (±inf/nan) cannot appear in strict JSON
+    (``json.dumps(..., allow_nan=False)``), so they become strings that keep
+    their meaning for provenance readers.
+    """
+    if math.isfinite(value):
+        return value
+    if math.isnan(value):
+        return "nan"
+    return "inf" if value > 0 else "-inf"
+
+
+def _make_json_serializable(obj: Any) -> Any:
+    """Recursively convert to JSON-native types, **keeping** ``None``.
+
+    Conversions:
+    - ``np.integer`` → ``int``; ``np.floating`` → ``float``; ``np.bool_`` → ``bool``
+    - ``np.ndarray`` → ``list``
+    - non-finite floats (±inf/nan) → ``"inf"``/``"-inf"``/``"nan"`` (strict JSON)
+    - ``Path`` → ``str``; ``datetime`` → ISO string
+    - MNE ICA objects → ``None``; other non-serializable objects → type-name string
+
+    ``None`` values are preserved (never dropped), so provenance keys such as
+    ``n_calibration_samples`` survive the sidecar round-trip.
     """
     if obj is None:
         return None
@@ -28,19 +50,37 @@ def _make_json_serializable(obj: Any) -> Any:
     if hasattr(obj, '__class__') and obj.__class__.__name__ == 'ICA':
         return None  # Remove ICA objects
 
-    # Handle dictionaries recursively
+    # Handle dictionaries recursively (None values are kept)
     if isinstance(obj, dict):
-        return {k: _make_json_serializable(v) for k, v in obj.items() if _make_json_serializable(v) is not None}
+        return {k: _make_json_serializable(v) for k, v in obj.items()}
 
-    # Handle lists/tuples recursively
+    # Handle lists/tuples recursively (None values are kept)
     if isinstance(obj, (list, tuple)):
-        filtered = [_make_json_serializable(item) for item in obj]
-        # Remove None values from lists
-        return [item for item in filtered if item is not None]
+        return [_make_json_serializable(item) for item in obj]
+
+    # numpy containers/scalars (checked before plain float/bool: np.float64
+    # subclasses float and np.bool_ does not subclass bool)
+    if isinstance(obj, np.ndarray):
+        return [_make_json_serializable(item) for item in obj.tolist()]
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return _finite_float(float(obj))
 
     # Handle primitives and JSON-serializable types
-    if isinstance(obj, (str, int, float, bool)):
+    if isinstance(obj, bool):
         return obj
+    if isinstance(obj, float):
+        return _finite_float(obj)
+    if isinstance(obj, (str, int)):
+        return obj
+
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
 
     # Try to serialize - if it fails, return type name
     try:

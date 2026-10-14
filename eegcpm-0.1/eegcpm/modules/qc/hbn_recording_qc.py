@@ -12,7 +12,10 @@ Metrics:
 - emg_proxy_30_45_ratio: 30-45 Hz / 2-45 Hz spectral ratio (partial
   EMG proxy; the 45 Hz ceiling caps the classic 70-110 Hz EMG band)
 - asr_burden / asr_rejected_fraction / asr_repaired_fraction: from the
-  persisted ASR metadata (clean_sample_mask lineage)
+  ASR step metadata (`chain_metadata['asr']`); `None` when the chain
+  metadata is not supplied. The ASR step stores no state in the MNE
+  ``info`` 'temp' field (it does not survive a FIF save) — the
+  executor's JSON sidecar and this metadata are the only provenance.
 - bad_channels_n: len(raw.info['bads']) after the chain
 """
 
@@ -44,8 +47,9 @@ def recording_qc_metrics(
         Task label.
     subject_id : str, optional
     chain_metadata : dict, optional
-        Per-step metadata from the preprocessing chain (for ASR burden
-        fields when info['temp'] is absent).
+        Per-step metadata from the preprocessing chain. The ASR burden
+        fields are read from ``chain_metadata['asr']`` (the ASR step
+        keeps no state in the MNE ``info`` 'temp' field).
     """
     data = raw_post.get_data()
     sfreq = raw_post.info["sfreq"]
@@ -89,12 +93,13 @@ def recording_qc_metrics(
     row["emg_proxy_30_45_ratio"] = float(
         (F[:, memg].mean() + 1e-30) / (F[:, mall].mean() + 1e-30))
 
-    # ASR burden fields: from info['temp'] (persisted by the ASR step)
-    temp = raw_post.info.get("temp")
-    if isinstance(temp, dict):
-        row["asr_burden"] = temp.get("asr_burden")
-        row["asr_rejected_fraction"] = temp.get("asr_rejected_fraction")
-        row["asr_repaired_fraction"] = temp.get("asr_repaired_fraction")
+    # ASR burden fields: read from the ASR step metadata
+    # (chain_metadata['asr'], produced by ASRStep / _ASRStepWrapper).
+    # The step deliberately keeps no state in the MNE ``info`` 'temp' field.
+    asr_meta = (chain_metadata or {}).get("asr") or {}
+    row["asr_burden"] = asr_meta.get("asr_burden")
+    row["asr_rejected_fraction"] = asr_meta.get("window_rejected_fraction")
+    row["asr_repaired_fraction"] = asr_meta.get("repaired_fraction")
     row["bad_channels_n"] = len(raw_post.info.get("bads") or [])
 
     # Chain metadata fallbacks

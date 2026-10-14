@@ -189,7 +189,7 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 |---|---|---|
 | **B1** | Executor fail-fast + exclusion + dependency preflight + one preprocessing schema + status persistence (P1-F1, F4, F6, F9 blanket-except only, F17 ImportError only) | `[x]` **verified 2026-10-14** — Opus rev2 approval, no conditions left (residuals → B3/B6) |
 | B2 | Source-ERP core: anatomical labels, unique names, geometry, signed output + dipole ground truth | `[x]` **verified 2026-10-14** — Opus conditions met (F2/N1/N2/N3 + CF-1 fixed, K3-confirmed) |
-| B3 | Timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper metadata | `[ ]` not started |
+| B3 | Timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper metadata | `[~]` implemented — awaiting audit |
 | B4 | Source usability + config wiring + P1 bad-channel detector | `[ ]` not started |
 | B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[ ]` not started |
 | B6 | ⛔ Checkpoint A (RPCA) + instrumentation + golden resolved-config hash + P1 tier-2 debt | `[ ]` not started |
@@ -253,6 +253,47 @@ dipole ground truth unchanged (seed 0: 178.0 vs 114.9 next-ROI, `corr = 1.0000`,
 skipped the subject guard) → fixed with a regression test (empirically probed non-vacuous) →
 K3 confirmation pass: `confirm-with-notes` (cosmetic annotation fixed).
 
+B3 evidence (2026-10-14, working tree on `remediation/p1p2`, not committed): probe (task 1,
+`/tmp/opencode/`) — `eeg_mne2eeg` returns `(n_channels, n_times)` float32 in **µV** (×1e6);
+`clean_asr` returns a **new** dict at the same shape (float64, µV, never cut) and
+`ref_maxbadchannels=<ndarray>` requires `(n_channels, n_samples)` (transposed → `ValueError`);
+`clean_windows` returns `(EEG, sample_mask)` with `mask.shape == (n_times,)`, `True` = kept, and
+`max_bad_channels` in (0,1) is a **fraction of channels per window**. Implementation: `ASRStep`
+v2.0 full-length repair (write-back into the original Raw; `BAD_asr_window` from the mask;
+repaired intervals in metadata only; NaN input/output → `RuntimeError`; all `info['temp']`
+writes deleted; `validate_inputs` enforces `train_duration` for the fixed branch only);
+`_ASRStepWrapper` v2.0 delegates and forwards metadata unchanged (+`retain_burst_masks`);
+`_derive_asr_burden` deleted; `hbn_recording_qc` reads `chain_metadata['asr']`. **Offset-recipe
+finding (needs auditor attention):** the §0.3 recipe as written moves pre-existing annotations by
+`raw.first_time` whenever `meas_date is None` and `first_samp != 0` (mne 1.13.2 `set_annotations`
+re-adds `first_time` to *every* onset when `orig_time is None` — probed with an identity
+`set_annotations(raw.annotations)`: stored onset 5.0 s → 9.0 s at `first_samp=1000`, 250 Hz);
+`append_bad_annotations` pre-shifts the existing onsets back in that branch only, so both frames
+keep every annotation on its sample (used by ASR **and** the B1 block-rejection gate).
+B3 command (`test_asr_timeline + test_preprocessing_reachability + test_preprocessing_chain +
+test_executor_failure_semantics`) → **62 passed**; full standard suite → **3 failed / 562 passed /
+2 skipped** (exactly the baseline: 2 `mne_connectivity` P4 + 1 `robust_pca` B6). Greps:
+`info['temp']` absent from `eegcpm/`; no `RawArray`/`nan_to_num` in `asr.py`; `except` only
+re-raises `ImportError`. New `tests/unit/test_asr_timeline.py` (14 tests, incl. event-sample
+integrity for both calibrations × both `meas_date` branches, sidecar provenance, QC
+chain-metadata mapping, executor-level `train_duration` gate, and `BAD_BLOCK` offsets in both
+frames). **B3 rev1 (orchestrator, 2026-10-14, after K3 pre-audit):** (1) **B3-K1 fixed** — the
+`_ASRStepWrapper` now overrides `validate_inputs` (delegates to the inner `ASRStep` fixed-first-60 s
+gate), so the golden chain fails loudly on recordings shorter than 60 s instead of silently capping
+the calibration; false comment corrected; test `test_golden_chain_wrapper_enforces_minimum_length`
+added (executor path included). (2) **Encoder landed** — `workflow/state.py::_make_json_serializable`
+is now numpy-aware (`np.integer→int`, `np.floating→float`, `np.bool_→bool`, `ndarray→list`), keeps
+`None` in dicts/lists, and converts non-finite floats to `"inf"`/`"-inf"`/`"nan"` strings (strict
+JSON); tests added (`test_state_schema.py` encoder tests, data-driven sidecar test) — the earlier
+residual (1) is resolved. (3) `asr_burden` is the **union** of rejected+repaired samples (plan
+wording "rejected or repaired"), not the old sum. Remaining minors for B6/B7: `run_processor`'s
+dead `has_nan_inf` block + spurious asrpy montage warning (B3-K3); `hbn_recording_qc` block-rejection
+fallback key names still `fraction`/`n_bad` vs emitted `rejected_fraction`/`n_blocks_rejected`
+(B3-K4, no production caller yet); workflow-level `metadata_json` bypasses the sanitizer (B3-K5);
+`artifacts.py` appends annotations without the `meas_date=None` frame correction (B6 tier-2 debt).
+Re-audit scope: `steps/asr.py` (incl. `append_bad_annotations`), `_ASRStepWrapper`,
+block-rejection append, `hbn_recording_qc` ASR fields, `workflow/state.py` encoder, the test files.
+
 ## Next actions (queue)
 
 - [x] Batch 0 — environment, skill, AGENTS.md, audit brief (done 2026-10-13)
@@ -270,9 +311,8 @@ K3 confirmation pass: `confirm-with-notes` (cosmetic annotation fixed).
       in `tests/unit/test_preprocessing_schema.py`**
 - [ ] Implementation batches B1…B8 (DeepSeek V4.1 Flash `#max`): per batch → builder-validator →
       K3 pre-audit → Opus 5.5 final audit on milestone batches (B1, B2, B4, B6, B7) and whenever
-      K3 flags a blocker. → **B1 verified 2026-10-14; B2 verified 2026-10-14. Next: B3
-      (timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper
-      metadata) — ready to start.**
+      K3 flags a blocker. → **B1 verified 2026-10-14; B2 verified 2026-10-14; B3 implemented
+      2026-10-14 (awaiting audit — see the B3 evidence paragraph). Next: re-audit B3, then B4.**
 - [ ] **Science decision before P2 condition 4:** `mean_flip` vs `pca_flip` (plan §12 item 4;
       11/30 vs 22/30 dominance under uniform-patch injection, midline polarity near-ties) — does
       not block B3–B8.

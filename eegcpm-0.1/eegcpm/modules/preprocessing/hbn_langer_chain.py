@@ -14,7 +14,10 @@ Steps (in order):
   6. eog_regression (9 EOG channels)
   7. robust_pca (IALM, lam=0.003162 per S20b)
   8. asr (eegprep; cutoff_sd=20; window_criterion=0.25 = REJECTION
-     FRACTION not window length, per ENG-010; retain burst masks)
+     FRACTION not window length, per ENG-010; fixed first-60-s
+     calibration; full-length repair with BAD_asr_window marks and
+     burden metadata — never cuts samples, keeps no state in the MNE
+     ``info`` 'temp' field)
   9. block_rejection (max_rejected_fraction=0.20, S12 reconciled)
   10. reference (average over 109 scalp; Cz INCLUDED via eeg typing;
       post-ref Cz variance > 0; RECOVERED column)
@@ -26,7 +29,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-import mne
 import numpy as np
 
 from .steps.bad_channels import BadChannelDetectionStep
@@ -34,6 +36,7 @@ from .steps.eog_regression import EOGRegressionStep
 from .steps.channel_roles import ChannelRolesStep
 from .steps.interpolate import InterpolateBadChannelsStep
 from .steps.reference import ReferenceStep
+from .steps.asr import append_bad_annotations
 from .steps.robust_pca import (
     CANONICAL_LAMBDA,
     CANONICAL_LAMBDA_RULE,
@@ -80,38 +83,6 @@ def build_hbn_langer_chain() -> List[Any]:
         # column downstream.
         ReferenceStep(type="average", projection=False, exclude_bads=True),
     ]
-
-
-def _derive_asr_burden(raw_pre: mne.io.BaseRaw,
-                       raw_post: mne.io.BaseRaw):
-    """Derive the ASR burden honestly from pre/post recordings.
-
-    Returns (mask, rejected_fraction, repaired_fraction, burden).
-    - rejected_fraction: samples dropped by window rejection
-      (length difference) / n_pre.
-    - repaired_fraction: when lengths match, fraction of samples whose
-      cross-channel std changed >50% (ASR repair); 0 when the length
-      differs (retained-sample alignment is unknowable without the
-      eegprep window mask — recorded as a limitation, never guessed).
-    - burden: rejected + repaired * (n_post / n_pre).
-    - mask: per-sample boolean over the POST-recording samples.
-    """
-    picks = mne.pick_types(raw_pre.info, eeg=True, exclude="bads")
-    n_pre = raw_pre.n_times
-    n_post = raw_post.n_times
-    rejected = max(0, n_pre - n_post) / max(n_pre, 1)
-    mask = np.zeros(n_post, dtype=bool)
-    repaired = 0.0
-    if n_post == n_pre:
-        pre = raw_pre.get_data(picks=picks)
-        post = raw_post.get_data(picks=picks)
-        pre_std = np.std(pre, axis=0)
-        post_std = np.std(post, axis=0)
-        ratio = np.abs(post_std - pre_std) / (pre_std + 1e-12)
-        mask = ratio > 0.5
-        repaired = float(mask.mean())
-    burden = rejected + repaired * (n_post / max(n_pre, 1))
-    return mask, float(rejected), repaired, float(burden)
 
 
 # --- Wrappers around existing steps to pin the spec parameters ---
@@ -176,7 +147,7 @@ class _BadChannelDetectorWrapper(_PS):
 
 class _ASRStepWrapper(_PS):
     name = "asr"
-    version = "1.0"
+    version = "2.0"
 
     def __init__(self, cutoff: float = 20.0,
                  window_criterion: float = 0.25,
@@ -188,53 +159,52 @@ class _ASRStepWrapper(_PS):
         # window_criterion is a REJECTION FRACTION [0, 1] — NOT a
         # window length. Per ENG-010: code.md misread it.
         self.window_criterion = window_criterion
+        if calibration_window != "fixed_first_60s":
+            raise ValueError(
+                "_ASRStepWrapper implements calibration_window="
+                f"'fixed_first_60s' only (got {calibration_window!r}); use "
+                "ASRStep(calibration=...) for other calibrations"
+            )
         self.calibration_window = calibration_window
         self.retain_burst_masks = retain_burst_masks
 
-    def process(self, raw, metadata):
-        # R-005: use the existing ASRStep (eegprep implementation).
-        # We pass our locked arguments to eegprep by their
-        # DOCUMENTED meaning:
-        #   cutoff: SD threshold for clean/reject (lower = more aggressive)
-        #   max_bad_chans: max fraction of bad channels during
-        #     calibration (NOT a count)
-        #   window_length: window length in seconds (NOT a rejection
-        #     fraction; the existing ASRStep misuses this as
-        #     WindowCriterion but we keep the original default to
-        #     avoid breaking the existing implementation)
-        #   train_duration: clean calibration duration (fixed_first_60s)
+    def check_dependencies(self) -> None:
+        """Delegate the backend preflight to the underlying ASRStep."""
         from .steps.asr import ASRStep
-        # We construct ASRStep with the original defaults (avoiding
-        # the WindowCriterion misuse) and only override what we know
-        # is safe: cutoff and max_bad_chans. The lockable values
-        # we don't have a clean way to pass (window_criterion,
-        # calibration_window) are stored in the step's metadata
-        # for downstream introspection.
+        ASRStep(method="eegprep").check_dependencies()
+
+    def validate_inputs(self, raw) -> bool:
+        """Delegate the fixed-first-60 s minimum-length check (B3-K1).
+
+        The base implementation returns True, so without this override the
+        golden chain silently capped a short recording's calibration to its
+        length instead of failing the run.
+        """
+        from .steps.asr import ASRStep
+        return ASRStep(
+            method="eegprep",
+            calibration="fixed_first_60s",
+            train_duration=60.0,
+        ).validate_inputs(raw)
+
+    def process(self, raw, metadata):
+        # P1-F8: delegate to ASRStep and forward its metadata UNCHANGED
+        # (true calibration, rejected-window fraction, repaired fraction,
+        # burden). The wrapper no longer invents a burden from pre/post
+        # statistics and stores nothing in the MNE ``info`` 'temp' field
+        # (it does not survive a FIF save; the executor's JSON sidecar is
+        # the home of per-run provenance).
+        from .steps.asr import ASRStep
         step = ASRStep(
             cutoff=self.cutoff,
             method="eegprep",
-            window_criterion=self.window_criterion,  # rejection fraction
-            train_duration=60.0,   # fixed_first_60s calibration
+            window_criterion=self.window_criterion,
+            calibration="fixed_first_60s",
+            train_duration=60.0,
         )
         out_raw, step_meta = step.process(raw, metadata)
-        # R-005: honest ASR burden (rejected + repaired fractions;
-        # never an all-zero placeholder, never a misaligned std-diff).
-        mask, rejected, repaired, burden = _derive_asr_burden(raw, out_raw)
-        n_burst = int(np.sum(mask))
-        if "temp" not in out_raw.info or not hasattr(out_raw.info["temp"], "get"):
-            out_raw.info["temp"] = {}
-        out_raw.info["temp"]["asr_burst_masks"] = mask
-        out_raw.info["temp"]["asr_burden"] = burden
-        out_raw.info["temp"]["asr_n_burst"] = n_burst
-        out_raw.info["temp"]["asr_rejected_fraction"] = rejected
-        out_raw.info["temp"]["asr_repaired_fraction"] = repaired
-        return out_raw, {
-            "applied": True,
-            "cutoff": self.cutoff,
-            "window_criterion": self.window_criterion,
-            "calibration_window": self.calibration_window,
-            "retain_burst_masks": self.retain_burst_masks,
-        }
+        return out_raw, {**step_meta,
+                         "retain_burst_masks": self.retain_burst_masks}
 
 
 class _BlockRejectionStepWrapper(_PS):
@@ -300,18 +270,16 @@ class _BlockRejectionStepWrapper(_PS):
         # the existing ones — that would wipe stim events and earlier
         # BAD_* marks). Done BEFORE the exclusion raise so an excluded
         # recording still carries its rejection marks. Relative onsets
-        # are seconds from the first data sample; the offset recipe
-        # restores absolute onsets when the annotations carry orig_time.
+        # are seconds from the first data sample; `append_bad_annotations`
+        # applies the §0.3 offset recipe (including the meas_date=None
+        # frame correction) so no existing annotation moves.
         if n_bad > 0:
-            off = (raw.first_time
-                   if raw.annotations.orig_time is not None else 0.0)
-            new_annots = mne.Annotations(
-                onset=np.asarray(bad_block_onsets_s) + off,
-                duration=[window_samples / sfreq] * n_bad,
-                description=["BAD_BLOCK"] * n_bad,
-                orig_time=raw.annotations.orig_time,
+            append_bad_annotations(
+                raw,
+                bad_block_onsets_s,
+                [window_samples / sfreq] * n_bad,
+                ["BAD_BLOCK"] * n_bad,
             )
-            raw.set_annotations(raw.annotations + new_annots)
         # R-006: HARD FAIL on > max_rejected_fraction; NO silent truncation
         if fraction > self.max_rejected_fraction:
             raise RecordingExcluded(

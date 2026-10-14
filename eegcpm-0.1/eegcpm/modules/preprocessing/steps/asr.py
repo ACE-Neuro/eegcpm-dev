@@ -1,97 +1,300 @@
 """
 Artifact Subspace Reconstruction (ASR) step.
 
-Supports both eegprep (EEGLab port) and asrpy implementations.
+ASR **repairs** artifacts at full length. eegprep's ``clean_asr`` reconstructs
+the corrupted signal subspace without cutting samples, so after this step the
+recording keeps its sample count, its event samples, its ``info``
+(``meas_date`` / ``highpass`` / ``lowpass`` / ``bads`` / montage) and its
+existing annotations. Windows flagged by ``clean_windows`` are **annotated**
+(``BAD_asr_window``) instead of being removed, and repaired (burst-corrected)
+intervals are recorded in the step metadata only (``repaired_intervals_s`` /
+``repaired_fraction``) — repaired data are correct data, not bad data.
+
+Supports both eegprep (EEGLab port) and asrpy implementations. The asrpy
+branch is kept functional but is not part of any golden chain: it does not
+annotate rejected windows and does not report the eegprep burden fields.
+
+Probe findings (2026-10-14, eegprep 0.4.0 / mne 1.13.2, recorded per the
+skill's "verify, never trust memory" rule; probe under ``/tmp/opencode/``):
+
+- ``eegprep.eeg_mne2eeg(raw)`` returns an EEGLAB dict whose ``data`` is
+  ``(n_channels, n_times)`` in **µV** (MNE Volts × 1e6), dtype float32.
+- ``eegprep.clean_asr(EEG, ...)`` returns a **new** EEG dict (the input is
+  deep-copied internally) with ``data`` at the same ``(n_channels, n_times)``
+  shape (never cut), dtype float64, still in µV.
+- ``clean_asr(..., ref_maxbadchannels=<ndarray>)`` uses the array *itself* as
+  the calibration reference data and requires shape ``(n_channels,
+  n_samples)`` — a transposed array raises ``ValueError``. That is how the
+  ``fixed_first_60s`` calibration is implemented (the array is the first
+  ``train_duration`` seconds of the µV data).
+- ``clean_asr(..., ref_maxbadchannels=0.075, ref_tolerances=(-inf, 5.5))``
+  selects the calibration data internally via ``clean_windows`` (data-driven).
+- ``eegprep.clean_windows(EEG, max_bad_channels=<fraction>, zthresholds=...)``
+  returns ``(EEG, sample_mask)`` with ``sample_mask.shape == (n_times,)``,
+  bool, ``True`` = retained. A value in (0, 1) is interpreted as a *fraction
+  of bad channels per window*; other values as an absolute channel count.
+  The mask is used for annotations only; the data are never cut here.
 
 Author: EEGCPM Development Team
 Created: 2025-12
 """
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
+
 import mne
 import numpy as np
 
 from .base import ProcessingStep
 
 
+def _true_runs(mask: np.ndarray) -> list:
+    """Sample runs of a boolean mask as ``[(start_sample, n_samples), ...]``."""
+    mask = np.asarray(mask, dtype=bool).ravel()
+    if mask.size == 0 or not mask.any():
+        return []
+    padded = np.concatenate(([False], mask, [False]))
+    edges = np.flatnonzero(np.diff(padded.astype(np.int8)))
+    return [(int(start), int(stop - start))
+            for start, stop in zip(edges[::2], edges[1::2])]
+
+
+def append_bad_annotations(
+    raw: mne.io.BaseRaw,
+    rel_onsets: Sequence[float],
+    durations: Sequence[float],
+    descriptions: Sequence[str],
+) -> None:
+    """Append ``BAD_*`` annotations to ``raw`` (plan §0.3 offset recipe).
+
+    ``rel_onsets`` are seconds from the **first data sample** of ``raw`` (the
+    data frame), so the marks land on their samples whatever ``first_samp``
+    and ``meas_date`` are. Existing annotations are never moved or replaced
+    (append-only invariant).
+
+    The recipe is::
+
+        off = raw.first_time if raw.annotations.orig_time is not None else 0.0
+        new = mne.Annotations(rel_onsets + off, durations, descriptions,
+                              orig_time=raw.annotations.orig_time)
+        raw.set_annotations(raw.annotations + new)
+
+    with one correction required by mne 1.13.2: when ``orig_time`` is None,
+    ``set_annotations`` adds ``raw.first_time`` to *every* onset it is handed
+    (probed: an identity ``set_annotations(raw.annotations)`` moves a stored
+    onset from 5.0 s to 9.0 s at 250 Hz with ``first_samp=1000``). Calling
+    the recipe as written would therefore shift the already-present
+    annotations by ``first_time`` whenever ``first_samp != 0`` — the exact
+    timeline corruption this step exists to prevent. In that branch the
+    existing onsets are pre-shifted back by ``first_time``, so the stored
+    result keeps every annotation on its original sample and the new onsets
+    land ``rel_onsets`` seconds after the first data sample.
+    """
+    rel_onsets = np.atleast_1d(np.asarray(rel_onsets, dtype=float))
+    durations = np.atleast_1d(np.asarray(durations, dtype=float))
+    descriptions = list(descriptions)
+    if len(rel_onsets) == 0:
+        return
+    if not (len(rel_onsets) == len(durations) == len(descriptions)):
+        raise ValueError(
+            "rel_onsets, durations and descriptions must have the same length "
+            f"(got {len(rel_onsets)}, {len(durations)}, {len(descriptions)})"
+        )
+
+    current = raw.annotations
+    if current.orig_time is None:
+        # `set_annotations` will add `raw.first_time` to everything; hand it
+        # the existing onsets in the pre-shift frame so they stay put.
+        base = current.copy()
+        base.onset = base.onset - raw.first_time
+        new = mne.Annotations(rel_onsets, durations, descriptions,
+                              orig_time=None)
+    else:
+        base = current
+        new = mne.Annotations(rel_onsets + raw.first_time, durations,
+                              descriptions, orig_time=current.orig_time)
+    raw.set_annotations(base + new)
+
+
 class ASRStep(ProcessingStep):
     """
-    Artifact Subspace Reconstruction step.
+    Artifact Subspace Reconstruction step (full-length repair).
 
-    ASR identifies and removes high-amplitude artifacts by reconstructing
-    corrupted signal subspaces. Two implementations are supported:
-    - eegprep: Port of EEGLab's ASR (recommended, more robust)
-    - asrpy: Standalone Python implementation
-
-    The EEGLab recommended workflow uses two-stage ASR:
-    1. Mild ASR (cutoff=40) before ICA - preserves artifacts for ICA to detect
-    2. Aggressive ASR (cutoff=20) after ICA - cleans remaining artifacts
+    ASR identifies and reconstructs high-amplitude artifact subspaces. The
+    EEGLab recommended workflow uses two-stage ASR (mild before ICA,
+    aggressive after ICA); the canonical HBN-Langer chain uses a single
+    aggressive pass (``cutoff=20``) after ICA-free artifact regression.
 
     Parameters
     ----------
     cutoff : float
         ASR cutoff parameter (standard deviations). Lower = more aggressive.
-        Recommended: 40 for mild, 20 for aggressive
+        Recommended: 40 for mild, 20 for aggressive.
     mode : str
-        Processing mode: 'mild', 'aggressive', or 'single'
-        - 'mild': Preserves artifacts for later ICA detection (cutoff ~40)
-        - 'aggressive': Removes more artifacts (cutoff ~20)
-        - 'single': User-specified cutoff
+        Processing label only ('mild', 'aggressive' or 'single'); it does not
+        change the numerics — ``cutoff`` does. Reported in the metadata.
     method : str
-        Implementation: 'eegprep' (default, recommended) or 'asrpy'
-    window_length : float
-        Window length for ASR processing (seconds, default: 0.5)
+        Implementation: 'eegprep' (default, recommended) or 'asrpy'.
+    window_criterion : float
+        Bad-channel **fraction** per window in (0, 1) passed to
+        ``clean_windows(max_bad_channels=...)``; windows exceeding it are
+        annotated ``BAD_asr_window``. This is a rejection fraction, NOT a
+        window length (ENG-010) and it never falls back to ``window_length``.
+    window_tolerances : tuple of float
+        ``(lower, upper)`` RMS z-thresholds for window flagging, passed as
+        ``clean_windows(zthresholds=...)``. Default ``(-inf, 7.0)``: only
+        over-power windows are flagged.
+    calibration : {'data_driven', 'fixed_first_60s'}
+        'data_driven' (default): eegprep picks clean calibration data itself
+        (``ref_maxbadchannels=0.075``, ``ref_tolerances=(-inf, 5.5)``).
+        'fixed_first_60s': the first ``train_duration`` seconds of the data
+        are the calibration reference (``ref_maxbadchannels=<ndarray>``),
+        the canonical HBN-Langer calibration.
+        Ignored by ``method='asrpy'`` (asrpy always fits on the first
+        ``train_duration`` seconds); that backend reports
+        ``calibration='asrpy_fit_first_train_duration'`` so the metadata
+        never claims a calibration that was not used.
     train_duration : float
-        Duration of clean data for calibration (seconds, default: 60)
+        Calibration duration in seconds for ``calibration='fixed_first_60s'``.
+    window_length : float, optional
+        ASR statistics window length in seconds; passed to
+        ``clean_asr(window_len=...)`` only when set (``None`` = eegprep's own
+        default ``max(0.5, 1.5 * n_channels / sfreq)``).
+    exclude_channels : sequence of str
+        Channels that must not enter ASR (in addition to bad channels). The
+        recording's reference channel from
+        ``metadata['channel_roles']['reference_channel']`` (flat Cz before
+        re-referencing) is always excluded.
     max_bad_chans : float
-        Maximum fraction of bad channels during calibration (default: 0.1)
+        asrpy-only: max fraction of bad channels during calibration.
 
     Examples
     --------
-    Mild ASR before ICA (EEGLab workflow):
-    >>> step = ASRStep(cutoff=40, mode='mild', method='eegprep')
+    Aggressive ASR (chain default):
 
-    Aggressive ASR after ICA (EEGLab workflow):
-    >>> step = ASRStep(cutoff=20, mode='aggressive', method='eegprep')
+    >>> step = ASRStep(cutoff=20, method='eegprep')
 
-    Single-stage ASR:
-    >>> step = ASRStep(cutoff=20, mode='single', method='eegprep')
+    Fixed first-60-s calibration (HBN-Langer):
 
-    Using asrpy implementation:
-    >>> step = ASRStep(cutoff=20, method='asrpy')
+    >>> step = ASRStep(cutoff=20, calibration='fixed_first_60s',
+    ...                train_duration=60.0)
     """
 
     name = "asr"
-    version = "1.0"
+    version = "2.0"  # 2.0: full-length repair + BAD_asr_window + sidecar metadata
 
     def __init__(
         self,
         cutoff: float = 20.0,
-        mode: str = 'single',
-        method: str = 'eegprep',
-        window_length: float = 0.5,
+        mode: str = "single",
+        method: str = "eegprep",
+        window_criterion: float = 0.25,
+        window_tolerances: Tuple[float, float] = (-np.inf, 7.0),
+        calibration: str = "data_driven",
         train_duration: float = 60.0,
+        window_length: Optional[float] = None,
+        exclude_channels: Sequence[str] = (),
         max_bad_chans: float = 0.1,
-        window_criterion: float = None,
         enabled: bool = True,
     ):
         """Initialize ASR step."""
         super().__init__(enabled=enabled)
 
-        self.cutoff = cutoff
+        if method not in ("eegprep", "asrpy"):
+            raise ValueError(
+                f"Unknown ASR method: {method}. Use 'eegprep' or 'asrpy'")
+        if calibration not in ("data_driven", "fixed_first_60s"):
+            raise ValueError(
+                f"Unknown ASR calibration: {calibration!r}. "
+                "Use 'data_driven' or 'fixed_first_60s'")
+        if window_criterion is None or not 0.0 < float(window_criterion) < 1.0:
+            raise ValueError(
+                "window_criterion must be a bad-channel FRACTION in (0, 1); "
+                f"got {window_criterion!r}. clean_windows interprets values "
+                "outside (0, 1) as an absolute channel count (ENG-010: this "
+                "is a rejection fraction, never a window length).")
+        if not float(train_duration) > 0:
+            raise ValueError(
+                f"train_duration must be > 0 s; got {train_duration!r}")
+
+        self.cutoff = float(cutoff)
         self.mode = mode
         self.method = method
-        self.window_length = window_length
-        self.train_duration = train_duration
+        self.window_criterion = float(window_criterion)
+        self.window_tolerances = tuple(float(t) for t in window_tolerances)
+        self.calibration = calibration
+        self.train_duration = float(train_duration)
+        self.window_length = None if window_length is None else float(window_length)
+        self.exclude_channels = tuple(exclude_channels)
         self.max_bad_chans = max_bad_chans
-        # eegprep WindowCriterion is a window REJECTION FRACTION in
-        # [0, 1] (ENG-010) — distinct from window_length. Backward
-        # compatible: falls back to window_length when unset.
-        self.window_criterion = window_criterion
 
-        # Validate method
-        if method not in ['eegprep', 'asrpy']:
-            raise ValueError(f"Unknown ASR method: {method}. Use 'eegprep' or 'asrpy'")
+    # ------------------------------------------------------------------
+    # picks / validation
+    # ------------------------------------------------------------------
+
+    def _channel_exclusions(
+        self, raw: mne.io.BaseRaw, metadata: Optional[Dict[str, Any]]
+    ) -> list:
+        """Names of EEG channels that must not enter ASR.
+
+        Explicit ``exclude_channels`` plus the recording's reference channel
+        (``metadata['channel_roles']['reference_channel']``): a flat
+        pre-referencing Cz must not drive the ASR covariance estimate.
+        """
+        roles = (metadata or {}).get("channel_roles") or {}
+        reference = roles.get("reference_channel")
+        names = list(self.exclude_channels)
+        if reference and reference in raw.ch_names and reference not in names:
+            names.append(reference)
+        return names
+
+    def _asr_picks(
+        self, raw: mne.io.BaseRaw, metadata: Optional[Dict[str, Any]]
+    ) -> Tuple[np.ndarray, list]:
+        """EEG picks for ASR, minus excluded channels.
+
+        Returns ``(picks, excluded_from_asr)`` where ``excluded_from_asr``
+        lists only channels that would otherwise have been picked (honest
+        reporting: a name that is not an EEG pick was not excluded by us).
+        """
+        eeg_picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
+        candidates = self._channel_exclusions(raw, metadata)
+        picked_names = {raw.ch_names[i] for i in eeg_picks}
+        excluded = [name for name in candidates if name in picked_names]
+        picks = np.asarray(
+            [i for i in eeg_picks if raw.ch_names[i] not in excluded],
+            dtype=int,
+        )
+        if len(picks) < 2:
+            raise ValueError(
+                "ASR needs at least 2 EEG channels after exclusions "
+                f"(got {len(picks)}; excluded={excluded})")
+        return picks, excluded
+
+    def validate_inputs(self, raw: mne.io.BaseRaw) -> bool:
+        """Validate inputs.
+
+        Only the ``fixed_first_60s`` calibration has a length requirement:
+        it needs ``train_duration`` seconds of data to build the reference.
+        The data-driven calibration selects its own window and works on
+        arbitrarily short recordings (eegprep raises if there is not enough
+        data for even one window).
+        """
+        eeg_picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
+        if len(eeg_picks) == 0:
+            raise ValueError("No EEG channels available for ASR")
+
+        if self.calibration == "fixed_first_60s":
+            required_samples = int(round(self.train_duration * raw.info["sfreq"]))
+            if raw.n_times < required_samples:
+                raise ValueError(
+                    f"Data too short for ASR calibration "
+                    f"(calibration='fixed_first_60s'): need {self.train_duration}s "
+                    f"({required_samples} samples), have {raw.n_times} samples")
+        return True
+
+    # ------------------------------------------------------------------
+    # processing
+    # ------------------------------------------------------------------
 
     def process(
         self,
@@ -99,245 +302,171 @@ class ASRStep(ProcessingStep):
         metadata: Dict[str, Any]
     ) -> Tuple[mne.io.BaseRaw, Dict[str, Any]]:
         """
-        Apply ASR.
+        Apply ASR in place (full length) and annotate rejected windows.
 
         Parameters
         ----------
         raw : mne.io.BaseRaw
-            Input raw data
+            Input raw data. The executor passes a copy; the repaired data are
+            written back with ``raw._data[picks] = ...`` so ``info``,
+            ``meas_date`` and annotations survive.
         metadata : dict
-            Metadata from previous steps
+            Metadata from previous steps (``channel_roles`` supplies the
+            reference channel to exclude).
 
         Returns
         -------
         raw : mne.io.BaseRaw
-            ASR-processed raw data
+            The same object with repaired EEG data and ``BAD_asr_window``
+            annotations appended.
         step_metadata : dict
-            ASR metadata
+            ASR metadata (see ``_apply_eegprep_asr``).
         """
-        # Check for NaN/Inf before ASR
-        eeg_picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
-        if len(eeg_picks) == 0:
-            return raw, {'skipped': True, 'reason': 'no_eeg_channels'}
+        if self.method == "asrpy":
+            return self._apply_asrpy_asr(raw)
+        return self._apply_eegprep_asr(raw, metadata)
 
-        data_sample = raw.get_data(picks=eeg_picks, start=0, stop=min(1000, raw.n_times))
+    def _apply_eegprep_asr(
+        self, raw: mne.io.BaseRaw, metadata: Dict[str, Any]
+    ) -> Tuple[mne.io.BaseRaw, Dict]:
+        """Repair artifacts with eegprep's ASR at full length.
 
-        if not np.isfinite(data_sample).all():
-            return raw, {
-                'skipped': True,
-                'reason': 'data_contains_nan_inf',
-                'error': 'Data contains NaN/Inf values. Skipping ASR.'
-            }
-
-        # Apply ASR based on method
-        if self.method == 'eegprep':
-            raw_cleaned, step_metadata = self._apply_eegprep_asr(raw)
-        else:  # asrpy
-            raw_cleaned, step_metadata = self._apply_asrpy_asr(raw)
-
-        # Add common metadata
-        step_metadata.update({
-            'cutoff': self.cutoff,
-            'mode': self.mode,
-            'method': self.method,
-        })
-
-        return raw_cleaned, step_metadata
-
-    def _apply_eegprep_asr(self, raw: mne.io.BaseRaw) -> Tuple[mne.io.BaseRaw, Dict]:
+        The recording is never rebuilt: only the picked rows of the original
+        ``raw._data`` are overwritten, so ``meas_date``, ``highpass``,
+        ``lowpass``, ``bads``, the montage and every annotation survive.
         """
-        Apply ASR using eegprep (EEGLab port).
+        import eegprep  # imported lazily; check_dependencies() preflights it
 
-        This is the recommended method as it's a direct port of EEGLab's
-        mature ASR implementation.
-        """
-        try:
-            import eegprep
-        except ImportError:
-            raise ImportError(
-                "eegprep not installed. Install with: pip install eegprep"
+        picks, excluded_from_asr = self._asr_picks(raw, metadata)
+
+        pre = raw.get_data(picks=picks)          # V, (n_picks, n_times)
+        if not np.isfinite(pre).all():
+            raise RuntimeError(
+                "ASR input contains non-finite samples; refusing to run "
+                "(eegprep's calibration zeroes non-finite samples silently)")
+
+        # eegprep works on EEGLAB dicts in µV: (n_channels, n_samples).
+        eeg = eegprep.eeg_mne2eeg(raw.copy().pick(picks))
+        sfreq = float(eeg["srate"])
+        n_samples = int(np.asarray(eeg["data"]).shape[1])
+
+        # --- calibration ---
+        asr_kwargs: Dict[str, Any] = {}
+        n_calibration_samples: Optional[int] = None
+        if self.calibration == "fixed_first_60s":
+            # The golden-chain wrapper rejects recordings shorter than
+            # train_duration via validate_inputs (B3-K1); a direct process()
+            # call on a short fixture stays usable by capping the reference,
+            # and the real count is reported in `n_calibration_samples`.
+            n_cal = min(int(round(self.train_duration * sfreq)), n_samples)
+            asr_kwargs["ref_maxbadchannels"] = np.asarray(eeg["data"])[:, :n_cal]
+            n_calibration_samples = n_cal
+        else:
+            # Data-driven calibration: eegprep selects clean data internally.
+            # The number of calibration samples it ends up with is not
+            # returned, so it is reported as None rather than invented.
+            asr_kwargs["ref_maxbadchannels"] = 0.075
+            asr_kwargs["ref_tolerances"] = (-np.inf, 5.5)
+        if self.window_length is not None:
+            asr_kwargs["window_len"] = self.window_length
+
+        eeg_repaired = eegprep.clean_asr(eeg, cutoff=self.cutoff, **asr_kwargs)
+        post_uv = np.asarray(eeg_repaired["data"], dtype=float)
+
+        # --- output checks (fail loudly; never zero-fill, never cut) ---
+        if post_uv.shape != pre.shape:
+            raise RuntimeError(
+                f"ASR changed the data shape ({post_uv.shape} != {pre.shape}); "
+                "ASR must repair at full length and never cut samples")
+        if not np.isfinite(post_uv).all():
+            n_bad = int((~np.isfinite(post_uv)).sum())
+            raise RuntimeError(
+                f"ASR output contains {n_bad} non-finite values; refusing to "
+                "zero-fill them (they would silently corrupt the recording)")
+
+        post = post_uv * 1e-6                     # µV → V
+        raw._data[picks] = post
+
+        # --- rejected-window mask (annotation only, no cutting) ---
+        _, sample_mask = eegprep.clean_windows(
+            eeg_repaired,
+            max_bad_channels=self.window_criterion,
+            zthresholds=self.window_tolerances,
+        )
+        sample_mask = np.asarray(sample_mask, dtype=bool).ravel()
+        if sample_mask.shape != (raw.n_times,):
+            raise RuntimeError(
+                f"clean_windows returned a sample mask of shape "
+                f"{sample_mask.shape}; expected ({raw.n_times},)")
+
+        bad_runs = _true_runs(~sample_mask)
+        # `n_bad_windows` counts the contiguous rejected intervals (= the
+        # annotations): `clean_windows` scores overlapping 1-s windows, so
+        # raw window counts would not match `bad_window_intervals_s`.
+        bad_window_intervals_s = [
+            [start / sfreq, n_run / sfreq] for start, n_run in bad_runs
+        ]
+        if bad_runs:
+            append_bad_annotations(
+                raw,
+                [start / sfreq for start, _ in bad_runs],
+                [n_run / sfreq for _, n_run in bad_runs],
+                ["BAD_asr_window"] * len(bad_runs),
             )
 
-        # Convert MNE Raw to EEGLab format
-        eeg = eegprep.eeg_mne2eeg(raw)
+        # --- repaired-sample mask (metadata only, not annotated) ---
+        # A sample counts as repaired when the cross-channel RMS of the
+        # post−pre difference exceeds half the cross-channel RMS of the
+        # pre-ASR data: a conservative detector of samples ASR rewrote.
+        pre_rms = np.sqrt(np.mean(pre ** 2, axis=0))
+        diff_rms = np.sqrt(np.mean((post - pre) ** 2, axis=0))
+        repaired_mask = diff_rms > 0.5 * pre_rms
+        repaired_runs = _true_runs(repaired_mask)
+        repaired_fraction = float(repaired_mask.mean())
+        window_rejected_fraction = float((~sample_mask).mean())
+        # Burden: fraction of samples either in a rejected window or
+        # repaired (union — a sample is counted once).
+        asr_burden = float((repaired_mask | ~sample_mask).mean())
 
-        # Apply ASR
-        # Note: eegprep.clean_artifacts() handles ASR via BurstCriterion parameter
-        # We disable other preprocessing steps (flatline, highpass, channels, line noise)
-        result = eegprep.clean_artifacts(
-            eeg,
-            BurstCriterion=self.cutoff,               # ASR cutoff
-            WindowCriterion=(self.window_criterion
-                             if self.window_criterion is not None
-                             else self.window_length),  # rejection FRACTION
-            FlatlineCriterion='off',                  # Already handled
-            Highpass='off',                           # Already filtered
-            ChannelCriterion='off',                   # Already handled bad channels
-            LineNoiseCriterion='off',                 # Optional, can enable if needed
-        )
-
-        eeg_cleaned = result[0]
-
-        # Kept-sample mask (for event/annotation remapping after window
-        # rejection): 1 = kept, 0 = dropped, over the ORIGINAL samples.
-        # Downstream consumers (condition segmentation, epochs) MUST
-        # remap original sample indices through this mask.
-        sample_mask = None
-        try:
-            etc = eeg_cleaned.get("etc", {})
-            if isinstance(etc, dict) and "clean_sample_mask" in etc:
-                sample_mask = np.asarray(etc["clean_sample_mask"]).astype(bool)
-        except Exception:
-            sample_mask = None
-
-        # Convert back to MNE Raw
-        # IMPORTANT: eegprep stores data in µV, MNE expects Volts
-        # eeg_mne2eeg() multiplied by 1e6 (V → µV), so we must divide by 1e6 here
-        data = eeg_cleaned['data'] * 1e-6  # µV → V
-        sfreq = eeg_cleaned['srate']
-        ch_names = [ch['labels'] for ch in eeg_cleaned['chanlocs']]
-
-        # Store original montage for restoration
-        original_montage = raw.get_montage()
-        montage_restored = False
-
-        # Check for NaN/Inf values (indicates numerical problems in ASR)
-        has_nan = np.isnan(data).any()
-        has_inf = np.isinf(data).any()
-
-        nan_inf_metadata = {}
-        annotations_added = []
-
-        if has_nan or has_inf:
-            # Find bad regions (any sample with NaN/Inf across any channel)
-            nan_mask = np.isnan(data)
-            inf_mask = np.isinf(data)
-            bad_mask = nan_mask | inf_mask
-
-            # Find bad time points (any channel has NaN/Inf)
-            bad_timepoints = np.any(bad_mask, axis=0)
-
-            n_bad_samples = np.sum(bad_timepoints)
-            n_total_samples = len(bad_timepoints)
-            pct_bad = 100 * n_bad_samples / n_total_samples
-
-            # Per-channel statistics
-            bad_per_channel = np.sum(bad_mask, axis=1)
-            affected_channels = np.where(bad_per_channel > 0)[0]
-
-            nan_inf_metadata = {
-                'has_nan_inf': True,
-                'n_nan_samples': int(np.sum(nan_mask)),
-                'n_inf_samples': int(np.sum(inf_mask)),
-                'n_bad_timepoints': int(n_bad_samples),
-                'pct_bad_samples': float(pct_bad),
-                'n_affected_channels': int(len(affected_channels)),
-                'affected_channel_indices': affected_channels.tolist(),
-            }
-
-            # Replace NaN/Inf with zeros temporarily (for data integrity)
-            data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Create new Raw object (legacy)
-        # info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types='eeg')
-
-        # Preserve original channel types so non-EEG channels are not reclassified as EEG
-        original_types_by_name = dict(zip(raw.ch_names, raw.get_channel_types()))
-        ch_types = [original_types_by_name.get(ch_name, 'eeg') for ch_name in ch_names]
-        info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
-        raw_cleaned = mne.io.RawArray(data, info, verbose=False)
-
-        # Preserve original annotations/events - CRITICAL for epoching later
-        if raw.annotations is not None and len(raw.annotations) > 0:
-            raw_cleaned.set_annotations(raw.annotations)
-
-        # Restore montage - CRITICAL for RANSAC, ICLabel, and spatial operations
-        if original_montage is not None:
-            try:
-                raw_cleaned.set_montage(original_montage, on_missing='warn', verbose=False)
-                montage_restored = True
-            except Exception as e:
-                # Log montage restoration failure - this is critical!
-                import warnings
-                warnings.warn(
-                    f"Failed to restore montage after ASR: {e}. "
-                    "This will cause RANSAC bad channel detection and ICLabel to fail.",
-                    UserWarning
-                )
-
-        # Add annotations for bad segments (NaN/Inf regions)
-        if has_nan or has_inf:
-            # Find contiguous bad segments
-            bad_timepoints = np.any(bad_mask, axis=0)
-            times = np.arange(len(bad_timepoints)) / sfreq
-
-            # Find transitions (start/stop of bad segments)
-            transitions = np.diff(np.concatenate([[0], bad_timepoints.astype(int), [0]]))
-            starts = np.where(transitions == 1)[0]
-            stops = np.where(transitions == -1)[0]
-
-            # Create annotations for each bad segment
-            onsets = []
-            durations = []
-            descriptions = []
-
-            for start, stop in zip(starts, stops):
-                onset = times[start]
-                duration = times[stop - 1] - times[start] if stop > 0 else 0
-                onsets.append(onset)
-                durations.append(duration)
-                descriptions.append('BAD_asr_naninf')
-                annotations_added.append({
-                    'onset': float(onset),
-                    'duration': float(duration),
-                    'description': 'BAD_asr_naninf'
-                })
-
-            if onsets:
-                # Add to raw_cleaned annotations
-                new_annotations = mne.Annotations(
-                    onset=onsets,
-                    duration=durations,
-                    description=descriptions,
-                    orig_time=raw_cleaned.info['meas_date']
-                )
-                raw_cleaned.set_annotations(
-                    raw_cleaned.annotations + new_annotations if raw_cleaned.annotations else new_annotations
-                )
-
-                nan_inf_metadata['n_annotations_added'] = len(onsets)
-                nan_inf_metadata['total_bad_duration_s'] = float(np.sum(durations))
-
-        metadata = {
-            'applied': True,
-            'implementation': 'eegprep',
-            **nan_inf_metadata,  # Include NaN/Inf statistics if any
-            'n_channels_before': len(raw.ch_names),
-            'n_channels_after': len(raw_cleaned.ch_names),
-            'n_samples_before': int(raw.n_times),
-            'n_samples_after': int(raw_cleaned.n_times),
-            'window_rejected_fraction': (
-                float(1.0 - raw_cleaned.n_times / raw.n_times)
-                if raw.n_times else 0.0),
-            'montage_restored': montage_restored,
+        step_metadata = {
+            "applied": True,
+            "implementation": "eegprep",
+            "mode": self.mode,
+            "calibration": self.calibration,
+            "n_calibration_samples": n_calibration_samples,
+            "cutoff": self.cutoff,
+            "window_criterion": self.window_criterion,
+            "window_tolerances": list(self.window_tolerances),
+            "window_length": self.window_length,
+            "n_channels_asr": int(len(picks)),
+            "excluded_from_asr": excluded_from_asr,
+            # Full-length guarantee: ASR must never change the timeline.
+            "n_samples_before": int(raw.n_times),
+            "n_samples_after": int(raw.n_times),
+            "window_rejected_fraction": window_rejected_fraction,
+            "n_bad_windows": len(bad_runs),
+            "bad_window_intervals_s": bad_window_intervals_s,
+            "repaired_fraction": repaired_fraction,
+            "repaired_intervals_s": [
+                [start / sfreq, n_run / sfreq] for start, n_run in repaired_runs
+            ],
+            "asr_burden": asr_burden,
+            # Kept for run_processor's log line. ASR no longer rebuilds the
+            # Raw, so this reports that the recording still carries its
+            # montage (computed, not a phantom "restoration" claim).
+            "montage_restored": raw.get_montage() is not None,
         }
-
-        # Persist the kept-sample mask for event remapping (R-fix:
-        # events.tsv indices refer to the ORIGINAL timeline)
-        if sample_mask is not None:
-            if "temp" not in raw_cleaned.info or not isinstance(
-                    raw_cleaned.info.get("temp"), dict):
-                raw_cleaned.info["temp"] = {}
-            raw_cleaned.info["temp"]["clean_sample_mask"] = sample_mask
-
-        return raw_cleaned, metadata
+        return raw, step_metadata
 
     def _apply_asrpy_asr(self, raw: mne.io.BaseRaw) -> Tuple[mne.io.BaseRaw, Dict]:
         """
         Apply ASR using asrpy (standalone Python implementation).
 
-        Note: asrpy may have numerical stability issues with very poor quality data.
-        eegprep is generally more robust.
+        Kept functional but not part of any golden chain: it returns a new
+        Raw (asrpy's own copy) and does not annotate rejected windows or
+        report the eegprep burden fields. asrpy always fits on the first
+        ``train_duration`` seconds, so its ``calibration`` metadata value is
+        ``'asrpy_fit_first_train_duration'``, never the eegprep value.
         """
         try:
             from asrpy import ASR
@@ -346,30 +475,31 @@ class ASRStep(ProcessingStep):
                 "asrpy not installed. Install with: pip install asrpy"
             )
 
-        # Initialize ASR
         asr = ASR(
             sfreq=raw.info['sfreq'],
             cutoff=self.cutoff,
             max_bad_chans=self.max_bad_chans
         )
 
-        # Fit on calibration window
         train_samples = int(self.train_duration * raw.info['sfreq'])
         train_samples = min(train_samples, raw.n_times)
 
         asr.fit(raw, picks='eeg', start=0, stop=train_samples)
-
-        # Transform entire dataset
         raw_cleaned = asr.transform(raw, picks='eeg')
 
-        metadata = {
+        step_metadata = {
             'applied': True,
             'implementation': 'asrpy',
+            'calibration': 'asrpy_fit_first_train_duration',
             'train_duration': self.train_duration,
-            'train_samples': train_samples,
+            'n_calibration_samples': train_samples,
+            'cutoff': self.cutoff,
+            'mode': self.mode,
+            'n_samples_before': int(raw.n_times),
+            'n_samples_after': int(raw_cleaned.n_times),
         }
 
-        return raw_cleaned, metadata
+        return raw_cleaned, step_metadata
 
     def check_dependencies(self) -> None:
         """Fail at construction when the ASR backend is missing.
@@ -395,31 +525,19 @@ class ASRStep(ProcessingStep):
                     "Install with: pip install asrpy"
                 ) from e
 
-    def validate_inputs(self, raw: mne.io.BaseRaw) -> bool:
-        """Validate inputs."""
-        # Check we have EEG channels
-        eeg_picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
-        if len(eeg_picks) == 0:
-            raise ValueError("No EEG channels available for ASR")
-
-        # Check calibration data length
-        required_samples = int(self.train_duration * raw.info['sfreq'])
-        if raw.n_times < required_samples:
-            raise ValueError(
-                f"Data too short for ASR calibration. "
-                f"Need {self.train_duration}s ({required_samples} samples), "
-                f"have {raw.times[-1]:.1f}s ({raw.n_times} samples)"
-            )
-
-        return True
-
     def get_config(self) -> Dict[str, Any]:
-        """Get configuration."""
+        """Get configuration (all behaviour-affecting parameters)."""
         config = super().get_config()
         config.update({
             'cutoff': self.cutoff,
             'mode': self.mode,
             'method': self.method,
+            'window_criterion': self.window_criterion,
+            'window_tolerances': list(self.window_tolerances),
+            'calibration': self.calibration,
             'train_duration': self.train_duration,
+            'window_length': self.window_length,
+            'exclude_channels': list(self.exclude_channels),
+            'max_bad_chans': self.max_bad_chans,
         })
         return config
