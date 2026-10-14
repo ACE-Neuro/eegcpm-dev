@@ -182,6 +182,7 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | 2026-10-14 | P2 | Opus 5.5 B2 audit — **science escalation** | `mean_flip` vs `pca_flip` under uniform-patch injection: 11/30 vs 22/30 dominant; midline flip axes near-tied (0.008–0.21); one ROI polarity-inverted. **Blocks P2 condition 4; user decision required** (plan §12 item 4) | open |
 | 2026-10-14 | P2 | Opus 5.5 B2 re-audit + K3 confirm | **CF-1 fixed**: label cache key now includes the source-space subject (a cache hit previously skipped the N2 subject guard — a scaled template with equal `vertno` silently reused fsaverage labels); regression test added and empirically probed non-vacuous. B2 verified; accepted residuals: trial path untested until B4/B5, connectivity IndexError until P4, single-shell BEM until B5, `fetch_fsaverage` config side-effect recorded for B5 provenance | closed |
 | 2026-10-14 | — | Validator wording note | The 2 "connectivity P4 failures" are `mne_connectivity`-missing import failures; the deferred npz-schema `IndexError` breakage (P4 backlog) is not exercised by the suite | noted |
+| 2026-10-15 | P2 | Qwen3.8-Max B3 final audit (user-approved Opus stand-in) | `approve` — new findings: **K6** `append_bad_annotations` lacked an append-only self-check; **K7** mask-on-repaired-data semantics undocumented + suite could not detect a regression to pre-repair `clean_windows`; **K8** `montage_restored` phantom key; **K10** tautological `n_samples_before`; **K11** stale counts; **K9** (pre-existing, default-reachable) four uncorrected `artifacts.py` append sites corrupt the timeline when `meas_date=None` + `first_samp≠0`; K3–K5 arbitrated | **rev2 applied + confirmed; B3 verified 2026-10-15** |
 
 ## Remediation batches — `plan/261013-2240-p1p2-remediation.md`
 
@@ -189,7 +190,7 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 |---|---|---|
 | **B1** | Executor fail-fast + exclusion + dependency preflight + one preprocessing schema + status persistence (P1-F1, F4, F6, F9 blanket-except only, F17 ImportError only) | `[x]` **verified 2026-10-14** — Opus rev2 approval, no conditions left (residuals → B3/B6) |
 | B2 | Source-ERP core: anatomical labels, unique names, geometry, signed output + dipole ground truth | `[x]` **verified 2026-10-14** — Opus conditions met (F2/N1/N2/N3 + CF-1 fixed, K3-confirmed) |
-| B3 | Timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper metadata | `[~]` implemented — awaiting audit |
+| B3 | Timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper metadata | `[x]` **verified 2026-10-15** — final audit by Qwen3.8-Max (user-approved Opus 5.5 stand-in): `approve`; rev2 confirmed (`confirm-with-notes`) |
 | B4 | Source usability + config wiring + P1 bad-channel detector | `[ ]` not started |
 | B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[ ]` not started |
 | B6 | ⛔ Checkpoint A (RPCA) + instrumentation + golden resolved-config hash + P1 tier-2 debt | `[ ]` not started |
@@ -286,11 +287,22 @@ is now numpy-aware (`np.integer→int`, `np.floating→float`, `np.bool_→bool`
 `None` in dicts/lists, and converts non-finite floats to `"inf"`/`"-inf"`/`"nan"` strings (strict
 JSON); tests added (`test_state_schema.py` encoder tests, data-driven sidecar test) — the earlier
 residual (1) is resolved. (3) `asr_burden` is the **union** of rejected+repaired samples (plan
-wording "rejected or repaired"), not the old sum. Remaining minors for B6/B7: `run_processor`'s
-dead `has_nan_inf` block + spurious asrpy montage warning (B3-K3); `hbn_recording_qc` block-rejection
+wording "rejected or repaired"), not the old sum. Remaining minors: `hbn_recording_qc` block-rejection
 fallback key names still `fraction`/`n_bad` vs emitted `rejected_fraction`/`n_blocks_rejected`
-(B3-K4, no production caller yet); workflow-level `metadata_json` bypasses the sanitizer (B3-K5);
-`artifacts.py` appends annotations without the `meas_date=None` frame correction (B6 tier-2 debt).
+(B3-K4, owned by plan B7 task 3); workflow-level `metadata_json` sanitizer bypass (B3-K5 → plan B6
+task 18); `artifacts.py` four uncorrected append sites (B3-K9 → plan B6 task 17). `run_processor`'s
+dead `has_nan_inf` block + spurious asrpy warning were removed in rev2 (B3-K3, closed).
+**B3 verified 2026-10-15** — final audit by **Qwen3.8-Max** (user-approved stand-in; Opus 5.5
+endpoint outage): `approve`; rev2 applied (K6 self-check + test, K7 mask-semantics doc + spy test,
+K8 rename, K10 pre-write-back capture, K11 counts annotated, K3 removals, `data_roundtrip` key) and
+confirmed (`confirm-with-notes`): both new tests proven non-vacuous (K6 exercises a real
+92-annotation drop; K7 pins `clean_windows(EEG_rep)`), suites reproduce (18 passed; 3F/568P/2S).
+The audit independently verified the `eeg_mne2eeg` channel-order identity (non-contiguous picks),
+the frame correction across FIF round-trip / `set_meas_date` / `anonymize`, the encoder (37 cases)
+and the repaired-detector behaviour. Residuals accepted: K6 raises after `set_annotations` mutated
+the in-memory raw (fail-loud, nothing persisted); asrpy caps calibration with no gate (non-golden,
+truthful metadata); plain `pytest tests/unit` interrupts on the two specparam collection errors
+(the documented command ignores those files).
 Re-audit scope: `steps/asr.py` (incl. `append_bad_annotations`), `_ASRStepWrapper`,
 block-rejection append, `hbn_recording_qc` ASR fields, `workflow/state.py` encoder, the test files.
 
@@ -311,8 +323,12 @@ block-rejection append, `hbn_recording_qc` ASR fields, `workflow/state.py` encod
       in `tests/unit/test_preprocessing_schema.py`**
 - [ ] Implementation batches B1…B8 (DeepSeek V4.1 Flash `#max`): per batch → builder-validator →
       K3 pre-audit → Opus 5.5 final audit on milestone batches (B1, B2, B4, B6, B7) and whenever
-      K3 flags a blocker. → **B1 verified 2026-10-14; B2 verified 2026-10-14; B3 implemented
-      2026-10-14 (awaiting audit — see the B3 evidence paragraph). Next: re-audit B3, then B4.**
+      K3 flags a blocker. → **B1 verified 2026-10-14; B2 verified 2026-10-14; B3 verified 2026-10-15
+      (Qwen3.8-Max stand-in audit + rev2 confirmation). Next: B4** (source config wiring + modes +
+      consumer + P1 bad-channel detector) — ready to start.
+- [ ] **Final-audit model note:** Opus 5.5 was intermittently unavailable for B3; per user decision
+      the B3 final audit ran on Qwen3.8-Max. B4/B6/B7 milestone audits: try Opus 5.5 first, fall back
+      to Qwen3.8-Max (or Kimi K3) only with a recorded note.
 - [ ] **Science decision before P2 condition 4:** `mean_flip` vs `pca_flip` (plan §12 item 4;
       11/30 vs 22/30 dominance under uniform-patch injection, midline polarity near-ties) — does
       not block B3–B8.

@@ -56,6 +56,7 @@ REQUIRED_METADATA_KEYS = [
     "excluded_from_asr", "window_rejected_fraction", "n_bad_windows",
     "bad_window_intervals_s", "repaired_fraction", "repaired_intervals_s",
     "asr_burden", "n_samples_before", "n_samples_after",
+    "montage_present", "data_roundtrip",
 ]
 
 
@@ -497,3 +498,54 @@ def test_block_rejection_appends_with_offsets(with_meas_date):
     events_after, _ = mne.events_from_annotations(out)
     assert np.array_equal(events_before, events_after), (
         "existing event samples moved when BAD_BLOCK was appended")
+
+
+def test_append_bad_annotations_refuses_to_drop_timeline():
+    """B3-K6: a desynced ``orig_time`` (private-state mutation that MNE's
+    public API never produces) must fail loudly instead of silently dropping
+    the whole annotation timeline."""
+    from datetime import timedelta
+
+    from eegcpm.modules.preprocessing.steps.asr import append_bad_annotations
+
+    raw = _make_raw(meas_date=MEAS_DATE)
+    desynced = mne.Annotations(
+        onset=raw.annotations.onset,
+        duration=raw.annotations.duration,
+        description=raw.annotations.description,
+        orig_time=MEAS_DATE + timedelta(hours=1),  # desync, private-state only
+    )
+    raw._annotations = desynced
+
+    with pytest.raises(RuntimeError, match="refusing to rewrite"):
+        append_bad_annotations(raw, [1.0], [0.0], ["BAD_test"])
+
+
+def test_clean_windows_receives_repaired_data(monkeypatch):
+    """B3-K7: the rejection mask is computed on the REPAIRED data (residual
+    post-repair badness), not on the pre-ASR input. Without this assertion a
+    regression to ``clean_windows(pre)`` would leave every test green (the
+    fixture's pre/post masks are identical)."""
+    import eegprep
+
+    from eegcpm.modules.preprocessing.steps.asr import ASRStep
+
+    seen = {}
+    real = eegprep.clean_windows
+
+    def spy(EEG, *args, **kwargs):
+        seen["data"] = np.array(EEG["data"], dtype=float, copy=True)
+        return real(EEG, *args, **kwargs)
+
+    monkeypatch.setattr(eegprep, "clean_windows", spy)
+
+    raw = _make_raw()
+    step = ASRStep()  # data-driven
+    out, meta = step.process(raw, {})
+    assert "data" in seen, "clean_windows was not called"
+
+    # The write-back is exactly the repaired data the spy saw (× 1e-6 V).
+    # ASR runs on the EEG picks minus bads (the fixture has one bad channel).
+    picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
+    post = raw.get_data(picks=picks)
+    np.testing.assert_allclose(seen["data"] * 1e-6, post, rtol=1e-9, atol=1e-12)

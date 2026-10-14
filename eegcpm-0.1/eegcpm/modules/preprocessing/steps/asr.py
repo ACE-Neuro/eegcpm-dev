@@ -100,6 +100,26 @@ def append_bad_annotations(
             f"(got {len(rel_onsets)}, {len(durations)}, {len(descriptions)})"
         )
 
+    # Self-check (B3-K6): capture the pre-existing annotations' data-sample
+    # positions and verify none moved or disappeared after the rewrite. The
+    # correction below depends on MNE's onset convention; if that convention
+    # ever differs (e.g. a desynced orig_time set through private state), the
+    # rewrite could silently drop the whole timeline — refuse loudly instead.
+    sfreq = float(raw.info["sfreq"])
+    first_time = float(raw.first_time)
+
+    def _sample_keys(annotations):
+        return {
+            (round((onset - first_time) * sfreq), round(duration * sfreq), str(descr))
+            for onset, duration, descr in zip(
+                annotations.onset,
+                annotations.duration,
+                annotations.description,
+            )
+        }
+
+    prev_keys = _sample_keys(raw.annotations)
+
     current = raw.annotations
     if current.orig_time is None:
         # `set_annotations` will add `raw.first_time` to everything; hand it
@@ -113,6 +133,14 @@ def append_bad_annotations(
         new = mne.Annotations(rel_onsets + raw.first_time, durations,
                               descriptions, orig_time=current.orig_time)
     raw.set_annotations(base + new)
+
+    missing = prev_keys - _sample_keys(raw.annotations)
+    if missing:
+        raise RuntimeError(
+            "append_bad_annotations would drop or move pre-existing "
+            f"annotations ({len(missing)} missing/moved, e.g. {sorted(missing)[:3]}); "
+            "refusing to rewrite the timeline"
+        )
 
 
 class ASRStep(ProcessingStep):
@@ -340,6 +368,7 @@ class ASRStep(ProcessingStep):
         picks, excluded_from_asr = self._asr_picks(raw, metadata)
 
         pre = raw.get_data(picks=picks)          # V, (n_picks, n_times)
+        n_samples_before = int(pre.shape[1])     # captured before the write-back (B3-K10)
         if not np.isfinite(pre).all():
             raise RuntimeError(
                 "ASR input contains non-finite samples; refusing to run "
@@ -423,6 +452,10 @@ class ASRStep(ProcessingStep):
         repaired_mask = diff_rms > 0.5 * pre_rms
         repaired_runs = _true_runs(repaired_mask)
         repaired_fraction = float(repaired_mask.mean())
+        # The mask is computed on the REPAIRED data (B3-K7): these numbers
+        # measure RESIDUAL post-repair badness. Windows ASR fully repaired are
+        # deliberately NOT marked — repaired data are correct data (user
+        # decision: mark-only, repaired intervals in metadata).
         window_rejected_fraction = float((~sample_mask).mean())
         # Burden: fraction of samples either in a rejected window or
         # repaired (union — a sample is counted once).
@@ -441,7 +474,7 @@ class ASRStep(ProcessingStep):
             "n_channels_asr": int(len(picks)),
             "excluded_from_asr": excluded_from_asr,
             # Full-length guarantee: ASR must never change the timeline.
-            "n_samples_before": int(raw.n_times),
+            "n_samples_before": n_samples_before,
             "n_samples_after": int(raw.n_times),
             "window_rejected_fraction": window_rejected_fraction,
             "n_bad_windows": len(bad_runs),
@@ -451,10 +484,14 @@ class ASRStep(ProcessingStep):
                 [start / sfreq, n_run / sfreq] for start, n_run in repaired_runs
             ],
             "asr_burden": asr_burden,
+            # eegprep's eeg_mne2eeg round-trips through a float32 µV EEGLAB
+            # .set file, so every ASR sample is re-quantized (max relative L2
+            # error ~4e-8; far below ADC precision, but ASR is not bit-neutral).
+            "data_roundtrip": "eeglab_set_float32_uV",
             # Kept for run_processor's log line. ASR no longer rebuilds the
             # Raw, so this reports that the recording still carries its
-            # montage (computed, not a phantom "restoration" claim).
-            "montage_restored": raw.get_montage() is not None,
+            # montage (a fact, not a phantom "restoration" claim — B3-K8).
+            "montage_present": raw.get_montage() is not None,
         }
         return raw, step_metadata
 

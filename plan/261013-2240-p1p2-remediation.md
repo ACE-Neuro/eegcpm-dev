@@ -744,6 +744,17 @@ Before any B6 code, the user records in `planning/VERIFICATION_TODO.md` (decisio
     position → `ValueError` listing channels.
 16. Regenerate `planning/EXCLUSION_CRITERIA.md` from the code: `too_many_bad_channels`,
     `too_many_bad_channels_for_interpolation`, `block_rejection_fraction_exceeded`, required-step failure.
+17. **B3-K9 (audit owner assignment):** `eegcpm/modules/preprocessing/artifacts.py:202,242,306,358` use the uncorrected
+    `raw.set_annotations(raw.annotations + annot)` recipe — with `meas_date=None` and `first_samp != 0`
+    (e.g. re-processing a saved FIF derivative) the shift compounds per append site (events 1000 → 3000;
+    probed 2026-10-14), violating invariant 2 with default parameters. Replace all four sites with
+    `append_bad_annotations` (import from `steps.asr`; verify each site's onset frame first) and add a test:
+    default `ArtifactAnnotationStep` on `meas_date=None`, `first_samp=1000` → event samples unchanged.
+18. **B3-K5 (audit owner assignment):** `workflow/state.py:317` `json.dumps(state.metadata)` bypasses
+    `_make_json_serializable`; a numpy scalar raises `TypeError` (crashing `save_state`) and a non-finite
+    float writes `-Infinity` (non-strict JSON). Exposure becomes live with this batch's
+    `resolved_config`/`config_hash`/`library_versions`; route it through the encoder and add a
+    numpy-scalar metadata round-trip test.
 
 **Validation:** full standard command; `test_robust_pca.py` now passes; `test_config_hash.py` green.
 **Exit criteria:** C4 (decision recorded; if (b), real-data report attached), C5 complete.
@@ -839,6 +850,9 @@ new `tests/unit/test_hbn_chain_e2e.py`, `tests/unit/test_source.py`, `.github/wo
    screenshot and pre-flight distances to `planning/audits/`; confirm crosstalk matrix in the QC HTML;
    review provenance JSON; sensor-vs-source N1/P2 polarity sanity; frontal-ERP EOG sensitivity (F13): frontal
    ERP with vs without EOG regression; RPCA data if Checkpoint A = (b). Record in `VERIFICATION_TODO.md`.
+   **Resource note (B3 audit):** `eegprep.eeg_mne2eeg` exports the raw to a temporary EEGLAB `.set` file and
+   reloads it (float32 µV), so each ASR run costs several full copies plus a disk round-trip — order-GB peak
+   RSS and hundreds of MB temp IO for a 129-channel/500 Hz/~20-min HBN recording. Check temp space and RSS.
 
 ---
 

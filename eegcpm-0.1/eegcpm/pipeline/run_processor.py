@@ -338,23 +338,16 @@ class RunProcessor:
                     elif step_name.startswith('asr') and step_meta.get('applied'):
                         cutoff = step_meta.get('cutoff', 'unknown')
                         mode = step_meta.get('mode', '')
-                        montage_restored = step_meta.get('montage_restored', False)
+                        montage_present = step_meta.get('montage_present')
 
-                        # Show montage restoration status
-                        montage_str = "✓" if montage_restored else "✗"
-                        logs.append(f"✓ ASR ({mode}): cutoff={cutoff}, montage {montage_str}")
-
-                        # Warn about NaN/Inf if present
-                        if step_meta.get('has_nan_inf'):
-                            pct = step_meta.get('pct_bad_samples', 0)
-                            n_ch = step_meta.get('n_affected_channels', 0)
-                            n_annot = step_meta.get('n_annotations_added', 0)
-                            bad_dur = step_meta.get('total_bad_duration_s', 0)
-                            logs.append(f"  ⚠️ ASR NaN/Inf: {pct:.2f}% samples, {n_ch} channels → {n_annot} segments marked BAD ({bad_dur:.1f}s)")
-
-                        # Warn about montage loss (critical issue)
-                        if not montage_restored:
-                            logs.append(f"  ⚠️ ASR lost montage - RANSAC and ICLabel will fail")
+                        if montage_present is None:
+                            logs.append(f"✓ ASR ({mode}): cutoff={cutoff}")
+                        else:
+                            montage_str = "✓" if montage_present else "✗"
+                            logs.append(f"✓ ASR ({mode}): cutoff={cutoff}, montage {montage_str}")
+                            if not montage_present:
+                                logs.append(
+                                    "  ⚠️ ASR ran without a montage - RANSAC and ICLabel will fail")
 
                     # ICA
                     elif step_name == 'ica' and step_meta.get('applied'):
