@@ -186,93 +186,97 @@ class ZaplineStep(ProcessingStep):
         print(f"  Detection threshold: {self.noiseCompDetectSigma}σ")
         print(f"  Fallback components: {self.fixedNremove}")
 
+        # Transpose for pyzaplineplus: (n_times, n_channels)
+        data_T = data.T
+
+        # Apply Zapline-Plus
+        # zapline_plus expects (n_times, n_channels)
+        # Returns: (cleaned_data, zapline_config, analytics, plots)
+        result = zapline_plus(
+            data_T,
+            sampling_rate=sfreq,
+            noisefreqs=self.noisefreqs,
+            noiseCompDetectSigma=self.noiseCompDetectSigma,
+            fixedNremove=self.fixedNremove,
+            plotResults=False,  # Disable plotting
+        )
+        cleaned_data = result[0]
+        info_dict = result[1] if len(result) > 1 else {}
+
+        # Transpose back: (n_channels, n_times)
+        cleaned_data = cleaned_data.T
+
+        # Update raw data in-place
+        raw._data[picks, :] = cleaned_data
+
+        # Extract info from pyzaplineplus output
+        n_components_removed = info_dict.get('n_removed_components', 1) if info_dict else 1
+
+        # Get detected frequencies
+        detected_freqs = info_dict.get('noisefreqs', []) if info_dict else []
+        detected_freq = detected_freqs[0] if len(detected_freqs) > 0 else self.fline
+
+        # Check if auto-detection was used
+        auto_detected = info_dict.get('automaticFreqDetection', False) if info_dict else False
+
+        # Calculate noise reduction
+        noise_power_before = np.var(data)
+        noise_power_after = np.var(cleaned_data)
+        noise_reduction_db = 10 * np.log10(noise_power_before / noise_power_after)
+
+        # Calculate line noise power at detected frequency
+        from scipy import signal
+        freqs, psd_before = signal.welch(data, fs=sfreq, nperseg=min(self.nfft, data.shape[1]))
+        _, psd_after = signal.welch(cleaned_data, fs=sfreq, nperseg=min(self.nfft, data.shape[1]))
+
+        # Find power at line frequency (use detected freq, or default to 60 Hz if None)
+        line_freq_for_calc = detected_freq if detected_freq is not None else 60.0
+        line_idx = np.argmin(np.abs(freqs - line_freq_for_calc))
+        line_power_before = np.mean(psd_before[:, line_idx])
+        line_power_after = np.mean(psd_after[:, line_idx])
+        line_reduction_db = 10 * np.log10(line_power_before / line_power_after)
+
+        # Always print results to console
+        if auto_detected:
+            print(f"  ✓ Detected line frequency: {detected_freq} Hz")
+        if len(detected_freqs) > 1:
+            print(f"  ✓ Additional frequencies: {[f'{f:.1f}' for f in detected_freqs[1:]]}")
+        print(f"  Components removed: {n_components_removed}")
+        print(f"  Overall noise reduction: {noise_reduction_db:.1f} dB")
+        print(f"  Line noise ({detected_freq} Hz) reduction: {line_reduction_db:.1f} dB")
+
+        # Build metadata
+        step_metadata = {
+            'fline': self.fline,
+            'detected_freq': float(detected_freq) if detected_freq is not None else None,
+            'detected_freqs': [float(f) for f in detected_freqs],
+            'auto_detected': auto_detected,
+            'n_components_removed': n_components_removed,
+            'n_channels_processed': len(picks),
+            'duration_seconds': duration,
+            'noise_reduction_db': float(noise_reduction_db),
+            'line_reduction_db': float(line_reduction_db),
+            'adaptive': self.adaptive,
+            'applied': True,
+        }
+
+        return raw, step_metadata
+
+    def check_dependencies(self) -> None:
+        """Fail at construction when pyzaplineplus is missing.
+
+        Never silently no-op the line-noise step: a missing backend
+        must fail the run before any data is touched.
+        """
         try:
-            # Transpose for pyzaplineplus: (n_times, n_channels)
-            data_T = data.T
+            from pyzaplineplus import zapline_plus  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                f"ZaplineStep requires pyzaplineplus, which is not importable ({e}). "
+                "Install with: pip install pyzaplineplus"
+            ) from e
 
-            # Apply Zapline-Plus
-            # zapline_plus expects (n_times, n_channels)
-            # Returns: (cleaned_data, info_dict, config, plot_list)
-            result = zapline_plus(
-                data_T,
-                sampling_rate=sfreq,
-                noisefreqs=self.noisefreqs,
-                noiseCompDetectSigma=self.noiseCompDetectSigma,
-                fixedNremove=self.fixedNremove,
-                plotResults=False,  # Disable plotting
-            )
-            cleaned_data = result[0]
-            info_dict = result[1] if len(result) > 1 else {}
-
-            # Transpose back: (n_channels, n_times)
-            cleaned_data = cleaned_data.T
-
-            # Update raw data in-place
-            raw._data[picks, :] = cleaned_data
-
-            # Extract info from pyzaplineplus output
-            n_components_removed = info_dict.get('n_removed_components', 1) if info_dict else 1
-
-            # Get detected frequencies
-            detected_freqs = info_dict.get('noisefreqs', []) if info_dict else []
-            detected_freq = detected_freqs[0] if len(detected_freqs) > 0 else self.fline
-
-            # Check if auto-detection was used
-            auto_detected = info_dict.get('automaticFreqDetection', False) if info_dict else False
-
-            # Calculate noise reduction
-            noise_power_before = np.var(data)
-            noise_power_after = np.var(cleaned_data)
-            noise_reduction_db = 10 * np.log10(noise_power_before / noise_power_after)
-
-            # Calculate line noise power at detected frequency
-            from scipy import signal
-            freqs, psd_before = signal.welch(data, fs=sfreq, nperseg=min(self.nfft, data.shape[1]))
-            _, psd_after = signal.welch(cleaned_data, fs=sfreq, nperseg=min(self.nfft, data.shape[1]))
-
-            # Find power at line frequency (use detected freq, or default to 60 Hz if None)
-            line_freq_for_calc = detected_freq if detected_freq is not None else 60.0
-            line_idx = np.argmin(np.abs(freqs - line_freq_for_calc))
-            line_power_before = np.mean(psd_before[:, line_idx])
-            line_power_after = np.mean(psd_after[:, line_idx])
-            line_reduction_db = 10 * np.log10(line_power_before / line_power_after)
-
-            # Always print results to console
-            if auto_detected:
-                print(f"  ✓ Detected line frequency: {detected_freq} Hz")
-            if len(detected_freqs) > 1:
-                print(f"  ✓ Additional frequencies: {[f'{f:.1f}' for f in detected_freqs[1:]]}")
-            print(f"  Components removed: {n_components_removed}")
-            print(f"  Overall noise reduction: {noise_reduction_db:.1f} dB")
-            print(f"  Line noise ({detected_freq} Hz) reduction: {line_reduction_db:.1f} dB")
-
-            # Build metadata
-            step_metadata = {
-                'fline': self.fline,
-                'detected_freq': float(detected_freq) if detected_freq is not None else None,
-                'detected_freqs': [float(f) for f in detected_freqs],
-                'auto_detected': auto_detected,
-                'n_components_removed': n_components_removed,
-                'n_channels_processed': len(picks),
-                'duration_seconds': duration,
-                'noise_reduction_db': float(noise_reduction_db),
-                'line_reduction_db': float(line_reduction_db),
-                'adaptive': self.adaptive,
-                'applied': True,
-            }
-
-            return raw, step_metadata
-
-        except Exception as e:
-            if self.verbose:
-                print(f"Zapline failed: {e}")
-            return raw, {
-                'applied': False,
-                'error': str(e),
-                'fline': self.fline,
-            }
-
-    def validate(self, raw: mne.io.BaseRaw) -> None:
+    def validate_inputs(self, raw: mne.io.BaseRaw) -> bool:
         """
         Validate that Zapline can be applied to this data.
 
@@ -280,6 +284,11 @@ class ZaplineStep(ProcessingStep):
         ----------
         raw : mne.io.BaseRaw
             Raw data to validate
+
+        Returns
+        -------
+        valid : bool
+            True if validation passes
 
         Raises
         ------
@@ -290,7 +299,7 @@ class ZaplineStep(ProcessingStep):
         sfreq = raw.info['sfreq']
         nyquist = sfreq / 2
 
-        if self.fline >= nyquist:
+        if self.fline is not None and self.fline >= nyquist:
             raise ValueError(
                 f"Line frequency {self.fline} Hz exceeds Nyquist frequency {nyquist} Hz. "
                 f"Cannot remove line noise above Nyquist limit."
@@ -302,6 +311,8 @@ class ZaplineStep(ProcessingStep):
             raise ValueError(
                 f"Zapline requires at least 2 EEG channels, found {len(picks)}"
             )
+
+        return True
 
     def get_config(self) -> Dict[str, Any]:
         """Get step configuration."""

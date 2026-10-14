@@ -7,7 +7,7 @@ import numpy as np
 
 from eegcpm.core.config import EpochsConfig
 from eegcpm.core.task_config import TaskConfig
-from eegcpm.core.paths import EEGCPMPaths
+from eegcpm.core.paths import EEGCPMPaths, find_preprocessed_raw
 from eegcpm.modules.epochs import EpochExtractionModule
 from eegcpm.modules.qc.epochs_qc import generate_epochs_qc_report
 from eegcpm.data.event_mapping import translate_event_codes, get_event_mapping_for_run, load_events_from_bids_tsv, find_events_tsv
@@ -178,8 +178,7 @@ def epochs_command(args):
             run_dirs = sorted(task_dir.glob("run-*"))
             if not run_dirs:
                 # No run subdirectories, check if files are directly in task dir
-                preprocessed_files = list(task_dir.glob("*_preprocessed_raw.fif"))
-                if preprocessed_files:
+                if find_preprocessed_raw(task_dir) is not None:
                     run_dirs = [task_dir]
                 else:
                     print(f"   ⚠️  No runs found, skipping")
@@ -208,12 +207,11 @@ def epochs_command(args):
                 raw_list = []
                 for run_dir in run_dirs:
                     # Find preprocessed raw file
-                    raw_files = list(run_dir.glob("*_preprocessed_raw.fif"))
-                    if not raw_files:
+                    raw_file = find_preprocessed_raw(run_dir)
+                    if raw_file is None:
                         print(f"   ⚠️  No preprocessed file in {run_dir.name}, skipping run")
                         continue
 
-                    raw_file = raw_files[0]
                     print(f"   📖 Loading: {raw_file.name}")
                     raw = mne.io.read_raw_fif(raw_file, preload=True, verbose=False)
                     raw_list.append(raw)
@@ -500,17 +498,15 @@ def discover_events_command(args):
         print(f"{'='*60}")
 
         for run_dir in run_dirs[:1]:
-            # Find preprocessed FIF file
-            fif_files = list(run_dir.glob("*_preprocessed_raw.fif"))
-            if not fif_files:
-                # Try directly in task dir
-                fif_files = list(task_dir.rglob("*_preprocessed_raw.fif"))
+            # Find preprocessed FIF file (run dir first, then task dir)
+            fif_path = find_preprocessed_raw(run_dir)
+            if fif_path is None and run_dir != task_dir:
+                fif_path = find_preprocessed_raw(task_dir)
 
-            if not fif_files:
+            if fif_path is None:
                 print(f"  No preprocessed FIF file found in {run_dir}")
                 continue
 
-            fif_path = fif_files[0]
             print(f"  File: {fif_path.name}")
 
             # Read raw data (just headers, don't load data)

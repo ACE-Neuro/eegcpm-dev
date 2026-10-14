@@ -1,5 +1,11 @@
 # Minimal Preprocessing Configuration
 # For testing or very clean data
+#
+# Schema (single accepted dialect): each step is
+#   - name: <STEP_REGISTRY key>
+#     params: {<constructor kwargs>}
+#     required: <bool, default true>
+# Flat keys next to `name` are rejected (`extra='forbid'`).
 
 stage: preprocessing
 name: minimal
@@ -9,13 +15,19 @@ depends_on: null
 # Minimal steps
 steps:
   - name: filter
-    l_freq: 1.0
-    h_freq: 30.0
-    method: fir
+    params:
+      l_freq: 1.0
+      h_freq: 30.0
+      method: fir
 
+  # Detection marks channels only; no automatic interpolation, so the
+  # caller reviews marks before any data is modified. (`method: manual`
+  # and `threshold:` were stale keys no step ever consumed.)
   - name: bad_channels
-    method: manual  # No automatic rejection
-    threshold: null
+    params:
+      method: variance
+      variance_threshold: 7.0
+      mark_only: true
 
 # No ICA - minimal pipeline
 

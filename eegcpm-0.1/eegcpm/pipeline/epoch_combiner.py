@@ -17,6 +17,7 @@ from ..workflow.state import (
     StepRecord,
 )
 from .combined_qc import CombinedQC
+from ..core.paths import find_preprocessed_raw
 from ..data.event_mapping import translate_event_codes, get_event_mapping_for_run
 from datetime import datetime
 
@@ -450,9 +451,11 @@ class EpochCombiner:
 
         for result in run_results:
             if result.success and selection.get(result.run, False):
-                # Find the preprocessed raw file
-                raw_file = result.output_path / f"{subject_id}_preprocessed_raw.fif"
-                if raw_file.exists():
+                # Find the preprocessed raw file (stem is
+                # `{subject}{_ses-X}{_run-Y}`, not the bare subject id).
+                raw_file = (find_preprocessed_raw(result.output_path)
+                            if result.output_path else None)
+                if raw_file is not None:
                     selected_runs.append(raw_file)
                     selected_ids.append(result.run)
 

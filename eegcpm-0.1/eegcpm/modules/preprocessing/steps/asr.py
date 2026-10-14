@@ -371,6 +371,30 @@ class ASRStep(ProcessingStep):
 
         return raw_cleaned, metadata
 
+    def check_dependencies(self) -> None:
+        """Fail at construction when the ASR backend is missing.
+
+        A missing backend must never leave the step as a silent no-op;
+        the run has to fail before any data is touched.
+        """
+        if self.method == 'eegprep':
+            try:
+                import eegprep  # noqa: F401
+                import eeglabio  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    f"ASRStep(method='eegprep') requires eegprep and eeglabio ({e}). "
+                    "Install with: pip install eegprep eeglabio"
+                ) from e
+        elif self.method == 'asrpy':
+            try:
+                import asrpy  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    f"ASRStep(method='asrpy') requires asrpy ({e}). "
+                    "Install with: pip install asrpy"
+                ) from e
+
     def validate_inputs(self, raw: mne.io.BaseRaw) -> bool:
         """Validate inputs."""
         # Check we have EEG channels

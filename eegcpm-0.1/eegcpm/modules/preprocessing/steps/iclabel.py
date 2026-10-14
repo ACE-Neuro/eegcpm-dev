@@ -306,6 +306,16 @@ class ICLabelStep(ProcessingStep):
                 return key
         return None
 
+    def check_dependencies(self) -> None:
+        """Fail at construction when mne-icalabel is missing."""
+        try:
+            import mne_icalabel  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                f"ICLabelStep requires mne-icalabel, which is not importable ({e}). "
+                "Install with: pip install mne-icalabel"
+            ) from e
+
     def validate_inputs(self, raw: mne.io.BaseRaw) -> bool:
         """Validate inputs."""
         # ICLabel validation happens in process() since we need metadata

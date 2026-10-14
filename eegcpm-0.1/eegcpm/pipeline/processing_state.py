@@ -34,11 +34,13 @@ class ProcessingState:
     run : str
         Run identifier (e.g., 'run-1')
     status : str
-        Processing status: 'pending', 'in_progress', 'completed', 'failed'
+        Processing status: 'pending', 'in_progress', 'completed',
+        'failed', 'excluded'
     started_at : str
         ISO timestamp when processing started
     completed_at : str, optional
-        ISO timestamp when processing completed
+        ISO timestamp when processing reached a final status
+        ('completed', 'failed' or 'excluded')
     source : str
         Processing source: 'CLI' or 'UI'
     logs : list of str
@@ -48,7 +50,8 @@ class ProcessingState:
     quality : str, optional
         Quality assessment: 'excellent', 'good', 'acceptable', 'poor', 'reject'
     error : str, optional
-        Error message if status == 'failed'
+        Error message for a final non-completed status ('failed' or
+        'excluded')
     config : dict, optional
         Preprocessing configuration used
     output_files : dict, optional
@@ -181,13 +184,20 @@ class ProcessingState:
         return states
 
     def update_status(self, status: str, error: Optional[str] = None):
-        """Update processing status."""
+        """Update processing status.
+
+        A final status (``completed``/``failed``/``excluded``) always
+        stamps ``completed_at``, and a passed ``error`` is always
+        stored — including for an exclusion, which some consumers show
+        as the run's failure reason. A ``None`` error never clobbers a
+        previous one.
+        """
         self.status = status
 
-        if status == 'completed':
-            self.completed_at = datetime.now().isoformat()
-        elif status == 'failed' and error:
+        if error:
             self.error = error
+
+        if status in ('completed', 'failed', 'excluded'):
             self.completed_at = datetime.now().isoformat()
 
     def add_log(self, message: str):

@@ -5,18 +5,40 @@ from typing import List
 from datetime import datetime
 import yaml
 import mne
+from pydantic import ValidationError
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 
 from ..workflow.state import WorkflowStateManager, WorkflowState, ProcessingStatus, StepRecord
+from ..core.config import load_preprocessing_spec
+from ..core.paths import EEGCPMPaths, clear_run_outputs, fail_run_outputs
 from ..modules.preprocessing import PreprocessingPipeline
 from ..modules.qc.preprocessed_qc import PreprocessedQC
 from ..data.event_mapping import get_event_mapping_for_run, translate_event_codes
 from ..core.task_config import TaskConfig
 from ..modules.qc.quality_assessment import extract_metrics_from_qc_result
 from ..modules.qc.metrics_io import save_qc_metrics_json
-from ..core.paths import EEGCPMPaths
 from ..data.bids_utils import supported_formats, find_eeg_run_files, read_raw_eeg
+
+
+def _subject_status(run_statuses: List[ProcessingStatus]) -> ProcessingStatus:
+    """Aggregate per-run statuses (rule: failed > excluded > completed).
+
+    Raises
+    ------
+    ValueError
+        If no run status is supplied — an empty subject has no status,
+        and silently returning COMPLETED would fake a successful batch.
+    """
+    if not run_statuses:
+        raise ValueError("_subject_status() requires at least one run status")
+    if all(s == ProcessingStatus.COMPLETED for s in run_statuses):
+        return ProcessingStatus.COMPLETED
+    if any(
+        s not in (ProcessingStatus.COMPLETED, ProcessingStatus.EXCLUDED) for s in run_statuses
+    ):
+        return ProcessingStatus.FAILED
+    return ProcessingStatus.EXCLUDED
 
 
 def preprocess_command(args):
@@ -34,14 +56,20 @@ def preprocess_command(args):
     if not args.config.exists():
         console.print(
             f"[red]Error: Config file not found: {args.config}[/red]")
-        return
+        return 1
 
     with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+        raw_config = yaml.safe_load(f)
 
-    # Extract preprocessing config if nested
-    if 'preprocessing' in config:
-        config = config['preprocessing']
+    # One schema, `extra='forbid'`: the legacy flat and keyed dialects
+    # are hard errors, never silent no-ops.
+    try:
+        spec = load_preprocessing_spec(raw_config)
+    except ValidationError as e:
+        console.print(
+            f"[red]Error: invalid preprocessing config {args.config}[/red]")
+        console.print(str(e))
+        return 1
 
     # Setup paths using new centralized system
     paths = EEGCPMPaths(
@@ -65,9 +93,10 @@ def preprocess_command(args):
     batch_completed = 0
     batch_failed = 0
     batch_skipped = 0
+    batch_excluded = 0
 
     # Get task
-    task = args.task or config.get('task', 'unknown')
+    task = args.task or spec.task or 'unknown'
 
     # NEW: Output uses stage-first architecture
     # derivatives/preprocessing/{pipeline}/{subject}/ses-{session}/task-{task}/run-{run}/
@@ -104,24 +133,9 @@ def preprocess_command(args):
                 description=f"[cyan]Subject {i}/{len(subjects)}: {subject_id}"
             )
 
-            # Check if already completed
-            existing_state = manager.load_state(
-                subject_id, task, args.pipeline)
-            if existing_state and existing_state.status == ProcessingStatus.COMPLETED and not args.force:
-                console.print(
-                    f"  [dim]✓ {subject_id} already completed (use --force to reprocess)[/dim]")
-                batch_skipped += 1
-                progress.update(overall_task, advance=1)
-                continue
-
-            # Initialize workflow state
-            workflow = WorkflowState(
-                subject_id=subject_id,
-                task=task,
-                pipeline=args.pipeline,
-                status=ProcessingStatus.IN_PROGRESS,
-                created_at=datetime.now()
-            )
+            # Per-run final statuses (one WorkflowState per run).
+            run_statuses = []
+            workflow = None
 
             try:
                 # Find input files (may be multiple runs)
@@ -132,13 +146,20 @@ def preprocess_command(args):
                 if not input_files:
                     console.print(
                         f"  [yellow]⚠ {subject_id}: No input files found for task {task}[/yellow]")
-                    workflow.status = ProcessingStatus.FAILED
+                    workflow = WorkflowState(
+                        subject_id=subject_id,
+                        task=task,
+                        pipeline=args.pipeline,
+                        status=ProcessingStatus.FAILED,
+                        created_at=datetime.now()
+                    )
                     workflow.add_step(StepRecord(
                         step_name="load_data",
                         status=ProcessingStatus.FAILED,
                         error_message=f"No input files found for task {task}"
                     ))
                     manager.save_state(workflow)
+                    batch_failed += 1
                     progress.update(overall_task, advance=1)
                     continue
 
@@ -154,234 +175,355 @@ def preprocess_command(args):
                     session = input_file.stem.split(
                         '_ses-')[1].split('_')[0] if '_ses-' in input_file.stem else "01"
 
-                    console.print(f"    Processing run {run_num}...")
+                    # Skip runs already completed or excluded for this
+                    # exact identity (subject/session/task/run).
+                    existing_state = manager.load_state(
+                        subject_id, task, args.pipeline,
+                        session=session, run=run_num)
+                    if (existing_state
+                            and existing_state.status in (ProcessingStatus.COMPLETED,
+                                                          ProcessingStatus.EXCLUDED)
+                            and not args.force):
+                        console.print(
+                            f"    [dim]✓ run {run_num} already "
+                            f"{existing_state.status.value} "
+                            f"(use --force to reprocess)[/dim]")
+                        batch_skipped += 1
+                        continue
 
-                    # Load data step
-                    load_step = StepRecord(
-                        step_name=f"load_data_run{run_num}",
-                        status=ProcessingStatus.IN_PROGRESS,
-                        started_at=datetime.now()
-                    )
-                    workflow.add_step(load_step)
-                    workflow.session = session  # Update workflow with actual session
-                    workflow.run = run_num      # Update workflow with actual run
-                    manager.save_state(workflow)
-                    raw = None
-                    print("read raw eeg enter...")
-                    raw = read_raw_eeg(input_file)
-                    # match extension:
-                    #     case "vhdr":
-                    #         raw = mne.io.read_raw_brainvision(
-                    #             input_file, preload=True, verbose=False)
-                    #         # Auto-set common auxiliary channel types for BrainVision
-                    #         misc_channels = {
-                    #             'photosensor': 'stim',
-                    #             'optical': 'stim',
-                    #             'ecg': 'ecg',
-                    #             'resp': 'misc'
-                    #         }
-                    #         channels_to_set = {
-                    #             ch: ch_type for ch, ch_type in misc_channels.items()
-                    #             if ch in raw.ch_names
-                    #         }
-                    #         if channels_to_set:
-                    #             raw.set_channel_types(channels_to_set)
-                    #     case "fif":
-                    #         raw = mne.io.read_raw_fif(
-                    #             input_file, preload=True, verbose=False)
-                    #     case "edf":
-                    #         raw = mne.io.read_raw_edf(
-                    #             input_file, preload=True, verbose=False)
-                    #     case "bdf":
-                    #         raw = mne.io.read_raw_bdf(
-                    #             input_file, preload=True, verbose=False)
-                    #     case "set":
-                    #         raw = mne.io.read_raw_eeglab(
-                    #             input_file, preload=True, verbose=False)
-                    #     case "cnt":
-                    #         raw = mne.io.read_raw_cnt(
-                    #             input_file, preload=True, verbose=False)
-                    #     case "cdt":
-                    #         raw = mne.io.read_raw_curry(
-                    #             input_file, preload=True, verbose=False)
+                    # Fresh handle per run: an exception below must mark
+                    # *this* run FAILED, never re-save the previous row.
+                    workflow = None
+                    result = None
+                    try:
+                        # One workflow row per run.
+                        workflow = WorkflowState(
+                            subject_id=subject_id,
+                            task=task,
+                            pipeline=args.pipeline,
+                            status=ProcessingStatus.IN_PROGRESS,
+                            session=session,
+                            run=run_num,
+                            created_at=datetime.now()
+                        )
+                        manager.save_state(workflow)
 
-                    # raw = mne.io.read_raw_fif(input_file, preload=True, verbose=False)
+                        # This run is definitely being (re)processed:
+                        # drop stale outputs *before* loading the data, so
+                        # even a load failure cannot leave the previous
+                        # FIF + success sidecar next to a new FAILED row.
+                        run_output = paths.get_preprocessing_dir(
+                            pipeline=args.pipeline,
+                            subject=subject_id,
+                            session=session,
+                            task=task,
+                            run=run_num
+                        )
+                        run_output.mkdir(parents=True, exist_ok=True)
+                        clear_run_outputs(run_output)
 
-                    load_step.status = ProcessingStatus.COMPLETED
-                    load_step.completed_at = datetime.now()
-                    workflow.add_step(load_step)
-                    manager.save_state(workflow)
+                        console.print(f"    Processing run {run_num}...")
 
-                    # Preprocessing step
-                    preproc_step = StepRecord(
-                        step_name=f"preprocessing_run{run_num}",
-                        status=ProcessingStatus.IN_PROGRESS,
-                        started_at=datetime.now()
-                    )
-                    workflow.add_step(preproc_step)
-                    manager.save_state(workflow)
+                        # Load data step
+                        load_step = StepRecord(
+                            step_name=f"load_data_run{run_num}",
+                            status=ProcessingStatus.IN_PROGRESS,
+                            started_at=datetime.now()
+                        )
+                        workflow.add_step(load_step)
+                        manager.save_state(workflow)
+                        raw = None
+                        print("read raw eeg enter...")
+                        raw = read_raw_eeg(input_file)
+                        # match extension:
+                        #     case "vhdr":
+                        #         raw = mne.io.read_raw_brainvision(
+                        #             input_file, preload=True, verbose=False)
+                        #         # Auto-set common auxiliary channel types for BrainVision
+                        #         misc_channels = {
+                        #             'photosensor': 'stim',
+                        #             'optical': 'stim',
+                        #             'ecg': 'ecg',
+                        #             'resp': 'misc'
+                        #         }
+                        #         channels_to_set = {
+                        #             ch: ch_type for ch, ch_type in misc_channels.items()
+                        #             if ch in raw.ch_names
+                        #         }
+                        #         if channels_to_set:
+                        #             raw.set_channel_types(channels_to_set)
+                        #     case "fif":
+                        #         raw = mne.io.read_raw_fif(
+                        #             input_file, preload=True, verbose=False)
+                        #     case "edf":
+                        #         raw = mne.io.read_raw_edf(
+                        #             input_file, preload=True, verbose=False)
+                        #     case "bdf":
+                        #         raw = mne.io.read_raw_bdf(
+                        #             input_file, preload=True, verbose=False)
+                        #     case "set":
+                        #         raw = mne.io.read_raw_eeglab(
+                        #             input_file, preload=True, verbose=False)
+                        #     case "cnt":
+                        #         raw = mne.io.read_raw_cnt(
+                        #             input_file, preload=True, verbose=False)
+                        #     case "cdt":
+                        #         raw = mne.io.read_raw_curry(
+                        #             input_file, preload=True, verbose=False)
 
-                    # NEW: Use centralized path management
-                    run_output = paths.get_preprocessing_dir(
-                        pipeline=args.pipeline,
-                        subject=subject_id,
-                        session=session,
-                        task=task,
-                        run=run_num
-                    )
-                    run_output.mkdir(parents=True, exist_ok=True)
+                        # raw = mne.io.read_raw_fif(input_file, preload=True, verbose=False)
 
-                    # Run preprocessing
-                    # Named canonical chains take precedence over a
-                    # steps list: config may carry `variant: hbn_langer`
-                    # (or `steps: hbn_langer`) to build the locked chain.
-                    steps_spec = config.get('steps', [])
-                    if config.get('variant') == 'hbn_langer' or steps_spec == 'hbn_langer':
-                        steps_spec = 'hbn_langer'
-                    module = PreprocessingPipeline(steps_spec, run_output)
-                    result = module.process(raw, subject_id=subject_id)
+                        load_step.status = ProcessingStatus.COMPLETED
+                        load_step.completed_at = datetime.now()
+                        workflow.add_step(load_step)
+                        manager.save_state(workflow)
 
-                    if result.success:
-                        # Extract bad channel information from metadata
-                        removed_channels = {}
-                        if 'bad_channels' in result.metadata:
-                            bad_ch_meta = result.metadata['bad_channels']
-                            bad_channel_list = bad_ch_meta.get(
-                                'bad_channels', [])
-                            method = bad_ch_meta.get('method', 'unknown')
-                            # Convert list to dict with method as reason
-                            method_str = ', '.join(method) if isinstance(
-                                method, list) else method
-                            removed_channels = {
-                                ch: method_str for ch in bad_channel_list}
+                        # Preprocessing step
+                        preproc_step = StepRecord(
+                            step_name=f"preprocessing_run{run_num}",
+                            status=ProcessingStatus.IN_PROGRESS,
+                            started_at=datetime.now()
+                        )
+                        workflow.add_step(preproc_step)
+                        manager.save_state(workflow)
 
-                        # Try to load task config and extract events for ERP QC
-                        events = None
-                        event_id = None
+                        # Run preprocessing from the validated spec (named
+                        # chain or explicit step list — `steps` is the only
+                        # selector; the schema already rejected anything
+                        # else).
+                        module = PreprocessingPipeline(
+                            spec.pipeline_steps(), run_output)
+                        result = module.process(
+                            raw,
+                            subject_id=subject_id,
+                            session_id=session,
+                            run_id=run_num,
+                        )
 
-                        # Use explicit task config if provided, otherwise try to auto-detect
-                        task_config_name = getattr(
-                            args, 'task_config', None) or task
-                        task_config_path = paths.get_configs_dir(
-                            "tasks") / f"{task_config_name}.yaml"
+                        if result.success:
+                            # The run is COMPLETED as soon as the pipeline
+                            # succeeds: QC is diagnostic and must never
+                            # flip the persisted status.
+                            preproc_step.status = ProcessingStatus.COMPLETED
+                            preproc_step.completed_at = datetime.now()
+                            preproc_step.output_path = str(run_output)
+                            preproc_step.metadata = result.metadata
 
-                        if task_config_path.exists():
-                            try:
-                                # Load task config
-                                task_config = TaskConfig.from_yaml(
-                                    task_config_path)
+                            # Extract bad channel information from metadata
+                            removed_channels = {}
+                            if 'bad_channels' in result.metadata:
+                                bad_ch_meta = result.metadata['bad_channels']
+                                bad_channel_list = bad_ch_meta.get(
+                                    'bad_channels', [])
+                                method = bad_ch_meta.get('method', 'unknown')
+                                # Convert list to dict with method as reason
+                                method_str = ', '.join(method) if isinstance(
+                                    method, list) else method
+                                removed_channels = {
+                                    ch: method_str for ch in bad_channel_list}
 
-                                # Extract events from preprocessed data
+                            # Try to load task config and extract events for ERP QC
+                            events = None
+                            event_id = None
+
+                            # Use explicit task config if provided, otherwise try to auto-detect
+                            task_config_name = getattr(
+                                args, 'task_config', None) or task
+                            task_config_path = paths.get_configs_dir(
+                                "tasks") / f"{task_config_name}.yaml"
+
+                            if task_config_path.exists():
                                 try:
-                                    events, event_dict = mne.events_from_annotations(
-                                        result.outputs['data'], verbose=False
-                                    )
+                                    # Load task config
+                                    task_config = TaskConfig.from_yaml(
+                                        task_config_path)
 
-                                    # Get event codes from task config
-                                    event_codes_to_use = task_config.get_event_codes_to_epoch()
+                                    # Extract events from preprocessed data
+                                    try:
+                                        events, event_dict = mne.events_from_annotations(
+                                            result.outputs['data'], verbose=False
+                                        )
 
-                                    # Translate semantic names to numeric codes if needed
-                                    event_mapping = get_event_mapping_for_run(
-                                        bids_root=paths.bids_root,
-                                        subject=subject_id,
-                                        session=session,
-                                        task=task,
-                                        run=run_num
-                                    )
+                                        # Get event codes from task config
+                                        event_codes_to_use = task_config.get_event_codes_to_epoch()
 
-                                    if event_mapping:
-                                        translated_codes = translate_event_codes(
-                                            event_codes_to_use, event_mapping)
-                                    else:
-                                        translated_codes = event_codes_to_use
+                                        # Translate semantic names to numeric codes if needed
+                                        event_mapping = get_event_mapping_for_run(
+                                            bids_root=paths.bids_root,
+                                            subject=subject_id,
+                                            session=session,
+                                            task=task,
+                                            run=run_num
+                                        )
 
-                                    # Filter event_dict to only include task-specified events
-                                    event_id = {
-                                        name: code for name, code in event_dict.items()
-                                        if name in translated_codes
-                                    }
+                                        if event_mapping:
+                                            translated_codes = translate_event_codes(
+                                                event_codes_to_use, event_mapping)
+                                        else:
+                                            translated_codes = event_codes_to_use
+
+                                        # Filter event_dict to only include task-specified events
+                                        event_id = {
+                                            name: code for name, code in event_dict.items()
+                                            if name in translated_codes
+                                        }
+
+                                    except Exception as e:
+                                        console.print(
+                                            f"      [yellow]⚠ Could not extract events for ERP QC: {e}[/yellow]")
 
                                 except Exception as e:
                                     console.print(
-                                        f"      [yellow]⚠ Could not extract events for ERP QC: {e}[/yellow]")
+                                        f"      [yellow]⚠ Could not load task config for ERP QC: {e}[/yellow]")
 
-                            except Exception as e:
+                            # QC is best-effort: a QC failure is recorded
+                            # as `qc_error` in the step metadata and warns,
+                            # but the run stays COMPLETED (its FIF exists
+                            # and is valid).
+                            try:
+                                # NEW: QC output in same directory as preprocessed data
+                                # No longer in separate derivatives folder
+                                qc = PreprocessedQC(run_output)
+                                qc_result = qc.compute(
+                                    data=result.outputs['data'],
+                                    subject_id=subject_id,
+                                    ica=result.outputs.get('ica'),
+                                    raw_before=raw,
+                                    metadata=result.metadata,
+                                    removed_channels=removed_channels,
+                                    session_id=session,
+                                    task_name=task,  # Changed from task= to task_name=
+                                    run=run_num,
+                                    events=events,  # Pass events for ERP QC
+                                    event_id=event_id  # Pass filtered event_id for ERP QC
+                                )
+
+                                # Save HTML report
+                                html_filename = f"{subject_id}_ses-{session}_task-{task}_run-{run_num}_preprocessed_qc.html"
+                                qc.generate_html_report(
+                                    qc_result, save_path=run_output / html_filename)
+
+                                # Save QC metrics as JSON (same directory)
+                                metrics_data = extract_metrics_from_qc_result(
+                                    qc_result,
+                                    subject_id=subject_id,
+                                    session=session,
+                                    task=task,
+                                    run=run_num,
+                                    pipeline=args.pipeline,
+                                    qc_report_path=html_filename
+                                )
+                                json_path = run_output / \
+                                    f"{subject_id}_ses-{session}_task-{task}_run-{run_num}_qc_metrics.json"
+                                save_qc_metrics_json(metrics_data, json_path)
+
+                                if qc_result.metrics:
+                                    preproc_step.metadata['qc_metrics'] = {
+                                        m.name: m.value for m in qc_result.metrics}
                                 console.print(
-                                    f"      [yellow]⚠ Could not load task config for ERP QC: {e}[/yellow]")
+                                    f"      [green]✓ Run {run_num} completed (QC generated)[/green]")
+                            except Exception as qc_error:
+                                import traceback
+                                preproc_step.metadata['qc_error'] = str(qc_error)
+                                console.print(
+                                    f"      [red]⚠ Run {run_num} QC failed: "
+                                    f"{qc_error}[/red]")
+                                console.print(
+                                    f"      [dim]{traceback.format_exc()}[/dim]")
+                                console.print(
+                                    f"      [green]✓ Run {run_num} completed "
+                                    f"(preprocessing OK, QC failed)[/green]")
+                        elif result.metadata.get('excluded'):
+                            excluded = result.metadata['excluded']
+                            preproc_step.status = ProcessingStatus.EXCLUDED
+                            preproc_step.completed_at = datetime.now()
+                            preproc_step.output_path = str(run_output)
+                            preproc_step.metadata = result.metadata
+                            preproc_step.error_message = (
+                                f"excluded: {excluded.get('reason')}")
+                            console.print(
+                                f"      [yellow]⊘ Run {run_num} excluded "
+                                f"({excluded.get('reason')})[/yellow]")
+                        else:
+                            preproc_step.status = ProcessingStatus.FAILED
+                            preproc_step.completed_at = datetime.now()
+                            preproc_step.error_message = str(result.errors)
+                            console.print(
+                                f"      [red]✗ Run {run_num} failed: {result.errors}[/red]")
 
-                        # NEW: QC output in same directory as preprocessed data
-                        # No longer in separate derivatives folder
-                        qc = PreprocessedQC(run_output)
-                        qc_result = qc.compute(
-                            data=result.outputs['data'],
-                            subject_id=subject_id,
-                            ica=result.outputs.get('ica'),
-                            raw_before=raw,
-                            metadata=result.metadata,
-                            removed_channels=removed_channels,
-                            session_id=session,
-                            task_name=task,  # Changed from task= to task_name=
-                            run=run_num,
-                            events=events,  # Pass events for ERP QC
-                            event_id=event_id  # Pass filtered event_id for ERP QC
-                        )
+                        workflow.add_step(preproc_step)
+                        workflow.status = preproc_step.status
+                        manager.save_state(workflow)
+                        run_statuses.append(preproc_step.status)
 
-                        # Save HTML report
-                        html_filename = f"{subject_id}_ses-{session}_task-{task}_run-{run_num}_preprocessed_qc.html"
-                        qc.generate_html_report(
-                            qc_result, save_path=run_output / html_filename)
-
-                        # Save QC metrics as JSON (same directory)
-                        metrics_data = extract_metrics_from_qc_result(
-                            qc_result,
-                            subject_id=subject_id,
-                            session=session,
-                            task=task,
-                            run=run_num,
-                            pipeline=args.pipeline,
-                            qc_report_path=html_filename
-                        )
-                        json_path = run_output / \
-                            f"{subject_id}_ses-{session}_task-{task}_run-{run_num}_qc_metrics.json"
-                        save_qc_metrics_json(metrics_data, json_path)
-
-                        preproc_step.status = ProcessingStatus.COMPLETED
-                        preproc_step.completed_at = datetime.now()
-                        preproc_step.output_path = str(run_output)
-                        preproc_step.metadata = result.metadata
-                        if qc_result.metrics:
-                            preproc_step.metadata['qc_metrics'] = {
-                                m.name: m.value for m in qc_result.metrics}
+                    except Exception as run_error:
+                        import traceback
                         console.print(
-                            f"      [green]✓ Run {run_num} completed (QC generated)[/green]")
+                            f"    [red]✗ run {run_num} error: {run_error}[/red]")
+                        console.print(
+                            f"    [dim]{traceback.format_exc()}[/dim]")
+                        # A run that already produced outputs and then
+                        # failed must not keep them: delete the FIF and
+                        # rewrite its success sidecar as FAILED.
+                        if result is not None and result.success:
+                            fail_run_outputs(
+                                run_output=run_output,
+                                subject_id=subject_id,
+                                session=session,
+                                run_num=run_num,
+                                output_files=result.output_files,
+                                error=run_error,
+                            )
+                        if workflow is None:
+                            workflow = WorkflowState(
+                                subject_id=subject_id,
+                                task=task,
+                                pipeline=args.pipeline,
+                                status=ProcessingStatus.FAILED,
+                                session=session,
+                                run=run_num,
+                                created_at=datetime.now(),
+                            )
+                        workflow.status = ProcessingStatus.FAILED
+                        workflow.add_step(StepRecord(
+                            step_name=f"error_run{run_num}",
+                            status=ProcessingStatus.FAILED,
+                            error_message=str(run_error),
+                        ))
+                        manager.save_state(workflow)
+                        run_statuses.append(ProcessingStatus.FAILED)
+                        continue
+
+                # Subject level counters (rule: failed > excluded > completed).
+                if run_statuses:
+                    subject_status = _subject_status(run_statuses)
+                    if subject_status is ProcessingStatus.COMPLETED:
+                        batch_completed += 1
+                        console.print(
+                            f"  [green]✓ {subject_id} completed "
+                            f"({len(run_statuses)} runs)[/green]")
+                    elif subject_status is ProcessingStatus.FAILED:
+                        batch_failed += 1
+                        console.print(
+                            f"  [red]✗ {subject_id} failed[/red]")
                     else:
-                        preproc_step.status = ProcessingStatus.FAILED
-                        preproc_step.completed_at = datetime.now()
-                        preproc_step.error_message = str(result.errors)
+                        batch_excluded += 1
                         console.print(
-                            f"      [red]✗ Run {run_num} failed: {result.errors}[/red]")
-
-                    workflow.add_step(preproc_step)
-                    manager.save_state(workflow)
-
-                # Mark overall workflow complete
-                workflow.status = ProcessingStatus.COMPLETED
-                batch_completed += 1
-                console.print(
-                    f"  [green]✓ {subject_id} completed ({len(input_files)} runs)[/green]")
+                            f"  [yellow]⊘ {subject_id} excluded[/yellow]")
 
             except Exception as e:
                 import traceback
                 console.print(f"  [red]✗ {subject_id} error: {e}[/red]")
                 console.print(f"  [dim]{traceback.format_exc()}[/dim]")
-                workflow.status = ProcessingStatus.FAILED
                 batch_failed += 1
-                workflow.add_step(StepRecord(
-                    step_name="error",
-                    status=ProcessingStatus.FAILED,
-                    error_message=str(e)
-                ))
-                manager.save_state(workflow)
+                if workflow is not None:
+                    workflow.status = ProcessingStatus.FAILED
+                    workflow.add_step(StepRecord(
+                        step_name="error",
+                        status=ProcessingStatus.FAILED,
+                        error_message=str(e)
+                    ))
+                    manager.save_state(workflow)
 
             progress.update(overall_task, advance=1)
 
@@ -389,6 +531,7 @@ def preprocess_command(args):
     console.print("\n[bold]Batch Processing Complete[/bold]")
     console.print(f"  Completed: {batch_completed}")
     console.print(f"  Failed: {batch_failed}")
+    console.print(f"  Excluded: {batch_excluded}")
     console.print(f"  Skipped: {batch_skipped}")
 
     # Overall database stats
@@ -398,7 +541,17 @@ def preprocess_command(args):
         f"  Total Completed: {summary['status_counts'].get('completed', 0)}")
     console.print(
         f"  Total Failed: {summary['status_counts'].get('failed', 0)}")
+    console.print(
+        f"  Total Excluded: {summary['status_counts'].get('excluded', 0)}")
     console.print(f"\nState saved to: {db_path}")
+
+    # Exit code: any failed run (or subject-level error) is a non-zero
+    # batch result, so scripts and CI do not treat a broken batch as
+    # success. Exclusions are a valid scientific outcome and do not
+    # affect the exit code; config errors already returned 1 above.
+    if batch_failed > 0:
+        return 2
+    return None
 
 
 def _get_subject_list(args, console, paths: EEGCPMPaths) -> List[str]:

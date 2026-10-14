@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 import json
 from datetime import datetime
+from ..core.paths import find_preprocessed_raw
 from ..workflow.state import WorkflowStateManager
 
 
@@ -122,9 +123,11 @@ class AggregateReportGenerator:
         quality_counts = {'excellent': 0, 'good': 0, 'acceptable': 0, 'poor': 0}
 
         for run_dir in run_dirs:
-            # Check if preprocessed file exists
-            preproc_file = run_dir / f"{subject_id}_preprocessed_raw.fif"
-            if preproc_file.exists():
+            # Check if the preprocessed file exists (stem carries
+            # session/run, so glob for it rather than hard-coding the
+            # subject-only name).
+            preproc_file = find_preprocessed_raw(run_dir)
+            if preproc_file is not None:
                 summary.n_runs_processed += 1
 
                 # Extract run number from directory name

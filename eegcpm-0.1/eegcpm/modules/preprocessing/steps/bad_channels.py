@@ -179,6 +179,23 @@ class BadChannelDetectionStep(ProcessingStep):
 
         return raw, step_metadata
 
+    def check_dependencies(self) -> None:
+        """Fail at construction when a backend needed by the selected
+        method(s) is missing.
+
+        RANSAC detection silently returned zero bad channels when
+        ``autoreject`` was absent — that is a silent quality
+        degradation and is replaced by this hard preflight.
+        """
+        if 'ransac' in self.method:
+            try:
+                from autoreject import Ransac  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    f"BadChannelDetectionStep(method='ransac') requires autoreject ({e}). "
+                    "Install with: pip install autoreject"
+                ) from e
+
     def get_config(self) -> Dict[str, Any]:
         """Get configuration."""
         config = super().get_config()

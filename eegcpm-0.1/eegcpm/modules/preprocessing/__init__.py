@@ -16,7 +16,7 @@ Created: 2025-12
 from .pipeline_builder import PreprocessingPipeline
 
 # Base class
-from .steps.base import ProcessingStep
+from .steps.base import ProcessingStep, RecordingExcluded
 
 # Individual steps
 from .steps.filter import FilterStep
@@ -43,6 +43,7 @@ __all__ = [
 
     # Base class
     'ProcessingStep',
+    'RecordingExcluded',
 
     # Steps
     'FilterStep',

@@ -40,6 +40,11 @@ class MontageStep(ProcessingStep):
     name = "montage"
     version = "1.0"
 
+    # A recording that already carries a montage is a legitimate no-op
+    # (nothing to set), not a failure. Any other not-applied result
+    # still fails a required step.
+    ALLOWED_NOOP_REASONS = frozenset({'montage_already_set'})
+
     def __init__(
         self,
         type: str = 'standard_1020',

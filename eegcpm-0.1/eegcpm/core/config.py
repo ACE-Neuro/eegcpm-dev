@@ -7,9 +7,17 @@ Stage-First Architecture:
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    conlist,
+    field_validator,
+    model_validator,
+)
 
 
 class BaseStageConfig(BaseModel):
@@ -68,9 +76,162 @@ class PreprocessingConfig(BaseModel):
     use_autoreject: bool = Field(default=False, description="Use autoreject for epoch rejection")
 
 
+class StepSpec(BaseModel):
+    """One preprocessing step in the single accepted nested dialect.
+
+    ``extra='forbid'`` makes the two legacy dialects hard errors
+    instead of silent no-ops: the *flat* dialect
+    (``{'name': 'filter', 'l_freq': 1.0}``) and the *keyed* dialect
+    (``{'filter': {...}}``) are both rejected.
+
+    Attributes
+    ----------
+    name : str
+        A key of ``eegcpm.modules.preprocessing.steps.STEP_REGISTRY``.
+    params : dict
+        Constructor keyword arguments for the step.
+    required : bool
+        Whether a failure / skip / not-applied result of this step must
+        fail the run (default: True).
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    name: str = Field(..., description="Registered preprocessing step name")
+    params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Step constructor keyword arguments",
+    )
+    required: bool = Field(
+        default=True,
+        description="Whether failure/skip/no-op of this step fails the run",
+    )
+
+    @field_validator('name')
+    @classmethod
+    def _validate_step_name(cls, value: str) -> str:
+        """Reject unknown step names.
+
+        The import is deliberately lazy: ``eegcpm.modules.preprocessing``
+        imports pipeline machinery that itself imports core helpers, so a
+        module-level import here would create a core -> modules cycle.
+        """
+        from eegcpm.modules.preprocessing.steps import STEP_REGISTRY
+
+        if value not in STEP_REGISTRY:
+            raise ValueError(
+                f"Unknown preprocessing step {value!r}. "
+                f"Available steps: {sorted(STEP_REGISTRY)}"
+            )
+        return value
+
+
+class PreprocessingSpec(BaseModel):
+    """The single preprocessing configuration schema.
+
+    ``steps`` is the only selector of the processing chain: either the
+    named canonical chain (``'hbn_langer'``, defined in code by
+    :func:`build_hbn_langer_chain`) or a non-empty list of
+    :class:`StepSpec` entries. A ``variant:`` name never selects the
+    chain — ``variant: hbn_langer`` next to an explicit step list is
+    rejected (older configs relied on the variant alone, which silently
+    changed meaning once the chain became code-defined).
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    stage: Literal['preprocessing'] = 'preprocessing'
+    name: Optional[str] = Field(default=None, description="Variant name")
+    variant: Optional[str] = Field(default=None, description="Variant name (legacy alias of name)")
+    description: Optional[str] = Field(default=None, description="Config description")
+    depends_on: Optional[Dict[str, str]] = Field(
+        default=None, description="Upstream stage dependencies"
+    )
+    task: Optional[str] = Field(default=None, description="Task name override")
+    is_primary: bool = Field(default=False, description="Primary variant for this stage")
+    notes: Optional[str] = Field(default=None, description="Free-form notes")
+    steps: Union[Literal['hbn_langer'], conlist(StepSpec, min_length=1)] = Field(
+        ..., description="Named chain or non-empty list of step specs"
+    )
+
+    @model_validator(mode='after')
+    def _validate_variant_chain_consistency(self):
+        """Reject ``variant: hbn_langer`` with an explicit step list.
+
+        Only ``steps:`` selects the chain. Older configs declared
+        ``variant: hbn_langer`` and were silently executed as their
+        (different) explicit step list, or vice versa — that silent
+        meaning change is now a hard error.
+        """
+        if self.variant == 'hbn_langer' and self.steps != 'hbn_langer':
+            raise ValueError(
+                "variant: hbn_langer requires steps: hbn_langer "
+                "(only `steps` selects the processing chain; a variant "
+                "name alone does not)"
+            )
+        return self
+
+    def pipeline_steps(self):
+        """Return the ``PreprocessingPipeline`` input for these steps.
+
+        Returns
+        -------
+        str or list of dict
+            ``'hbn_langer'`` for the named chain, else a list of
+            ``{'name', 'params', 'required'}`` dicts.
+        """
+        if self.steps == 'hbn_langer':
+            return 'hbn_langer'
+        return [step.model_dump() for step in self.steps]
+
+
+def load_preprocessing_spec(data: Dict[str, Any]) -> PreprocessingSpec:
+    """Validate a preprocessing configuration mapping.
+
+    Accepts either a bare preprocessing config or a project-config
+    envelope whose ``preprocessing`` key holds one; the envelope is the
+    only wrapping accepted. A mapping that carries **both** a
+    ``preprocessing`` envelope and a top-level ``steps`` key is
+    ambiguous (which one selects the chain?) and is rejected.
+
+    Parameters
+    ----------
+    data : dict
+        Parsed YAML mapping.
+
+    Returns
+    -------
+    PreprocessingSpec
+        Validated specification.
+
+    Raises
+    ------
+    pydantic.ValidationError
+        If the mapping uses a legacy dialect, has no/empty steps,
+        references an unknown step, or mixes the envelope with a
+        top-level ``steps`` key.
+    """
+    if isinstance(data, dict) and isinstance(data.get('preprocessing'), dict):
+        if 'steps' in data:
+            raise ValidationError.from_exception_data(
+                title='PreprocessingSpec',
+                line_errors=[{
+                    'type': 'value_error',
+                    'loc': ('steps',),
+                    'input': data.get('steps'),
+                    'ctx': {'error': ValueError(
+                        "ambiguous preprocessing config: both the "
+                        "`preprocessing:` envelope and a top-level `steps:` "
+                        "key are present — use one or the other"
+                    )},
+                }],
+            )
+        data = data['preprocessing']
+    return PreprocessingSpec.model_validate(data)
+
+
 class RejectionConfig(BaseModel):
     """Epoch rejection configuration."""
-
     # Amplitude-based rejection thresholds (max peak-to-peak)
     reject: Optional[Dict[str, float]] = Field(
         default=None,

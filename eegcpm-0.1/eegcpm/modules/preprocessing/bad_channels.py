@@ -238,10 +238,15 @@ class BadChannelDetector:
         """
         try:
             from autoreject import Ransac
-        except ImportError:
-            print("Warning: autoreject not installed. RANSAC detection unavailable.")
-            print("Install with: pip install autoreject")
-            return set(), {}
+        except ImportError as e:
+            # Never degrade detection silently: a missing backend must
+            # fail the run (F17). The step's check_dependencies()
+            # preflight catches this at construction; this re-raise
+            # covers direct detector use.
+            raise ImportError(
+                f"RANSAC bad-channel detection requires autoreject ({e}). "
+                "Install with: pip install autoreject"
+            ) from e
 
         # RANSAC requires montage for spatial interpolation
         if raw.get_montage() is None:
@@ -371,10 +376,13 @@ class BadChannelDetector:
         """
         try:
             from pyprep.find_noisy_channels import NoisyChannels
-        except ImportError:
-            print("Warning: pyprep not installed. PREP detection unavailable.")
-            print("Install with: pip install pyprep")
-            return set(), {}
+        except ImportError as e:
+            # Never degrade detection silently (F17): a missing
+            # backend must fail the run.
+            raise ImportError(
+                f"PREP bad-channel detection requires pyprep ({e}). "
+                "Install with: pip install pyprep"
+            ) from e
 
         # PREP requires montage
         if raw.get_montage() is None:

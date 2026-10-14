@@ -432,7 +432,9 @@ For more information: https://github.com/clivehywong/eegcpm-dev
         if args.command == 'status':
             status_command(args)
         elif args.command == 'preprocess':
-            preprocess_command(args)
+            rc = preprocess_command(args)
+            if rc:
+                sys.exit(int(rc))
         elif args.command == 'resume':
             resume_command(args)
         elif args.command == 'import-qc':

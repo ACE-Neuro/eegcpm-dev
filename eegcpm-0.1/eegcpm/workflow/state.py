@@ -57,6 +57,7 @@ class ProcessingStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    EXCLUDED = "excluded"
 
 
 @dataclass

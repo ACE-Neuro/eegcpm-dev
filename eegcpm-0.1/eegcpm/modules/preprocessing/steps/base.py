@@ -6,8 +6,34 @@ Created: 2025-12
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 import mne
+
+
+class RecordingExcluded(Exception):
+    """The recording must not be processed further.
+
+    Raised by a step (or the executor) when the data itself fails a
+    hard inclusion gate that no later step can repair — e.g. too many
+    bad channels, or a block-rejection fraction above the allowed
+    maximum. The executor turns this into a run status of
+    ``excluded``: no ``*_preprocessed_raw.fif`` is written and the
+    workflow is never marked COMPLETED.
+
+    Parameters
+    ----------
+    reason : str
+        Machine-readable exclusion reason (e.g.
+        ``'block_rejection_fraction_exceeded'``).
+    metrics : dict, optional
+        Numeric evidence supporting the exclusion (block counts,
+        fractions, ...). Stored in the run sidecar JSON.
+    """
+
+    def __init__(self, reason: str, metrics: Optional[Dict[str, Any]] = None):
+        self.reason = reason
+        self.metrics = dict(metrics) if metrics else {}
+        super().__init__(f"recording excluded: {reason}")
 
 
 class ProcessingStep(ABC):
@@ -26,6 +52,15 @@ class ProcessingStep(ABC):
         Step version for reproducibility
     enabled : bool
         Whether this step is enabled (default: True)
+    required : bool
+        Whether a failure/skip/no-op of this step must fail the run
+        (default: True). Set by the pipeline builder from the step
+        spec; never truncate data silently on a required step.
+    ALLOWED_NOOP_REASONS : frozenset of str
+        Reasons for which returning ``{'skipped': True, 'reason': r}``
+        (or ``{'applied': False, 'reason': r}``) is a legitimate
+        no-op rather than a failure. Empty by default: a no-op is a
+        failure unless explicitly allow-listed.
 
     Examples
     --------
@@ -46,6 +81,16 @@ class ProcessingStep(ABC):
 
     name: str = "processing_step"
     version: str = "1.0"
+
+    # Whether failure / skip / no-op of this step must fail the run.
+    # The pipeline builder overrides this per step from the step spec
+    # (`required: false` in YAML); subclasses must NOT add it to their
+    # constructors.
+    required: bool = True
+
+    # Reasons for which a not-applied result is a legitimate no-op.
+    # Empty means: every not-applied result is a failure.
+    ALLOWED_NOOP_REASONS: frozenset = frozenset()
 
     def __init__(self, enabled: bool = True, **kwargs):
         """
@@ -116,6 +161,22 @@ class ProcessingStep(ABC):
         # Default: accept all data
         return True
 
+    def check_dependencies(self) -> None:
+        """
+        Verify at construction time that the step's backend is importable.
+
+        Steps that rely on an optional third-party library override
+        this to import it eagerly, so a missing dependency fails the
+        run at construction instead of silently degrading detection.
+
+        Raises
+        ------
+        ImportError
+            If a required backend package is not installed, with a
+            ``pip install <pkg>`` hint.
+        """
+        return None
+
     def skip_step(self, raw: mne.io.BaseRaw, metadata: Dict[str, Any]) -> bool:
         """
         Determine if this step should be skipped based on current state.
@@ -149,6 +210,7 @@ class ProcessingStep(ABC):
             'name': self.name,
             'version': self.version,
             'enabled': self.enabled,
+            'required': self.required,
         }
 
     def __repr__(self) -> str:

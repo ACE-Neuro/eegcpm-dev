@@ -9,6 +9,8 @@ from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
 import mne
 from ..data.bids_utils import BIDSFile, find_subject_runs, read_raw_eeg
+from ..core.config import load_preprocessing_spec
+from ..core.paths import clear_run_outputs, fail_run_outputs, find_preprocessed_raw
 from ..modules.preprocessing import PreprocessingPipeline
 from ..modules.qc.preprocessed_qc import PreprocessedQC
 from ..modules.qc.multirun_qc_report import MultiRunQCReport
@@ -197,6 +199,11 @@ class RunProcessor:
         output_dir.mkdir(parents=True, exist_ok=True)
         logs.append(f"Output directory: {output_dir}")
 
+        # This run is about to be (re)processed: drop stale outputs so
+        # a failed re-run cannot leave the previous FIF behind next to
+        # the new FAILED sidecar.
+        clear_run_outputs(output_dir)
+
         # Create processing state (filesystem-based, for CLI/UI sync)
         processing_state = create_processing_state(
             subject_id=subject_id,
@@ -219,6 +226,9 @@ class RunProcessor:
             )
             self.state_manager.save_state(workflow)
 
+        # A run that succeeds and then crashes must not keep its outputs:
+        # initialise here so the except block can rewrite them (N4/F2).
+        preproc_result = None
         try:
             # Load data
             load_step = StepRecord(
@@ -252,21 +262,33 @@ class RunProcessor:
                 started_at=datetime.now()
             )
 
-            # Get steps from config
-            preproc_config = self.config.get('preprocessing', self.config)
-            steps = preproc_config.get('steps', [])
+            # Get steps from the single validated preprocessing schema
+            # (named chain or explicit step list).
+            spec = load_preprocessing_spec(self.config)
 
             # Create modular pipeline
-            pipeline = PreprocessingPipeline(steps=steps, output_dir=output_dir)
-            preproc_result = pipeline.process(raw, subject_id=subject_id)
+            pipeline = PreprocessingPipeline(spec.pipeline_steps(), output_dir=output_dir)
+            preproc_result = pipeline.process(
+                raw,
+                subject_id=subject_id,
+                session_id=session,
+                run_id=run,
+            )
 
             # Add detailed preprocessing logs from modular pipeline
             if preproc_result.metadata:
                 meta = preproc_result.metadata
                 print(f"[RUN_PROCESSOR DEBUG] Metadata keys: {list(meta.keys())}")
 
-                # Iterate through step results
-                for step_name, step_meta in meta.items():
+                # Iterate through step results. `metadata` also carries
+                # non-step keys ('step_status', 'degraded', 'excluded',
+                # 'save_error'), so drive the loop from the explicit
+                # step_status mapping and skip anything that is not a
+                # per-step dict.
+                for step_name in meta.get('step_status', {}):
+                    step_meta = meta.get(step_name)
+                    if not isinstance(step_meta, dict):
+                        continue
                     print(f"[RUN_PROCESSOR DEBUG] Processing step: {step_name}, meta: {step_meta}")
 
                     # Montage (process this BEFORE generic skip handling)
@@ -380,9 +402,16 @@ class RunProcessor:
             if not preproc_result.success:
                 preproc_step.error_message = str(preproc_result.errors)
 
+            if preproc_result.metadata.get('excluded'):
+                # A recording the pipeline refused to process is
+                # EXCLUDED, never COMPLETED and never FAILED.
+                preproc_step.status = ProcessingStatus.EXCLUDED
+                preproc_step.error_message = (
+                    f"excluded: {preproc_result.metadata['excluded'].get('reason')}")
+
             if self.state_manager:
                 workflow.add_step(preproc_step)
-                workflow.status = ProcessingStatus.COMPLETED if preproc_result.success else ProcessingStatus.FAILED
+                workflow.status = preproc_step.status
                 self.state_manager.save_state(workflow)
 
             # Get processed raw from outputs (key is 'data', not 'raw')
@@ -499,13 +528,31 @@ class RunProcessor:
             logs.append(f"Preprocessing completed: {quality_metrics.quality_status} ({quality_metrics.recommended_action})")
             self._print(f"    ✓ run-{run}: {quality_metrics.quality_status} ({quality_metrics.recommended_action})")
 
-            # Save processing state to filesystem
-            processing_state.update_status('completed')
+            # Save processing state to filesystem. The status must
+            # reflect what actually happened (the old code always wrote
+            # 'completed' even for failed runs).
+            if preproc_result.success:
+                processing_state.update_status('completed')
+            elif preproc_result.metadata.get('excluded'):
+                processing_state.update_status(
+                    'excluded',
+                    error=f"excluded: {preproc_result.metadata['excluded'].get('reason')}")
+            else:
+                processing_state.update_status(
+                    'failed', error=str(preproc_result.errors))
             processing_state.logs = logs
             processing_state.set_metadata(preproc_result.metadata)
             processing_state.set_quality(quality_metrics.quality_status)
+            # Never claim an output file for a failed/excluded run: the
+            # FIF is only written on success.
+            preproc_output = None
+            if preproc_result.success:
+                for out_file in preproc_result.output_files:
+                    if str(out_file).endswith('_preprocessed_raw.fif'):
+                        preproc_output = str(out_file)
+                        break
             processing_state.output_files = {
-                'preprocessed': str(output_dir / f"{subject_id}_preprocessed_raw.fif"),
+                'preprocessed': preproc_output,
                 'qc_report': str(qc_path) if qc_path else None,
             }
             processing_state.save(output_dir)
@@ -523,6 +570,18 @@ class RunProcessor:
         except Exception as e:
             logs.append(f"ERROR: {str(e)}")
             self._print(f"    ✗ run-{run}: {e}")
+
+            # A run that succeeded and then crashed must not keep
+            # success-looking outputs on disk (mirrors the CLI cleanup).
+            if preproc_result is not None and preproc_result.success:
+                fail_run_outputs(
+                    run_output=output_dir,
+                    subject_id=subject_id,
+                    session=session,
+                    run_num=run,
+                    output_files=list(preproc_result.output_files or []),
+                    error=e,
+                )
 
             # Save failed processing state to filesystem
             processing_state.update_status('failed', error=str(e))
@@ -689,8 +748,12 @@ class RunProcessor:
         """
         results = []
 
-        # Find run directories
-        subject_task_dir = self.output_root / subject_id / f"ses-{session}" / f"task-{task}"
+        # Find run directories. Outputs live under the BIDS subject
+        # prefix (`sub-01/...`), matching _process_single_run().
+        subject_prefix = (
+            subject_id if subject_id.startswith('sub-') else f"sub-{subject_id}"
+        )
+        subject_task_dir = self.output_root / subject_prefix / f"ses-{session}" / f"task-{task}"
 
         if not subject_task_dir.exists():
             return results
@@ -701,10 +764,11 @@ class RunProcessor:
         for run_dir in run_dirs:
             run_id = run_dir.name.replace('run-', '')
 
-            # Check if preprocessed file exists
-            preproc_file = run_dir / f"{subject_id}_preprocessed_raw.fif"
+            # Check if the preprocessed file exists (the output stem is
+            # `{subject}{_ses-X}{_run-Y}`, never the bare subject id).
+            preproc_file = find_preprocessed_raw(run_dir)
 
-            if not preproc_file.exists():
+            if preproc_file is None:
                 continue
 
             # Try to load workflow state

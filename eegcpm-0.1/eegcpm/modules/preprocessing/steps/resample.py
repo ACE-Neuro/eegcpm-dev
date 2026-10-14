@@ -36,6 +36,11 @@ class ResampleStep(ProcessingStep):
     name = "resample"
     version = "1.0"
 
+    # A recording already at the target sampling frequency is a
+    # legitimate no-op (nothing to do), not a failure. Any other
+    # not-applied result still fails a required step.
+    ALLOWED_NOOP_REASONS = frozenset({'already_at_target_sfreq'})
+
     def __init__(
         self,
         sfreq: float,

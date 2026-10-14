@@ -42,6 +42,17 @@ class InterpolateBadChannelsStep(ProcessingStep):
     name = "interpolate"
     version = "1.0"
 
+    # Interpolating zero bad channels is a legitimate no-op (nothing to
+    # do), not a failure. Any other not-applied result still fails a
+    # required step.
+    #
+    # NOTE: the channel-drop branch below (when the bad-channel budget
+    # `max_bad_percent` is exceeded) is a known P1-F5 defect — it drops
+    # the bad channels and reports `applied: True` instead of failing
+    # the recording. It is removed in B4 task 4 (P1-F5); do not rely on
+    # it (the pinned detector is mark-only and never drops channels).
+    ALLOWED_NOOP_REASONS = frozenset({'no_bad_channels'})
+
     def __init__(
         self,
         mode: str = 'accurate',

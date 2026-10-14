@@ -8,7 +8,7 @@ Author: EEGCPM Development Team
 Created: 2025-12
 """
 
-from .base import ProcessingStep
+from .base import ProcessingStep, RecordingExcluded
 from .filter import FilterStep
 from .lowpass import LowpassStep
 from .notch import NotchStep
@@ -44,6 +44,7 @@ STEP_REGISTRY = {
 
 __all__ = [
     'ProcessingStep',
+    'RecordingExcluded',
     'FilterStep',
     'LowpassStep',
     'NotchStep',

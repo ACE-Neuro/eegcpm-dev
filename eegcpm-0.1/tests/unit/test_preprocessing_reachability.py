@@ -145,28 +145,45 @@ def test_derive_asr_burst_mask_non_zero_on_burst():
 # --- R-006: block rejection hard-fail ---
 
 def test_block_rejection_hard_fails_on_excessive_contamination():
-    """R-006: a recording with > 20% bad blocks must HARD-FAIL,
+    """R-006 + F4: a recording with > 20% bad blocks must HARD-FAIL,
     NOT silently truncate. The reachability test (R-006 explicitly
-    requires "a reachability test that actually raises")."""
-    # Direct invocation of the block_rejection step (NOT the
-    # whole chain) so we test the gate in isolation.
+    requires "a reachability test that actually raises") now asserts
+    the exclusion exception AND that the BAD_BLOCK annotations were
+    appended (never replacing the pre-existing ones) before the raise."""
     from eegcpm.modules.preprocessing.hbn_langer_chain import (
         _BlockRejectionStepWrapper,
     )
+    from eegcpm.modules.preprocessing.steps.base import RecordingExcluded
+
     rng = np.random.RandomState(42)
     sfreq = 500
-    n_channels, n_times = 5, 10_000   # 10 s = 5 blocks of 2 s
+    n_channels, n_times = 5, 10_000   # 20 s = 10 blocks of 2 s
     ch_names = [f"E{i}" for i in range(1, n_channels + 1)]
     info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
     data = rng.randn(n_channels, n_times) * 1e-6
-    # Contaminate 4 out of 5 blocks = 80% (>> 0.20)
+    # Contaminate the first 8000 samples: 8 of the 10 blocks = 80%
+    # (>> 0.20).
     for b in range(4):
         data[:, b * 2000: (b + 1) * 2000] *= 100.0
     raw = mne.io.RawArray(data, info)
+    # Pre-existing annotations must survive (F4: append, never replace).
+    raw.set_annotations(mne.Annotations([0.5], [0.0], ["stim_1"]))
+
     step = _BlockRejectionStepWrapper(max_rejected_fraction=0.20,
                                           window_seconds=2.0)
-    with pytest.raises(ValueError, match="block_rejection"):
+    with pytest.raises(RecordingExcluded) as excinfo:
         step.process(raw, {})
+
+    assert excinfo.value.reason == "block_rejection_fraction_exceeded"
+    assert excinfo.value.metrics["n_blocks_rejected"] == 8
+    assert excinfo.value.metrics["n_blocks_total"] == 10
+    descriptions = list(raw.annotations.description)
+    assert "stim_1" in descriptions, (
+        "pre-existing annotations were wiped by the block-rejection gate"
+    )
+    assert descriptions.count("BAD_BLOCK") == 8, (
+        "BAD_BLOCK annotations must be appended before the exclusion raise"
+    )
 
 
 def test_block_rejection_passes_on_clean_recording():
@@ -187,3 +204,40 @@ def test_block_rejection_passes_on_clean_recording():
     assert "n_blocks_rejected" in meta
     assert "n_blocks_total" in meta
     assert meta["n_blocks_rejected"] == 0
+
+
+def test_block_rejection_onsets_follow_sample_boundaries():
+    """Onsets/durations are computed from the integer block boundaries
+    ``int(window_seconds * sfreq)``, not the nominal ``window_seconds``
+    (audit minor: onset drift on odd sampling rates)."""
+    from eegcpm.modules.preprocessing.hbn_langer_chain import (
+        _BlockRejectionStepWrapper,
+    )
+    from eegcpm.modules.preprocessing.steps.base import RecordingExcluded
+
+    rng = np.random.RandomState(0)
+    sfreq = 333.3                      # 2.0 s -> 666 samples (not 666.6)
+    window_seconds = 2.0
+    window_samples = int(window_seconds * sfreq)
+    n_channels, n_blocks = 5, 4
+    n_times = n_blocks * window_samples
+    ch_names = [f"E{i}" for i in range(1, n_channels + 1)]
+    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
+    data = rng.randn(n_channels, n_times) * 1e-6
+    # Contaminate exactly one block (index 2) = 25 % > 10 % gate.
+    data[:, 2 * window_samples: 3 * window_samples] *= 100.0
+    raw = mne.io.RawArray(data, info)
+
+    step = _BlockRejectionStepWrapper(max_rejected_fraction=0.10,
+                                      window_seconds=window_seconds)
+    with pytest.raises(RecordingExcluded) as excinfo:
+        step.process(raw, {})
+
+    expected_onset = 2 * window_samples / sfreq
+    onsets = excinfo.value.metrics["bad_block_onsets_s"]
+    assert onsets == pytest.approx([expected_onset])
+    assert onsets[0] != pytest.approx(2 * window_seconds)
+
+    durations = list(raw.annotations.duration)
+    assert durations == pytest.approx([window_samples / sfreq])
+    assert durations[0] != pytest.approx(window_seconds)

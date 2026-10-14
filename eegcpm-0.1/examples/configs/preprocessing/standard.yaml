@@ -1,5 +1,11 @@
 # Standard Preprocessing Configuration
-# Stage-first architecture: This config defines a preprocessing variant
+# Stage-first architecture: this config defines a preprocessing variant
+#
+# Schema (single accepted dialect): each step is
+#   - name: <STEP_REGISTRY key>
+#     params: {<constructor kwargs>}
+#     required: <bool, default true>
+# Flat keys next to `name` are rejected (`extra='forbid'`).
 
 # Stage metadata (NEW in stage-first architecture)
 stage: preprocessing
@@ -10,20 +16,28 @@ depends_on: null  # Preprocessing has no upstream dependencies
 # Preprocessing steps
 steps:
   - name: filter
-    l_freq: 0.5
-    h_freq: 40.0
-    method: fir
+    params:
+      l_freq: 0.5
+      h_freq: 40.0
+      method: fir
 
+  # Mark-only detection; interpolation is done explicitly (interpolate
+  # step) or not at all. (`method: automatic` and `threshold:` were
+  # stale keys no step ever consumed.)
   - name: bad_channels
-    method: automatic
-    threshold: 3.0
+    params:
+      method: variance
+      variance_threshold: 5.0
+      mark_only: true
 
   - name: ica
-    method: infomax
-    n_components: null  # Auto-select
-    random_state: 42
-    reject_eog: true
-    reject_ecg: false  # EEG-only dataset
+    params:
+      method: infomax
+      n_components: rank-1  # Auto-select (data rank - 1)
+      random_state: 42
+      l_freq_fit: 0.5
+      auto_detect_artifacts: true
+      reject_by_annotation: true
 
 # Output naming
 task: null  # Can be overridden by CLI argument

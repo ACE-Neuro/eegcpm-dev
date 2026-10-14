@@ -12,7 +12,8 @@ Stage-First Architecture:
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
+import json
 
 
 class EEGCPMPaths:
@@ -648,6 +649,77 @@ class EEGCPMPaths:
         return result
 
 
+def find_preprocessed_raw(run_dir: Path) -> Optional[Path]:
+    """Find the preprocessed raw FIF inside one per-run output directory.
+
+    The preprocessed FIF lives in the run directory with a stem of
+    ``{subject}{_ses-X}{_run-Y}`` (see
+    :meth:`PreprocessingPipeline._output_stem`), so consumers must glob
+    for it instead of hard-coding a subject-only filename.
+
+    Parameters
+    ----------
+    run_dir : Path
+        Per-run output directory (e.g.
+        ``derivatives/preprocessing/{pipeline}/sub-001/ses-01/task-rest/run-1``).
+
+    Returns
+    -------
+    Path or None
+        The single ``*_preprocessed_raw.fif`` in ``run_dir``, or ``None``
+        when the directory does not exist or holds no such file.
+
+    Raises
+    ------
+    RuntimeError
+        If more than one ``*_preprocessed_raw.fif`` is present — picking
+        one arbitrarily would silently consume a stale output.
+    """
+    run_dir = Path(run_dir)
+    matches = sorted(run_dir.glob('*_preprocessed_raw.fif'))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple preprocessed raw FIF files in {run_dir}: "
+            f"{[p.name for p in matches]}"
+        )
+    return matches[0]
+
+
+def clear_run_outputs(run_dir: Path) -> None:
+    """Delete stale preprocessing outputs before a run is reprocessed.
+
+    A forced re-run that fails must not leave the previous run's FIF
+    alongside the new ``*_preprocessing_FAILED.json`` sidecar. Deletes
+    (non-recursively, missing files ignored):
+
+    - ``*_preprocessed_raw.fif``
+    - ``*_ica.fif``
+    - ``*_preprocessing*.json`` (success / FAILED / EXCLUDED sidecars)
+    - ``*_qc_metrics.json``
+    - ``*_preprocessed_qc.html`` / ``*_preprocessed_qc.json``
+
+    Parameters
+    ----------
+    run_dir : Path
+        Per-run output directory.
+    """
+    run_dir = Path(run_dir)
+    patterns = (
+        '*_preprocessed_raw.fif',
+        '*_ica.fif',
+        '*_preprocessing*.json',
+        '*_qc_metrics.json',
+        '*_preprocessed_qc.html',
+        '*_preprocessed_qc.json',
+    )
+    for pattern in patterns:
+        for stale in run_dir.glob(pattern):
+            if stale.is_file():
+                stale.unlink()
+
+
 # Convenience function for creating paths from project root
 def create_paths(
     project_root: Path,
@@ -668,3 +740,46 @@ def create_paths(
         Path manager instance
     """
     return EEGCPMPaths(project_root, eegcpm_root)
+
+
+def fail_run_outputs(
+    run_output: Path,
+    subject_id: str,
+    session: str,
+    run_num: str,
+    output_files: List[Path],
+    error: Exception,
+) -> None:
+    """Turn a succeeded-then-crashed run's outputs into a FAILED run.
+
+    Deletes the run's saved outputs and rewrites its
+    ``{stem}_preprocessing.json`` success sidecar as
+    ``{stem}_preprocessing_FAILED.json`` with the error added, so the
+    filesystem never claims a success the persisted status denies.
+    Shared by the CLI and ``RunProcessor`` (audit condition N4/F2).
+    """
+    for out_file in output_files or []:
+        try:
+            Path(out_file).unlink()
+        except FileNotFoundError:
+            pass
+
+    stem = f"{subject_id}_ses-{session}_run-{run_num}"
+    success_sidecar = Path(run_output) / f"{stem}_preprocessing.json"
+    failed_sidecar = Path(run_output) / f"{stem}_preprocessing_FAILED.json"
+
+    payload = {}
+    if success_sidecar.exists():
+        try:
+            with open(success_sidecar) as f:
+                payload = json.load(f)
+        except (OSError, ValueError):
+            payload = {}
+        success_sidecar.unlink()
+
+    payload['success'] = False
+    payload['error'] = str(error)
+    payload['errors'] = list(payload.get('errors') or []) + [str(error)]
+    failed_sidecar.parent.mkdir(parents=True, exist_ok=True)
+    with open(failed_sidecar, 'w') as f:
+        json.dump(payload, f, indent=2, default=str)

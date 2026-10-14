@@ -263,6 +263,8 @@ class _BlockRejectionStepWrapper(_PS):
         # (single-channel spikes dominate), median-over-channels flags
         # ~13% (sensible gate). max-over-channels would make the gate
         # structurally unable to pass (METH-22-009).
+        from eegcpm.modules.preprocessing.steps.base import RecordingExcluded
+
         BLOCK_REJECTION_PTP_THRESHOLD = 100e-6   # 100 µV
         data = raw.get_data(picks="eeg")
         n_channels, n_total = data.shape
@@ -287,26 +289,41 @@ class _BlockRejectionStepWrapper(_PS):
         bad_blocks = block_med > BLOCK_REJECTION_PTP_THRESHOLD
         n_bad = int(bad_blocks.sum())
         fraction = n_bad / n_blocks
+        # Onsets follow the actual sample boundaries
+        # (window_samples = int(window_seconds * sfreq)), not the nominal
+        # window_seconds, so annotations cannot drift on non-integer
+        # sample counts.
+        bad_block_onsets_s = [
+            float(i) * window_samples / sfreq for i in np.where(bad_blocks)[0]
+        ]
+        # F4: APPEND BAD_BLOCK annotations (never set_annotations over
+        # the existing ones — that would wipe stim events and earlier
+        # BAD_* marks). Done BEFORE the exclusion raise so an excluded
+        # recording still carries its rejection marks. Relative onsets
+        # are seconds from the first data sample; the offset recipe
+        # restores absolute onsets when the annotations carry orig_time.
+        if n_bad > 0:
+            off = (raw.first_time
+                   if raw.annotations.orig_time is not None else 0.0)
+            new_annots = mne.Annotations(
+                onset=np.asarray(bad_block_onsets_s) + off,
+                duration=[window_samples / sfreq] * n_bad,
+                description=["BAD_BLOCK"] * n_bad,
+                orig_time=raw.annotations.orig_time,
+            )
+            raw.set_annotations(raw.annotations + new_annots)
         # R-006: HARD FAIL on > max_rejected_fraction; NO silent truncation
         if fraction > self.max_rejected_fraction:
-            raise ValueError(
-                f"block_rejection: {n_bad}/{n_blocks} blocks "
-                f"({fraction:.2%}) exceed {self.window_seconds}-s "
-                f"threshold; max allowed is "
-                f"{self.max_rejected_fraction:.2%}. The recording "
-                f"FAILS the spec's hard rejection gate."
+            raise RecordingExcluded(
+                "block_rejection_fraction_exceeded",
+                {
+                    "n_blocks_rejected": n_bad,
+                    "n_blocks_total": n_blocks,
+                    "rejected_fraction": fraction,
+                    "max_rejected_fraction": self.max_rejected_fraction,
+                    "bad_block_onsets_s": bad_block_onsets_s,
+                },
             )
-        # Annotate bad blocks
-        from mne import Annotations
-        if n_bad > 0:
-            bad_indices = np.where(bad_blocks)[0]
-            annot_onsets = [float(i) * self.window_seconds
-                            for i in bad_indices]
-            annot_durations = [self.window_seconds] * n_bad
-            annots = Annotations(
-                onset=annot_onsets, duration=annot_durations,
-                description=["BAD_BLOCK"] * n_bad)
-            raw.set_annotations(annots)
         return raw, {
             "applied": True,
             "window_seconds": self.window_seconds,
