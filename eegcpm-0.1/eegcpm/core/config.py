@@ -422,6 +422,19 @@ class SourceConfig(BaseModel):
         description="Parcellation: conn_networks (32 ROIs), aparc (68), schaefer100, etc."
     )
     roi_radius: float = Field(default=10.0, description="ROI extraction radius in mm")
+    roi_radius_midline: float = Field(
+        default=15.0, description="ROI extraction radius in mm for midline ROIs (|x| <= 5 mm)"
+    )
+    roi_radius_overrides: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-ROI extraction radius overrides keyed by ROI full name",
+    )
+    roi_min_vertices: int = Field(
+        default=3, description="Minimum vertices per ROI label; smaller labels raise"
+    )
+    subjects_dir: Optional[Path] = Field(
+        default=None, description="Subjects directory for the source space (default: cached fsaverage)"
+    )
 
     subjects: Any = Field(default="all", description="Subject selection ('all' or list of subject IDs)")
     output: SourceOutputConfig = Field(default_factory=SourceOutputConfig, description="Output options")

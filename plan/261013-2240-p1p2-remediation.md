@@ -645,6 +645,8 @@ module config/condition logic, consumer + CLI entry, detector/interpolate/channe
    `eegcpm`, `mne`, `numpy`, `scipy` versions; `subjects_dir`; BEM filename; spacing; `n_sources`
    (`sum(len(s['vertno']) for s in inv['src'])`); cov method; `cov_rank`; `data_rank`; `n_channels`;
    `lambda2_evoked`/`lambda2_trial`; `method_params`; `nave`; label info (counts, radii, hemi, excluded);
+   `excluded_reasons`; per-ROI flip summary (mean(dots) or flip axis) so silent polarity flips across
+   mne versions/configs are detectable (Opus B2-audit condition 5);
    montage distances; condition bookkeeping (B4); `nave_confound_warning`; `epochs_path` + `epochs_sha256`
    (streamed 1 MiB chunks; path passed by the CLI as `process(..., epochs_path=...)`); `config_hash` =
    sha256 of `json.dumps(cfg.model_dump(mode='json'), sort_keys=True)`.
@@ -895,4 +897,14 @@ renaming hard-coded ROI names; REST API; user management; `_legacy` code (exclud
 1. **Checkpoint A (RPCA):** remove from the ERP chain (a) or validate on ≥5 real HBN recordings (b)? Blocks B6.
 2. **Checkpoint B:** which real EGI-129 subject/session (P0 open item), and where is the data? Blocks B8 step 3.
 3. OK to **delete** the three keyed-dialect YAMLs in `eegcpm-0.1/config/` (B1 task 9), or move them?
-   Default if no answer: delete.
+   Default if no answer: delete. **Resolved 2026-10-14: deleted** (recoverable from git).
+4. **Source-ERP extraction mode (Opus B2 audit escalation, 2026-10-14 — blocks P2 condition 4,
+   not B2):** with a uniform-patch simulation (same dSPM/loose-0.2 pipeline, 40 epochs),
+   `mean_flip` makes the injected ROI dominant in only **11/30** ROIs vs **22/30** for
+   `pca_flip`; midline flip axes are near-tied (|mean(dots)| 0.008–0.21; MPFC lh −0.70 / rh +0.71)
+   and one ROI (`Language.IFG_R`) comes out polarity-inverted under both modes. Mean absolute
+   source energy still ranks the true ROIs first — the loss is cancellation during extraction,
+   not the inverse. Options: (a) keep `mean_flip` and document attenuation + polarity convention,
+   (b) switch to `pca_flip` (still signed), (c) redefine midline ROIs (split by hemisphere or use
+   surface patches instead of spheres). **User decision required before P2 condition 4 is
+   marked verified.**

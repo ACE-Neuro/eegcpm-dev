@@ -141,6 +141,11 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 - [ ] Pass B (Opus 5.5 audit) — verdict + critical findings
 - [ ] Fix confirmed findings; validate with tests
 - [ ] Re-audit changed areas; mark P4 verified
+- [ ] Regenerate connectivity from the B2/B4 source format: `*_roi_tc.npz` is now evoked
+      2-D with 30 ROIs + label metadata keys (`roi_coords_mni/roi_radius_mm/roi_vertex_counts/
+      roi_hemi/excluded_rois`) and trials live in `*_roi_tc_trials.npz` (B4); the old
+      magnitude-based connectivity outputs are invalid (P2-F4) and
+      `modules/connectivity/__init__.py` still treats every non-`_times` npz key as a condition.
 
 ## P5 — End-to-end verification
 
@@ -152,7 +157,14 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 
 - [ ] REST API frontend
 - [ ] User management
-- [ ] Regenerate connectivity outputs (P2 audit: existing magnitude-based PLV/wPLI invalid)
+- [ ] Regenerate connectivity outputs (P2 audit: existing magnitude-based PLV/wPLI invalid).
+      **B2+ live breakage (Opus B2 audit, confirmed 2026-10-14):** `ConnectivityModule`
+      (`modules/connectivity/__init__.py:115-116`) and UI page 11 (`ui/pages/11_connectivity.py:573`)
+      treat the new npz metadata keys as conditions and fail with `IndexError` on every B2+
+      `*_roi_tc.npz`. Loud failure (counted failed), deferred to P4 by deep-auditor decision —
+      fix together with the schema migration (optionally raise an explicit
+      "npz schema v2 unsupported" error instead of the IndexError). Do not half-enable
+      connectivity on evoked 2-D data without the P4 audit.
 
 ---
 
@@ -166,13 +178,17 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | 2026-10-13 | P1 | Opus 5.5 audit (Pass B) | Refuted/de-risked: H13 double ICA harmless (idempotent projector); H16 μ cap immaterial; H19 CLI does not persist COMPLETED | accepted |
 | 2026-10-13 | P2 | Opus 5.5 audit (Pass B) | **BLOCK** — F1 placeholder ROI (confirmed), F2 non-unique ROI names, F3 cerebellar/midline labels, F4 unsigned magnitude destroys ERP polarity, F5 no evoked path/config wiring, F6 consumer broken, F7 √nave amplitude confound | confirmed, fix pending |
 | 2026-10-13 | P2 | Opus 5.5 audit (Pass B) | Refuted: H4 noise covariance (baseline-corrected epochs are correct; switch to `shrunk`); H6 single-shell fallback dead (MNE errors); H14 partially refuted (`force_equal` actually False) | accepted |
+| 2026-10-14 | P2 | Opus 5.5 B2 audit (Pass B) | **revise** — F2 download-on-construction (`__init__` calls `fetch_fsaverage`; ~25 unmarked tests; forward ignores `self.subjects_dir`); new N2/N1 individual-subject source space silently mapped onto fsaverage + label cache not keyed by source space; N3 unknown `radius_overrides` keys silently ignored; F1 connectivity break deferred to P4 by decision (loud IndexError; UI page 11 also affected) | **fixed in rev1 2026-10-14**, awaiting confirmation |
+| 2026-10-14 | P2 | Opus 5.5 B2 audit — **science escalation** | `mean_flip` vs `pca_flip` under uniform-patch injection: 11/30 vs 22/30 dominant; midline flip axes near-tied (0.008–0.21); one ROI polarity-inverted. **Blocks P2 condition 4; user decision required** (plan §12 item 4) | open |
+| 2026-10-14 | P2 | Opus 5.5 B2 re-audit + K3 confirm | **CF-1 fixed**: label cache key now includes the source-space subject (a cache hit previously skipped the N2 subject guard — a scaled template with equal `vertno` silently reused fsaverage labels); regression test added and empirically probed non-vacuous. B2 verified; accepted residuals: trial path untested until B4/B5, connectivity IndexError until P4, single-shell BEM until B5, `fetch_fsaverage` config side-effect recorded for B5 provenance | closed |
+| 2026-10-14 | — | Validator wording note | The 2 "connectivity P4 failures" are `mne_connectivity`-missing import failures; the deferred npz-schema `IndexError` breakage (P4 backlog) is not exercised by the suite | noted |
 
 ## Remediation batches — `plan/261013-2240-p1p2-remediation.md`
 
 | Batch | Scope | Status |
 |---|---|---|
 | **B1** | Executor fail-fast + exclusion + dependency preflight + one preprocessing schema + status persistence (P1-F1, F4, F6, F9 blanket-except only, F17 ImportError only) | `[x]` **verified 2026-10-14** — Opus rev2 approval, no conditions left (residuals → B3/B6) |
-| B2 | Source-ERP core: anatomical labels, unique names, geometry, signed output + dipole ground truth | `[ ]` not started |
+| B2 | Source-ERP core: anatomical labels, unique names, geometry, signed output + dipole ground truth | `[x]` **verified 2026-10-14** — Opus conditions met (F2/N1/N2/N3 + CF-1 fixed, K3-confirmed) |
 | B3 | Timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper metadata | `[ ]` not started |
 | B4 | Source usability + config wiring + P1 bad-channel detector | `[ ]` not started |
 | B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[ ]` not started |
@@ -200,14 +216,53 @@ promote one shared stem helper in B3/B6. (2) An excluded run that later crashes 
 `processing_state failed` beside an `_EXCLUDED.json` — labelling only, never a false success.
 (3) `aggregate_reports`/`cli/epochs.py` call-site swaps lack dedicated tests (simple swaps, read-verified).
 
+B2 evidence (2026-10-14, working tree on `remediation/p1p2`, not committed): targeted validation
+`pytest tests/unit/test_conn_rois.py tests/unit/test_source.py tests/unit/test_source_labels.py
+tests/unit/test_source_dipole_groundtruth.py tests/unit/test_connectivity.py` → **73 passed /
+2 skipped / 2 failed** (only the 2 connectivity P4 baseline failures); full standard suite →
+**3 failed / 540 passed / 2 skipped** (2 connectivity P4 + 1 robust_pca B6; all 9 previously
+failing `test_source.py` tests now pass, 2 specparam collection errors ignored as documented).
+Greps: `grep -n "i % \|% stc.data\|roi_idx %" eegcpm/modules/source/__init__.py` → empty;
+every `pick_ori` call is `'normal'`. Dipole ground truth (fsaverage cached, oct6, dSPM, seeds
+0/1): target `SensoriMotor.Superior` has the largest max|tc| in 0.05–0.25 s (178.0 vs next
+114.9 = `DefaultMode.PCC`), `corr(tc_target, w) = 1.0000`, N1 extremum negative at 0.1000 s
+(±0 samples), same sign for both seeds, `tc.min() < 0`, min vertex count 12, Cerebellar
+excluded, names unique — assertion (1) **passed, no triage needed** (FEF leakage baseline
+34.96 mm recorded in the test). Probes: `build_conn_labels` at oct6 = 30 labels / 12–104
+vertices; most isolated ROI = `DefaultMode.MPFC` (44.07 mm). Re-audit scope: `conn_rois.py`,
+`modules/source/labels.py`, `modules/source/__init__.py` extraction/inversion,
+`pipeline/base.py` EpochsModule, `source_qc.py` parsing, the two new test files + `conftest.py`.
+Follow-up recorded for **P4**: `*_roi_tc.npz` now always contains
+`roi_coords_mni/roi_radius_mm/roi_vertex_counts/roi_hemi/excluded_rois`, and the evoked file is
+2-D with 30 ROIs while trials move to a separate file in B4 — `cli/connectivity.py` /
+`modules/connectivity/__init__.py` still glob `*_roi_tc.npz` and treat every non-`_times` key as
+a condition, so connectivity outputs must be regenerated (backlog, out of B2 scope).
+
+B2 rev1 evidence (2026-10-14; **B2 verified 2026-10-14**): F2 — construction no longer calls
+`fetch_fsaverage`; the new `subjects_dir` property resolves it on first use and caches it, and
+`_get_conn_labels` + `_get_template_forward` both use it (one fsaverage copy); N1 — the label cache
+is keyed on the source-space subject + vertno arrays and rebuilds on change (reused module across
+subjects stays legal; N2 still rejects individual-subject spaces, now also on cache hits — **CF-1**);
+N2 — `build_conn_labels` raises `ValueError` when `src._subject != subject`; N3 — unknown
+`radius_overrides` keys raise `ValueError` (excluded-ROI overrides stay valid); the EEG pick in
+`process()` moved inside the `try` (all-bad channels → `success=False`). Targeted B2 command →
+**81 passed / 2 skipped / 2 failed** (only the 2 `mne_connectivity`-missing baseline failures);
+full standard suite → **3 failed / 548 passed / 2 skipped** (2 connectivity + 1 robust_pca B6);
+dipole ground truth unchanged (seed 0: 178.0 vs 114.9 next-ROI, `corr = 1.0000`, N1 −178.0 at
+0.1000 s, min vertex count 12, Cerebellar excluded). Opus scoped re-audit found **CF-1** (cache hit
+skipped the subject guard) → fixed with a regression test (empirically probed non-vacuous) →
+K3 confirmation pass: `confirm-with-notes` (cosmetic annotation fixed).
+
 ## Next actions (queue)
 
 - [x] Batch 0 — environment, skill, AGENTS.md, audit brief (done 2026-10-13)
 - [x] Remediation plan (Opus 5.5): `plan/261013-2240-p1p2-remediation.md` — 8 batches
-- [x] Plan critique (Sonnet 4.6): verdict `revise` → all 14 findings patched into the plan
+- [x] Plan critique (Sonnet 5): verdict `revise` → all 14 findings patched into the plan
       (parity-harness compatibility, non-vacuous crosstalk recipe/test, covariance estimator moved
       to B2, dipole leakage distance corrected to 34.96 mm, avg-ref projector preservation note,
-      `modules/qc` added to the no-silent-except gate, plus minor clarifications)
+      `modules/qc` added to the no-silent-except gate, plus minor clarifications); delta
+      re-critique (Sonnet 5.5) `accept-with-fixes` → 4 residual items patched (B2 covariance
+      ordering, dipole triage protocol, crosstalk cross-check, precedence rule)
 - [ ] **User checkpoints before implementation:** (A) RPCA gate decision (blocks B6 only);
       (B) real EGI-129 subject/session + data path (blocks B8); (C) confirm deletion of 3 stale
       keyed-dialect YAMLs (blocks B1 task 9; default = delete) — **resolved 2026-10-14: the
@@ -215,5 +270,10 @@ promote one shared stem helper in B3/B6. (2) An excluded run that later crashes 
       in `tests/unit/test_preprocessing_schema.py`**
 - [ ] Implementation batches B1…B8 (DeepSeek V4.1 Flash `#max`): per batch → builder-validator →
       K3 pre-audit → Opus 5.5 final audit on milestone batches (B1, B2, B4, B6, B7) and whenever
-      K3 flags a blocker. **Start with B1.** → B1 implemented 2026-10-14, awaiting audit
+      K3 flags a blocker. → **B1 verified 2026-10-14; B2 verified 2026-10-14. Next: B3
+      (timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper
+      metadata) — ready to start.**
+- [ ] **Science decision before P2 condition 4:** `mean_flip` vs `pca_flip` (plan §12 item 4;
+      11/30 vs 22/30 dominance under uniform-patch injection, midline polarity near-ties) — does
+      not block B3–B8.
 - [ ] Real-subject end-to-end verification (Checkpoint B artifacts → `planning/audits/`)

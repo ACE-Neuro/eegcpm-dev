@@ -57,12 +57,17 @@ class SourceQC(BaseQC):
         if isinstance(roi_names, np.ndarray):
             roi_names = list(roi_names)
 
-        # Find condition keys (exclude metadata keys)
-        metadata_keys = {'roi_names', 'roi_coords_mni', 'roi_radius_mm', 'roi_vertex_counts', 'sfreq'}
+        # Find condition keys (exclude metadata keys; B2 added roi_hemi/excluded_rois
+        # and B4 adds per-condition {cond}_nave keys)
+        metadata_keys = {
+            'roi_names', 'roi_coords_mni', 'roi_radius_mm', 'roi_vertex_counts',
+            'roi_hemi', 'excluded_rois', 'sfreq',
+        }
         condition_keys = []
         for key in roi_data.keys():
-            if key not in metadata_keys and not key.endswith('_times'):
-                condition_keys.append(key)
+            if key in metadata_keys or key.endswith('_times') or key.endswith('_nave'):
+                continue
+            condition_keys.append(key)
 
         candidate_conditions = sorted(condition_keys)
         times = {}
@@ -427,7 +432,7 @@ class SourceQC(BaseQC):
     def _plot_network_summary(self, parsed: Dict[str, Any]) -> Optional[plt.Figure]:
         """Plot network activation summary for CONN parcellation."""
         # CONN network definitions (short names from parcellation)
-        # ROI names in data are like "DefaultMode.MPFC", "SensoriMotor.Lateral", etc.
+        # ROI names in data are like "DefaultMode.MPFC", "SensoriMotor.Lateral_L", etc.
         networks = {
             'DefaultMode': ['MPFC', 'LP', 'PCC'],
             'SensoriMotor': ['Lateral', 'Superior'],
@@ -447,8 +452,8 @@ class SourceQC(BaseQC):
             return None
 
         # Calculate average signal per network across conditions. Use the network
-        # prefix in names like "DefaultMode.LP" so duplicated L/R ROI names are
-        # both included instead of overwritten in a short-name lookup.
+        # prefix in names like "DefaultMode.LP_L" so both hemisphere ROIs are
+        # included instead of overwritten in a short-name lookup.
         network_powers = {}
         for network_name in networks:
             powers = []
@@ -521,23 +526,9 @@ class SourceQC(BaseQC):
         # Get sampling rate from kwargs
         sfreq = kwargs.get('sfreq', 500.0)
 
-        # Add laterality labels (L/R) to ROI names
-        # ROIs are stored with duplicates representing left/right hemispheres
-        display_names = []
-        roi_counts = {}
-        for name in roi_names:
-            if name in roi_counts:
-                # Second occurrence - add R suffix
-                display_names.append(f"{name}.R")
-                roi_counts[name] += 1
-            else:
-                # First occurrence - check if there will be a duplicate
-                if list(roi_names).count(name) > 1:
-                    display_names.append(f"{name}.L")
-                else:
-                    # Midline ROI - no laterality
-                    display_names.append(name)
-                roi_counts[name] = 1
+        # ROI names are already unique (e.g. "DefaultMode.LP_L" / "DefaultMode.LP_R";
+        # P2-F2), so display them as stored — no L/R guessing from list order.
+        display_names = list(roi_names)
 
         n_rois = len(roi_names)
 
@@ -704,23 +695,9 @@ class SourceQC(BaseQC):
 
         roi_timeseries = np.array(roi_timeseries)  # (n_rois, n_times_total)
 
-        # Add laterality labels (L/R) to ROI names
-        # ROIs are stored with duplicates representing left/right hemispheres
-        display_names = []
-        roi_counts = {}
-        for name in roi_names:
-            if name in roi_counts:
-                # Second occurrence - add R suffix
-                display_names.append(f"{name}.R")
-                roi_counts[name] += 1
-            else:
-                # First occurrence - check if there will be a duplicate
-                if list(roi_names).count(name) > 1:
-                    display_names.append(f"{name}.L")
-                else:
-                    # Midline ROI - no laterality
-                    display_names.append(name)
-                roi_counts[name] = 1
+        # ROI names are already unique (e.g. "DefaultMode.LP_L" / "DefaultMode.LP_R";
+        # P2-F2), so display them as stored — no L/R guessing from list order.
+        display_names = list(roi_names)
 
         # Show ALL consecutive overlapping windows
         # Use 3 columns for larger matrices with readable labels

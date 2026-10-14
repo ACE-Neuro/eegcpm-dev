@@ -11,6 +11,17 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+# Midline ROIs (|x| <= MIDLINE_X_MM in MNI space) are extracted bilaterally with
+# a larger radius because their centres fall between the two hemispheres (P2-F3).
+MIDLINE_X_MM = 5.0
+
+# Networks that cannot be sampled from a cortical surface source space. Cerebellar
+# ROIs have no fsaverage surface vertices within the ROI radius (P2-F3); they are
+# excluded from extraction and reported in the per-run ROI metadata.
+SOURCE_EXCLUDED_NETWORKS: Dict[str, str] = {
+    "Cerebellar": "no cortical surface source-space vertices within radius (fsaverage)",
+}
+
 
 @dataclass
 class ROI:
@@ -22,7 +33,15 @@ class ROI:
 
     @property
     def full_name(self) -> str:
+        """Unique ROI key: hemisphere suffix only for lateral ROIs (P2-F2)."""
+        if self.hemisphere:
+            return f"{self.network}.{self.name}_{self.hemisphere}"
         return f"{self.network}.{self.name}"
+
+    @property
+    def is_midline(self) -> bool:
+        """True when the ROI centre is within ``MIDLINE_X_MM`` of the midline."""
+        return abs(self.mni_coords[0]) <= MIDLINE_X_MM
 
 
 # CONN Network ROIs - 32 nodes across 8 networks
@@ -97,6 +116,15 @@ def get_conn_rois() -> List[ROI]:
 def get_roi_names() -> List[str]:
     """Get list of ROI full names in order."""
     return [roi.full_name for roi in CONN_ROIS]
+
+
+# P2-F2: 32 ROI definitions collapse to 20 unique names without a hemisphere suffix,
+# which silently overwrote left/right time courses. Enforce uniqueness at import time.
+_ROI_NAMES = get_roi_names()
+assert len(_ROI_NAMES) == len(set(_ROI_NAMES)), (
+    "CONN ROI full names must be unique; duplicates: "
+    f"{sorted({n for n in _ROI_NAMES if _ROI_NAMES.count(n) > 1})}"
+)
 
 
 def get_roi_by_name(name: str) -> Optional[ROI]:

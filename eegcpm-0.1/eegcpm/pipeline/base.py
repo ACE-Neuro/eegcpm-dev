@@ -146,8 +146,10 @@ class EpochsModule(BaseModule):
     """Base class for modules that process Epochs."""
 
     def validate_input(self, data: Any) -> bool:
-        if not isinstance(data, mne.Epochs):
-            raise ValueError(f"Expected mne.Epochs, got {type(data)}")
+        # read_epochs() returns EpochsFIF, which is not an instance of mne.Epochs
+        # (P2-F13); mne.BaseEpochs covers Epochs, EpochsArray, EpochsFIF.
+        if not isinstance(data, mne.BaseEpochs):
+            raise ValueError(f"Expected mne.Epochs (mne.BaseEpochs), got {type(data)}")
         return True
 
 

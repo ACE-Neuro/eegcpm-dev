@@ -102,3 +102,8 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --cov=eegcpm --cov-report=term-missing"
+markers = [
+    "slow: >30 s",
+    "fsaverage: needs cached fsaverage",
+    "chain_e2e: full hbn_langer chain",
+]

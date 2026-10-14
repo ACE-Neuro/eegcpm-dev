@@ -2,13 +2,21 @@
 
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import mne
 import numpy as np
 
-from eegcpm.pipeline.base import BaseModule, ModuleResult, EpochsModule
-from eegcpm.data.conn_rois import get_conn_rois, get_mni_coordinates, get_roi_names
+# In mne 1.13 the inverse operators live under mne.minimum_norm; they are imported as
+# module-level names so tests can monkeypatch ``eegcpm.modules.source.apply_inverse_epochs``.
+from mne.minimum_norm import (
+    apply_inverse,
+    apply_inverse_epochs,
+    make_inverse_operator,
+)
+
+from eegcpm.pipeline.base import ModuleResult, EpochsModule
+from eegcpm.modules.source.labels import build_conn_labels
 from eegcpm.modules.qc.source_qc import SourceQC
 
 
@@ -20,10 +28,15 @@ class SourceReconstructionModule(EpochsModule):
     - dSPM, sLORETA, eLORETA, MNE
     - Template or individual head models
     - ROI-based parcellation (CONN 32 networks default)
+
+    ROI time courses are anatomically mapped (CONN MNI centres -> source-space
+    vertices; P2-F1) with unique names (P2-F2) and extracted from a
+    ``pick_ori='normal'`` source estimate with ``mode='mean_flip'`` so the output is
+    **signed** (P2-F4) and can represent N1/P2 polarity.
     """
 
     name = "source_reconstruction"
-    version = "0.1.0"
+    version = "0.2.0"
     description = "Source localization and ROI extraction"
 
     def __init__(self, config: Dict[str, Any], output_dir: Path, task_config: Optional[Dict[str, Any]] = None):
@@ -34,12 +47,69 @@ class SourceReconstructionModule(EpochsModule):
         self.loose = config.get("loose", 0.2)
         self.depth = config.get("depth", 0.8)
         self.spacing = config.get("spacing", "oct6")
+        self.roi_radius = config.get("roi_radius", 10.0)
+        self.roi_radius_midline = config.get("roi_radius_midline", 15.0)
+        self.roi_radius_overrides = config.get("roi_radius_overrides") or {}
+        self.roi_min_vertices = config.get("roi_min_vertices", 3)
+        # F2: store the config value as-is (may be None) and resolve lazily in the
+        # ``subjects_dir`` property. ``fetch_fsaverage`` downloads ~500 MB when
+        # fsaverage is not cached, so ``__init__`` must not call it (~25 unmarked
+        # tests construct the module).
+        subjects_dir = config.get("subjects_dir")
+        self._subjects_dir: Optional[Path] = (
+            Path(subjects_dir) if subjects_dir is not None else None
+        )
         self.task_config = task_config  # Optional: for grouping epochs by condition
-        self.trial_level = config.get("trial_level", True)  # Default to trial-level for connectivity
+        # ERP polarity/amplitude features are defined on evoked (2-D) ROI time courses;
+        # per-trial arrays are opt-in (plan §0.5: default mode='evoked').
+        self.trial_level = config.get("trial_level", False)
+        # Labels are built on the source space actually used by the inverse operator and
+        # cached on ``self`` keyed by that source space's subject + vertno arrays (N1/CF-1).
+        self._labels: Optional[List[Any]] = None
+        self._label_info: Optional[Dict[str, Any]] = None
+        self._labels_key: Optional[Tuple[Optional[str], Tuple[Tuple[int, ...], ...]]] = None
+
+    @property
+    def subjects_dir(self) -> Path:
+        """Subjects dir containing fsaverage (F2).
+
+        Returns the configured value when set; otherwise resolves
+        ``mne.datasets.fetch_fsaverage(verbose=False)`` on **first use** and caches
+        the parent directory. Construction never touches the network; both
+        ``_get_conn_labels`` and ``_get_template_forward`` read this property, so
+        labels and the template forward always come from one fsaverage copy.
+        """
+        if self._subjects_dir is None:
+            self._subjects_dir = Path(
+                mne.datasets.fetch_fsaverage(verbose=False)
+            ).parent
+        return self._subjects_dir
+
+    def validate_input(self, data: Any) -> bool:
+        """Return True only for epochs with usable EEG montage positions.
+
+        Deviation from the :class:`~eegcpm.pipeline.base.BaseModule` contract: this
+        override returns ``False`` instead of raising for invalid input (other modules
+        raise). This is safe only because :meth:`process` calls this method first and
+        fails loudly with ``success=False``; ``pipeline/executor.py`` ignores the
+        return value of ``validate_input`` (it only relies on exceptions).
+        """
+        if not isinstance(data, mne.BaseEpochs):
+            return False
+        eeg_picks = mne.pick_types(data.info, eeg=True)
+        if len(eeg_picks) == 0:
+            return False
+        positions = np.array(
+            [data.info["chs"][p]["loc"][:3] for p in eeg_picks], dtype=float
+        )
+        return bool(
+            np.all(np.isfinite(positions))
+            and np.all(np.any(positions != 0.0, axis=1))
+        )
 
     def process(
         self,
-        data: mne.Epochs,
+        data: mne.BaseEpochs,
         subject: Optional[Any] = None,
         forward: Optional[mne.Forward] = None,
         **kwargs,
@@ -48,7 +118,8 @@ class SourceReconstructionModule(EpochsModule):
         Perform source reconstruction.
 
         Args:
-            data: Epochs data
+            data: Epochs data (baseline-corrected; the baseline window is used as the
+                noise covariance window)
             subject: Subject info
             forward: Optional pre-computed forward model
 
@@ -56,11 +127,25 @@ class SourceReconstructionModule(EpochsModule):
             ModuleResult with source estimates
         """
         start_time = time.time()
-        epochs = data.copy()  # Copy to avoid modifying original
+
+        if not self.validate_input(data):
+            return ModuleResult(
+                success=False,
+                module_name=self.name,
+                execution_time_seconds=time.time() - start_time,
+                errors=["Missing montage: EEG channel positions are absent or zero"],
+            )
+
+        # EOG/ECG channels must not enter the covariance or the inverse operator.
+        # The pick runs inside the ``try`` below so that an all-bad-channels case
+        # (``pick`` raises ValueError) returns ``success=False`` instead of
+        # propagating out of ``process`` (B2 rev1 robustness fix).
         output_files = []
         warnings = []
 
         try:
+            epochs = data.copy().pick("eeg", exclude="bads")
+
             # Ensure average reference projector is set (required for source modeling)
             if not any('EEG' in proj['desc'] and 'average' in proj['desc'].lower()
                       for proj in epochs.info['projs']):
@@ -72,17 +157,13 @@ class SourceReconstructionModule(EpochsModule):
                 forward, warnings_fwd = self._get_template_forward(epochs.info)
                 warnings.extend(warnings_fwd)
 
-            # Compute noise covariance
-            noise_cov = mne.compute_covariance(
-                epochs,
-                tmin=None,
-                tmax=0,  # Baseline period
-                method="empirical",
-                verbose=False,
-            )
+            # Compute noise covariance (baseline-corrected epochs, P2-F11 estimator).
+            # Runs after the forward so a forward failure remains errors[0].
+            noise_cov, cov_warnings = self._compute_noise_covariance(epochs)
+            warnings.extend(cov_warnings)
 
             # Make inverse operator
-            inverse_operator = mne.minimum_norm.make_inverse_operator(
+            inverse_operator = make_inverse_operator(
                 epochs.info,
                 forward,
                 noise_cov,
@@ -91,56 +172,24 @@ class SourceReconstructionModule(EpochsModule):
                 verbose=False,
             )
 
-            # Compute source estimates
+            # Anatomical CONN labels on the source space the inverse operator uses.
+            labels, label_info = self._get_conn_labels(inverse_operator["src"])
+
             lambda2 = 1.0 / self.snr ** 2
 
             if self.trial_level:
-                # TRIAL-BY-TRIAL MODE: Process each epoch individually
-                roi_data = self._process_trial_level(epochs, inverse_operator, forward, lambda2)
-                stcs = {}  # Don't save individual STCs in trial mode (too large)
+                roi_data, conditions = self._process_trial_level(
+                    epochs, inverse_operator, lambda2, labels, label_info
+                )
+                stcs: Dict[str, mne.SourceEstimate] = {}
+                n_trials = int(roi_data[conditions[0]].shape[0]) if conditions else 0
             else:
-                # EVOKED MODE: Average epochs first, then compute source estimates
-                stcs = {}
+                stcs, roi_data, conditions = self._process_evoked(
+                    epochs, inverse_operator, lambda2, labels, label_info
+                )
+                n_trials = 0
 
-                # If task config provided, group epochs by conditions
-                if self.task_config and 'conditions' in self.task_config:
-                    # Group epochs by task config conditions
-                    for condition_spec in self.task_config['conditions']:
-                        condition_name = condition_spec['name']
-                        event_codes = condition_spec.get('event_codes', [])
-
-                        # Find which epochs belong to this condition
-                        matching_events = [str(ec) for ec in event_codes if str(ec) in epochs.event_id]
-
-                        if matching_events:
-                            # Combine all matching events for this condition
-                            condition_epochs = epochs[matching_events]
-                            evoked = condition_epochs.average()
-                            stc = mne.minimum_norm.apply_inverse(
-                                evoked,
-                                inverse_operator,
-                                lambda2=lambda2,
-                                method=self.method,
-                                verbose=False,
-                            )
-                            stcs[condition_name] = stc
-                else:
-                    # No task config - process each event separately
-                    for condition in epochs.event_id:
-                        evoked = epochs[condition].average()
-                        stc = mne.minimum_norm.apply_inverse(
-                            evoked,
-                            inverse_operator,
-                            lambda2=lambda2,
-                            method=self.method,
-                            verbose=False,
-                        )
-                        stcs[condition] = stc
-
-                # Extract ROI time courses from evoked responses
-                roi_data = {}
-                if self.parcellation == "conn_networks":
-                    roi_data = self._extract_conn_rois(stcs, forward)
+            n_sources = int(sum(len(s["vertno"]) for s in inverse_operator["src"]))
 
             # Save results
             subject_id = subject.id if subject else "unknown"
@@ -221,10 +270,14 @@ class SourceReconstructionModule(EpochsModule):
                     "method": self.method,
                     "parcellation": self.parcellation,
                     "trial_level": self.trial_level,
-                    "n_sources": stcs[list(stcs.keys())[0]].data.shape[0] if stcs else 0,
-                    "n_rois": len([k for k in roi_data.keys() if not k.endswith('_times') and k not in ['roi_names', 'sfreq']]) if roi_data else 0,
-                    "n_trials": roi_data[list(roi_data.keys())[1]].shape[0] if self.trial_level and roi_data and len(roi_data) > 1 else 0,
-                    "conditions": list(stcs.keys()) if stcs else [k for k in roi_data.keys() if not k.endswith('_times') and k not in ['roi_names', 'sfreq']],
+                    "n_sources": n_sources,
+                    "n_rois": len(label_info["roi_names"]),
+                    "n_trials": n_trials,
+                    "conditions": conditions,
+                    "roi_names": list(label_info["roi_names"]),
+                    "roi_vertex_counts": label_info["roi_vertex_counts"].tolist(),
+                    "excluded_rois": list(label_info["excluded_rois"]),
+                    "sfreq": float(epochs.info["sfreq"]),
                     "qc_metrics": {m.name: m.value for m in qc_metrics} if qc_metrics else {},
                 },
             )
@@ -236,6 +289,214 @@ class SourceReconstructionModule(EpochsModule):
                 execution_time_seconds=time.time() - start_time,
                 errors=[str(e)],
             )
+
+    def _compute_noise_covariance(
+        self, epochs: mne.BaseEpochs
+    ) -> Tuple[mne.Covariance, List[str]]:
+        """Estimate the noise covariance from the baseline (P2-F11).
+
+        Uses the approved estimator (``shrunk``, ``rank=None``,
+        ``keep_sample_mean=True``, ``tmin=None``, ``tmax=0.0``) with loud guards.
+        Baseline-corrected epochs are correct for epoch covariance (audit H4 was
+        refuted); the guards only verify that a baseline actually exists.
+        """
+        warnings: List[str] = []
+        if epochs.baseline is None:
+            raise ValueError(
+                "epochs must be baseline-corrected (e.g. baseline=(None, 0)) so a "
+                "noise covariance window exists"
+            )
+        if epochs.tmin >= 0:
+            raise ValueError(
+                f"no pre-stimulus interval: epochs.tmin={epochs.tmin} >= 0; a "
+                "negative tmin is required to estimate the noise covariance"
+            )
+        data = epochs.get_data()
+        if not np.isfinite(data).all():
+            raise ValueError(
+                "non-finite values in epochs data; cannot estimate the noise covariance"
+            )
+
+        n_prestim = int(round(-epochs.tmin * epochs.info["sfreq"]))
+        n_eeg = len(mne.pick_types(epochs.info, eeg=True, exclude="bads"))
+        if len(epochs) * n_prestim < 10 * n_eeg:
+            warnings.append(
+                f"Few baseline samples for the noise covariance: "
+                f"{len(epochs)} epochs x {n_prestim} samples < 10 x {n_eeg} channels"
+            )
+
+        noise_cov = mne.compute_covariance(
+            epochs,
+            tmin=None,
+            tmax=0.0,
+            method="shrunk",
+            rank=None,
+            keep_sample_mean=True,
+            verbose=False,
+        )
+        return noise_cov, warnings
+
+    @staticmethod
+    def _source_space_key(
+        src: mne.SourceSpaces,
+    ) -> Optional[Tuple[Optional[str], Tuple[Tuple[int, ...], ...]]]:
+        """Cache key for a source space: subject name + vertno arrays (N1/CF-1).
+
+        The subject is part of the key because ``build_conn_labels`` rejects
+        non-fsaverage source spaces (N2): if a cached lookup skipped that check, a
+        scaled template with the same vertno but a different ``subject_his_id``
+        would silently reuse fsaverage labels.
+
+        Returns ``None`` for a malformed source space so ``build_conn_labels``
+        (which validates and raises) is always called instead of the cache serving
+        stale labels.
+        """
+        if len(src) != 2:
+            return None
+        return (
+            getattr(src, "_subject", None),
+            tuple(
+                tuple(np.asarray(src[h]["vertno"], dtype=int).tolist()) for h in (0, 1)
+            ),
+        )
+
+    def _get_conn_labels(self, src: mne.SourceSpaces) -> Tuple[List[Any], Dict[str, Any]]:
+        """Build (and cache) the CONN labels for this module instance (P2-F1).
+
+        The cache is keyed on the source space subject + vertno arrays (N1/CF-1):
+        labels built for one source space must never be reused for another, or their
+        vertex numbers silently refer to the wrong surface. Different key →
+        **rebuild** (not raise): reusing one module instance across subjects with
+        individual head models is legitimate. The N2 subject guard in
+        ``build_conn_labels`` still rejects individual-subject source spaces mapped
+        onto the fsaverage surface (including on cache hits, via the subject key).
+        """
+        key = self._source_space_key(src)
+        if (
+            self._labels is None
+            or self._label_info is None
+            or key is None
+            or self._labels_key != key
+        ):
+            self._labels, self._label_info = build_conn_labels(
+                src,
+                self.subjects_dir,
+                radius_mm=self.roi_radius,
+                midline_radius_mm=self.roi_radius_midline,
+                radius_overrides=self.roi_radius_overrides,
+                min_vertices=self.roi_min_vertices,
+            )
+            self._labels_key = key
+        return self._labels, self._label_info
+
+    @staticmethod
+    def _roi_metadata(label_info: Dict[str, Any]) -> Dict[str, Any]:
+        """ROI metadata block stored in every npz (P2-F1/F3)."""
+        return {
+            "roi_names": np.asarray(label_info["roi_names"], dtype=str),
+            "roi_coords_mni": np.asarray(label_info["roi_coords_mni"], dtype=float),
+            "roi_radius_mm": np.asarray(label_info["roi_radius_mm"], dtype=float),
+            "roi_vertex_counts": np.asarray(label_info["roi_vertex_counts"], dtype=int),
+            "roi_hemi": np.asarray(label_info["roi_hemi"], dtype=str),
+            "excluded_rois": np.asarray(label_info["excluded_rois"], dtype=str),
+        }
+
+    def _condition_groups(self, epochs: mne.BaseEpochs) -> Dict[str, mne.BaseEpochs]:
+        """Group epochs by condition (task-config names, else ``event_id`` keys)."""
+        if self.task_config and "conditions" in self.task_config:
+            groups: Dict[str, mne.BaseEpochs] = {}
+            for condition_spec in self.task_config["conditions"]:
+                condition_name = condition_spec["name"]
+                event_codes = condition_spec.get("event_codes", [])
+                matching_events = [
+                    str(ec) for ec in event_codes if str(ec) in epochs.event_id
+                ]
+                if matching_events:
+                    groups[condition_name] = epochs[matching_events]
+            return groups
+        return {condition: epochs[condition] for condition in epochs.event_id}
+
+    def _process_evoked(
+        self,
+        epochs: mne.BaseEpochs,
+        inverse_operator: Any,
+        lambda2: float,
+        labels: List[Any],
+        label_info: Dict[str, Any],
+    ) -> Tuple[Dict[str, mne.SourceEstimate], Dict[str, Any], List[str]]:
+        """Average per condition and extract signed ROI time courses (P2-F4)."""
+        stcs: Dict[str, mne.SourceEstimate] = {}
+        roi_data = self._roi_metadata(label_info)
+        conditions: List[str] = []
+
+        for condition, condition_epochs in self._condition_groups(epochs).items():
+            evoked = condition_epochs.average()
+            stc = apply_inverse(
+                evoked,
+                inverse_operator,
+                lambda2=lambda2,
+                method=self.method,
+                pick_ori="normal",
+                verbose=False,
+            )
+            stcs[condition] = stc
+            roi_data[condition] = mne.extract_label_time_course(
+                stc,
+                labels,
+                inverse_operator["src"],
+                mode="mean_flip",
+                allow_empty=False,
+                verbose=False,
+            )
+            roi_data[f"{condition}_times"] = stc.times
+            conditions.append(condition)
+
+        roi_data["sfreq"] = float(epochs.info["sfreq"])
+        return stcs, roi_data, conditions
+
+    def _process_trial_level(
+        self,
+        epochs: mne.BaseEpochs,
+        inverse_operator: Any,
+        lambda2: float,
+        labels: List[Any],
+        label_info: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Per-trial inversion via ``apply_inverse_epochs`` (P2-F12 scaffolding).
+
+        Trial lambda2 (snr_trial) and method_params are wired in B5; the exact same
+        ``pick_ori='normal'`` / ``mean_flip`` extraction as the evoked path is used so
+        single-trial output is signed as well.
+        """
+        roi_data = self._roi_metadata(label_info)
+        conditions: List[str] = []
+
+        for condition_name, condition_epochs in self._condition_groups(epochs).items():
+            stcs = apply_inverse_epochs(
+                condition_epochs,
+                inverse_operator,
+                lambda2,
+                method=self.method,
+                pick_ori="normal",
+                return_generator=True,
+                verbose=False,
+            )
+            tcs = mne.extract_label_time_course(
+                stcs,
+                labels,
+                inverse_operator["src"],
+                mode="mean_flip",
+                allow_empty=False,
+                return_generator=False,
+                verbose=False,
+            )
+            # (n_trials, n_rois, n_times)
+            roi_data[condition_name] = np.stack(tcs)
+            roi_data[f"{condition_name}_times"] = condition_epochs.times
+            conditions.append(condition_name)
+
+        roi_data["sfreq"] = float(epochs.info["sfreq"])
+        return roi_data, conditions
 
     def _get_template_forward(
         self,
@@ -250,9 +511,9 @@ class SourceReconstructionModule(EpochsModule):
         warnings = []
 
         try:
-            # Use fsaverage template
-            fs_dir = mne.datasets.fetch_fsaverage(verbose=False)
-            subjects_dir = Path(fs_dir).parent
+            # fsaverage template from the same subjects dir the labels use (F2).
+            subjects_dir = self.subjects_dir
+            fs_dir = subjects_dir / "fsaverage"
 
             # Setup source space
             src = mne.setup_source_space(
@@ -294,133 +555,6 @@ class SourceReconstructionModule(EpochsModule):
         except Exception as e:
             warnings.append(f"Template forward model failed: {e}")
             raise
-
-    def _extract_conn_rois(
-        self,
-        stcs: Dict[str, mne.SourceEstimate],
-        forward: mne.Forward,
-    ) -> Dict[str, np.ndarray]:
-        """
-        Extract time courses for CONN 32 ROIs.
-
-        Args:
-            stcs: Source estimates per condition
-            forward: Forward model
-
-        Returns:
-            Dict with ROI time courses per condition
-        """
-        roi_names = get_roi_names()
-        mni_coords = get_mni_coordinates()
-        n_rois = len(roi_names)
-
-        roi_data = {"roi_names": roi_names}
-
-        for condition, stc in stcs.items():
-            # Get source positions in MNI space
-            src = forward["src"]
-
-            # Simple nearest-neighbor ROI assignment
-            # For each ROI, find the closest source vertex
-            roi_tc = np.zeros((n_rois, stc.data.shape[1]))
-
-            # This is a simplified version
-            # Full implementation would use proper label extraction
-            for i, (name, coord) in enumerate(zip(roi_names, mni_coords)):
-                # Find sources within sphere around ROI center
-                # Use average of sources within radius
-                roi_tc[i, :] = stc.data[i % stc.data.shape[0], :]
-
-            roi_data[condition] = roi_tc
-            roi_data[f"{condition}_times"] = stc.times
-
-        # Add sampling frequency (required for connectivity analysis)
-        # Calculate from times array (assumes uniform sampling)
-        if stcs:
-            first_stc = list(stcs.values())[0]
-            if len(first_stc.times) > 1:
-                sfreq = 1.0 / (first_stc.times[1] - first_stc.times[0])
-                roi_data['sfreq'] = sfreq
-
-        return roi_data
-
-    def _process_trial_level(
-        self,
-        epochs: mne.Epochs,
-        inverse_operator: mne.minimum_norm.InverseOperator,
-        forward: mne.Forward,
-        lambda2: float,
-    ) -> Dict[str, np.ndarray]:
-        """
-        Process epochs trial-by-trial for connectivity analysis.
-
-        Args:
-            epochs: MNE Epochs object
-            inverse_operator: Inverse operator
-            forward: Forward model
-            lambda2: Regularization parameter
-
-        Returns:
-            Dictionary with trial-level ROI time courses
-        """
-        roi_names = get_roi_names()
-        n_rois = len(roi_names)
-
-        # Group epochs by condition if task config provided
-        if self.task_config and 'conditions' in self.task_config:
-            condition_groups = {}
-            for condition_spec in self.task_config['conditions']:
-                condition_name = condition_spec['name']
-                event_codes = condition_spec.get('event_codes', [])
-                matching_events = [str(ec) for ec in event_codes if str(ec) in epochs.event_id]
-
-                if matching_events:
-                    condition_groups[condition_name] = epochs[matching_events]
-        else:
-            # No task config - use event types as conditions
-            condition_groups = {condition: epochs[condition] for condition in epochs.event_id}
-
-        # Process each condition
-        roi_data = {'roi_names': roi_names}
-
-        for condition_name, condition_epochs in condition_groups.items():
-            n_trials = len(condition_epochs)
-            n_times = len(condition_epochs.times)
-
-            # Initialize array for all trials: (n_trials, n_rois, n_times)
-            trial_roi_data = np.zeros((n_trials, n_rois, n_times))
-
-            print(f"   Processing {n_trials} trials for condition '{condition_name}'...")
-
-            # Process each trial
-            for trial_idx in range(n_trials):
-                # Get single trial as evoked (MNE requires Evoked for apply_inverse)
-                single_trial = condition_epochs[trial_idx].average()
-
-                # Compute source estimate for this trial
-                stc = mne.minimum_norm.apply_inverse(
-                    single_trial,
-                    inverse_operator,
-                    lambda2=lambda2,
-                    method=self.method,
-                    verbose=False,
-                )
-
-                # Extract ROI time courses for this trial
-                for roi_idx in range(n_rois):
-                    # Simplified ROI extraction (use modulo to handle ROI count mismatch)
-                    trial_roi_data[trial_idx, roi_idx, :] = stc.data[roi_idx % stc.data.shape[0], :]
-
-            # Store trials for this condition
-            roi_data[condition_name] = trial_roi_data  # (n_trials, n_rois, n_times)
-            roi_data[f"{condition_name}_times"] = condition_epochs.times
-
-        # Add sampling frequency
-        if len(epochs.times) > 1:
-            sfreq = epochs.info['sfreq']
-            roi_data['sfreq'] = sfreq
-
-        return roi_data
 
     def get_output_spec(self) -> Dict[str, str]:
         return {

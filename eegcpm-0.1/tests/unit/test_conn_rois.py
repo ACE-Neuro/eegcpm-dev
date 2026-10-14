@@ -53,6 +53,34 @@ class TestConnROIs:
         assert names[0] == "DefaultMode.MPFC"
         assert "Salience.ACC" in names
 
+    def test_roi_names_unique(self):
+        """P2-F2: all 32 full names must be unique (L/R must not collide)."""
+        from eegcpm.data.conn_rois import CONN_ROIS
+
+        names = get_roi_names()
+        assert len(set(names)) == 32
+        assert names[0] == "DefaultMode.MPFC"
+        assert "DefaultMode.LP_L" in names
+        assert "DefaultMode.LP_R" in names
+        assert CONN_ROIS[1].full_name == "DefaultMode.LP_L"
+        assert CONN_ROIS[2].full_name == "DefaultMode.LP_R"
+
+    def test_midline_flag_and_excluded_networks(self):
+        """P2-F3: midline geometry flag and cerebellar exclusion list."""
+        from eegcpm.data.conn_rois import (
+            MIDLINE_X_MM,
+            SOURCE_EXCLUDED_NETWORKS,
+            get_roi_by_name,
+        )
+
+        assert MIDLINE_X_MM == 5.0
+        assert get_roi_by_name("DefaultMode.MPFC").is_midline is True
+        assert get_roi_by_name("Salience.ACC").is_midline is True
+        assert get_roi_by_name("SensoriMotor.Superior").is_midline is True
+        assert get_roi_by_name("DefaultMode.LP_L").is_midline is False
+        assert get_roi_by_name("DorsalAttention.FEF_R").is_midline is False
+        assert list(SOURCE_EXCLUDED_NETWORKS) == ["Cerebellar"]
+
     def test_mni_coordinates(self):
         """Test MNI coordinate shape."""
         coords = get_mni_coordinates()

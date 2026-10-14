@@ -234,6 +234,54 @@ class TestSourceReconstructionModule:
             assert "Forward model mocked" in result.errors[0]
 
 
+class TestSourceReconstructionSubjectsDir:
+    """F2: ``subjects_dir`` resolves lazily; construction never downloads fsaverage."""
+
+    def test_init_does_not_fetch_fsaverage(self, output_dir, monkeypatch):
+        """Construction must not call ``fetch_fsaverage`` (~500 MB when uncached)."""
+        monkeypatch.setattr(
+            mne.datasets,
+            "fetch_fsaverage",
+            lambda *args, **kwargs: pytest.fail(
+                "fetch_fsaverage must not be called during __init__"
+            ),
+        )
+        module = SourceReconstructionModule({}, output_dir)
+        assert module.method == "sLORETA"
+
+    def test_subjects_dir_resolved_once_on_first_use(self, output_dir, monkeypatch):
+        """The fallback is resolved on first access and cached afterwards."""
+        calls = []
+        fs_dir = output_dir / "fsaverage"
+        fs_dir.mkdir()
+
+        def fake_fetch(*args, **kwargs):
+            calls.append((args, kwargs))
+            return fs_dir
+
+        monkeypatch.setattr(mne.datasets, "fetch_fsaverage", fake_fetch)
+        module = SourceReconstructionModule({}, output_dir)
+
+        assert calls == []  # still lazy after construction
+        assert module.subjects_dir == output_dir  # parent of .../fsaverage
+        assert module.subjects_dir == output_dir
+        assert len(calls) == 1  # resolved once, then cached
+
+    def test_configured_subjects_dir_never_fetches(self, output_dir, monkeypatch):
+        """An explicit ``subjects_dir`` is used as-is (no fetch, no download)."""
+        monkeypatch.setattr(
+            mne.datasets,
+            "fetch_fsaverage",
+            lambda *args, **kwargs: pytest.fail(
+                "fetch_fsaverage must not run when subjects_dir is configured"
+            ),
+        )
+        module = SourceReconstructionModule(
+            {"subjects_dir": str(output_dir)}, output_dir
+        )
+        assert module.subjects_dir == output_dir
+
+
 class TestSourceReconstructionValidation:
     """Tests for input validation."""
 
@@ -244,10 +292,16 @@ class TestSourceReconstructionValidation:
         assert module.validate_input(epochs_with_montage) is True
 
     def test_validate_input_raw_with_montage(self, sample_raw, output_dir):
-        """Test validation passes for raw with montage."""
+        """Test validation fails for raw input even with a montage.
+
+        Regression note (P2-F13): the source module only accepts epochs. It used to
+        accept Raw (the base class accepted any object and the module never checked),
+        so this test previously asserted True. It now asserts False because
+        ``SourceReconstructionModule.validate_input`` requires ``mne.BaseEpochs``.
+        """
         config = {}
         module = SourceReconstructionModule(config, output_dir)
-        assert module.validate_input(sample_raw) is True
+        assert module.validate_input(sample_raw) is False
 
     def test_validate_input_epochs_without_montage(self, sample_epochs, output_dir):
         """Test validation fails for epochs without montage."""
@@ -274,6 +328,41 @@ class TestSourceReconstructionValidation:
         assert not result.success
         assert len(result.errors) > 0
         assert "montage" in result.errors[0].lower()
+
+    def test_source_validate_via_executor(self, sample_epochs, output_dir):
+        """Montage-less input through the executor path fails loud, writes nothing.
+
+        ``PipelineExecutor`` ignores the return value of ``validate_input``
+        (``pipeline/executor.py`` line ~109) and only catches exceptions, so the
+        module must re-check in ``process()`` and return ``success=False``. This test
+        pins that contract (the return-False deviation documented on
+        ``SourceReconstructionModule.validate_input``).
+        """
+        from types import SimpleNamespace
+
+        from eegcpm.pipeline.executor import PipelineExecutor
+
+        class _StubProject:
+            def __init__(self, root_path):
+                self.root_path = root_path
+                self.subjects = [SimpleNamespace(id="01")]
+
+        module_output = output_dir / "source"
+        executor = PipelineExecutor(
+            project=_StubProject(output_dir),
+            config=None,
+            output_dir=output_dir / "derivatives",
+            checkpoint_dir=output_dir / "checkpoints",
+        )
+        executor.add_module(SourceReconstructionModule({}, module_output))
+        executor._load_initial_data = lambda subject: sample_epochs
+
+        results = executor.run()
+
+        result = results["01"][0]
+        assert result.success is False
+        assert "montage" in result.errors[0].lower()
+        assert list(module_output.iterdir()) == []
 
 
 class TestSourceReconstructionConfig:
@@ -443,6 +532,25 @@ class TestSourceReconstructionErrorHandling:
         assert not result.success
         assert len(result.errors) > 0
         assert result.execution_time_seconds > 0
+
+    def test_process_all_bad_eeg_channels_returns_failure(
+        self, epochs_with_montage, output_dir
+    ):
+        """All EEG channels bad → ``success=False``, never an uncaught pick error.
+
+        ``validate_input`` already rejects this case (``pick_types`` excludes bads by
+        default); the EEG pick in ``process`` also runs inside the try (B2 rev1
+        robustness fix) so the contract holds whichever guard fires first.
+        """
+        epochs = epochs_with_montage.copy()
+        epochs.info["bads"] = list(epochs.ch_names)
+        module = SourceReconstructionModule({}, output_dir)
+
+        result = module.process(epochs)
+
+        assert result.success is False
+        assert result.errors
+        assert list(output_dir.iterdir()) == []
 
     def test_empty_epochs_handling(self, output_dir):
         """Test handling of empty epochs."""
