@@ -140,20 +140,18 @@ class TestSourceReconstructionModule:
         assert module.roi_radius == 10.0  # Default ROI radius
 
     def test_init_custom_config(self, output_dir):
-        """Test initialization with custom config."""
+        """Test initialization with custom nested config (P2-F5 schema)."""
         config = {
             "method": "dSPM",
-            "parcellation": "custom",
-            "snr": 2.0,
-            "loose": 0.1,
-            "depth": 0.9,
-            "spacing": "oct5",
+            "parcellation": "conn_networks",
+            "forward": {"spacing": "oct5"},
+            "inverse": {"snr": 2.0, "loose": 0.1, "depth": 0.9},
             "roi_radius": 15.0,
         }
         module = SourceReconstructionModule(config, output_dir)
 
         assert module.method == "dSPM"
-        assert module.parcellation == "custom"
+        assert module.parcellation == "conn_networks"
         assert module.snr == 2.0
         assert module.loose == 0.1
         assert module.depth == 0.9
@@ -189,8 +187,8 @@ class TestSourceReconstructionModule:
         assert "inverse_operator" in spec
 
     def test_snr_to_lambda2_conversion(self, output_dir):
-        """Test SNR to lambda2 conversion."""
-        config = {"snr": 3.0}
+        """Test SNR to lambda2 conversion (nested inverse section)."""
+        config = {"inverse": {"snr": 3.0}}
         module = SourceReconstructionModule(config, output_dir)
 
         # lambda2 = 1/snr^2
@@ -366,14 +364,21 @@ class TestSourceReconstructionValidation:
 
 
 class TestSourceReconstructionConfig:
-    """Tests for source reconstruction configuration."""
+    """Tests for source reconstruction configuration (nested schema, P2-F5)."""
 
     def test_valid_snr_values(self, output_dir):
-        """Test various valid SNR values."""
+        """Test various valid SNR values (nested inverse section)."""
         for snr in [1.0, 2.0, 3.0, 5.0, 10.0]:
-            config = {"snr": snr}
+            config = {"inverse": {"snr": snr}}
             module = SourceReconstructionModule(config, output_dir)
             assert module.snr == snr
+
+    def test_valid_snr_trial_values(self, output_dir):
+        """snr_trial reaches the module (B5 wires it into the trial lambda2)."""
+        config = {"inverse": {"snr_trial": 1.5}}
+        module = SourceReconstructionModule(config, output_dir)
+        assert module.snr_trial == 1.5
+        assert module.snr == 3.0
 
     def test_valid_roi_radius_values(self, output_dir):
         """Test various valid ROI radius values."""
@@ -383,32 +388,44 @@ class TestSourceReconstructionConfig:
             assert module.roi_radius == radius
 
     def test_valid_loose_values(self, output_dir):
-        """Test various valid loose parameter values."""
+        """Test various valid loose parameter values (nested inverse section)."""
         for loose in [0.0, 0.1, 0.2, 0.5, 1.0]:
-            config = {"loose": loose}
+            config = {"inverse": {"loose": loose}}
             module = SourceReconstructionModule(config, output_dir)
             assert module.loose == loose
 
     def test_valid_depth_values(self, output_dir):
-        """Test various valid depth parameter values."""
+        """Test various valid depth parameter values (nested inverse section)."""
         for depth in [0.0, 0.5, 0.8, 1.0]:
-            config = {"depth": depth}
+            config = {"inverse": {"depth": depth}}
             module = SourceReconstructionModule(config, output_dir)
             assert module.depth == depth
 
     def test_valid_spacing_values(self, output_dir):
-        """Test various valid spacing parameter values."""
+        """Test various valid spacing parameter values (nested forward section)."""
         for spacing in ["oct4", "oct5", "oct6", "ico4", "ico5"]:
-            config = {"spacing": spacing}
+            config = {"forward": {"spacing": spacing}}
             module = SourceReconstructionModule(config, output_dir)
             assert module.spacing == spacing
 
+    def test_valid_mode_values(self, output_dir):
+        """Evoked (default), trials and both are accepted; nothing else is."""
+        for mode in ["evoked", "trials", "both"]:
+            module = SourceReconstructionModule({"mode": mode}, output_dir)
+            assert module.mode == mode
+
     def test_parcellation_options(self, output_dir):
-        """Test different parcellation options."""
-        for parc in ["conn_networks", "aparc", "custom"]:
-            config = {"parcellation": parc}
-            module = SourceReconstructionModule(config, output_dir)
-            assert module.parcellation == parc
+        """Only conn_networks is implemented; other schemes raise (P2-F5)."""
+        from pydantic import ValidationError
+
+        module = SourceReconstructionModule(
+            {"parcellation": "conn_networks"}, output_dir
+        )
+        assert module.parcellation == "conn_networks"
+
+        for parc in ["aparc", "schaefer100", "custom"]:
+            with pytest.raises(ValidationError):
+                SourceReconstructionModule({"parcellation": parc}, output_dir)
 
 
 class TestSourceReconstructionHelpers:
@@ -419,17 +436,17 @@ class TestSourceReconstructionHelpers:
         # lambda2 = 1/snr^2
 
         # SNR = 1 -> lambda2 = 1
-        config = {"snr": 1.0}
+        config = {"inverse": {"snr": 1.0}}
         module = SourceReconstructionModule(config, output_dir)
         assert 1.0 / module.snr ** 2 == 1.0
 
         # SNR = 3 -> lambda2 = 1/9
-        config = {"snr": 3.0}
+        config = {"inverse": {"snr": 3.0}}
         module = SourceReconstructionModule(config, output_dir)
         assert 1.0 / module.snr ** 2 == pytest.approx(1.0/9.0)
 
         # SNR = 10 -> lambda2 = 1/100
-        config = {"snr": 10.0}
+        config = {"inverse": {"snr": 10.0}}
         module = SourceReconstructionModule(config, output_dir)
         assert 1.0 / module.snr ** 2 == pytest.approx(0.01)
 
@@ -502,8 +519,8 @@ class TestSourceReconstructionIntegration:
         config = {
             "method": "sLORETA",
             "parcellation": "conn_networks",
-            "snr": 3.0,
-            "spacing": "oct5",  # Coarser for speed
+            "inverse": {"snr": 3.0},
+            "forward": {"spacing": "oct5"},  # Coarser for speed
         }
         module = SourceReconstructionModule(config, output_dir)
 
@@ -566,3 +583,312 @@ class TestSourceReconstructionErrorHandling:
             # Empty epochs should fail during creation or processing
             epochs = mne.EpochsArray(data, info, events=events, verbose=False)
             module.process(epochs)
+
+
+# ---------------------------------------------------------------------------
+# P2-F7/F8/F9: condition selection, nave bookkeeping and loud failures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def source_erp_forward(fsaverage_subjects_dir):
+    """oct6 fsaverage forward on a 129-channel GSN montage (module-scoped)."""
+    subjects_dir = Path(fsaverage_subjects_dir)
+    src = mne.setup_source_space(
+        "fsaverage", "oct6", subjects_dir=subjects_dir, add_dist=False, verbose=False
+    )
+    bem_sol = mne.read_bem_solution(
+        subjects_dir / "fsaverage" / "bem" / "fsaverage-5120-5120-5120-bem-sol.fif",
+        verbose=False,
+    )
+    montage = mne.channels.make_standard_montage("GSN-HydroCel-129")
+    info = mne.create_info(montage.ch_names, 250.0, "eeg")
+    info.set_montage(montage, verbose=False)
+    fwd = mne.make_forward_solution(
+        info, "fsaverage", src, bem_sol, eeg=True, meg=False, mindist=5.0, verbose=False
+    )
+    return {"fwd": fwd, "info": info}
+
+
+def _condition_epochs(n_one, n_two, sfreq=250.0, tmin=-0.2, tmax=0.4, seed=0):
+    """Baseline-corrected epochs with event codes 1 (n_one) and 2 (n_two)."""
+    montage = mne.channels.make_standard_montage("GSN-HydroCel-129")
+    n_ch = len(montage.ch_names)
+    rng = np.random.default_rng(seed)
+    n_times = int(round((tmax - tmin) * sfreq)) + 1
+    n_epochs = n_one + n_two
+    data = rng.standard_normal((n_epochs, n_ch, n_times)) * 1e-5
+    codes = np.array([1] * n_one + [2] * n_two)
+    events = np.column_stack(
+        [np.arange(n_epochs) * int(sfreq), np.zeros(n_epochs, dtype=int), codes]
+    )
+    info = mne.create_info(montage.ch_names, sfreq, "eeg")
+    info.set_montage(montage, verbose=False)
+    epochs = mne.EpochsArray(
+        data,
+        info,
+        events=events,
+        event_id={"1": 1, "2": 2},
+        tmin=tmin,
+        baseline=(None, 0),
+        verbose=False,
+    )
+    epochs.set_eeg_reference(projection=True, verbose=False)
+    return epochs
+
+
+class TestConditionNameGuards:
+    """B4-K2/N2: duplicate/reserved condition names raise loudly.
+
+    These call ``_select_condition_epochs`` directly: no forward/fsaverage needed
+    (the guard runs before any matching or selection).
+    """
+
+    def test_duplicate_condition_names_raise(self, tmp_path):
+        """Two specs with the same name would silently keep only the last."""
+        task_config = {
+            "conditions": [
+                {"name": "dup", "event_codes": [1]},
+                {"name": "dup", "event_codes": [2]},
+            ]
+        }
+        module = SourceReconstructionModule({}, tmp_path, task_config=task_config)
+        with pytest.raises(ValueError, match="duplicate condition"):
+            module._select_condition_epochs(_condition_epochs(n_one=20, n_two=20))
+
+    @pytest.mark.parametrize(
+        "name",
+        ["roi_names", "sfreq", "excluded_rois", "excluded_reasons", "roi_radius"],
+    )
+    def test_reserved_condition_names_raise(self, name, tmp_path):
+        """Label-metadata keys (and every ``roi_*`` key) are reserved."""
+        task_config = {"conditions": [{"name": name, "event_codes": [1]}]}
+        module = SourceReconstructionModule({}, tmp_path, task_config=task_config)
+        with pytest.raises(ValueError, match="reserved"):
+            module._select_condition_epochs(_condition_epochs(n_one=20, n_two=20))
+
+    @pytest.mark.parametrize("name", ["early_times", "trial_nave"])
+    def test_companion_suffix_condition_names_raise(self, name, tmp_path):
+        """``{cond}_times`` / ``{cond}_nave`` would be overwritten by the writers."""
+        task_config = {"conditions": [{"name": name, "event_codes": [1]}]}
+        module = SourceReconstructionModule({}, tmp_path, task_config=task_config)
+        with pytest.raises(ValueError, match="companion"):
+            module._select_condition_epochs(_condition_epochs(n_one=20, n_two=20))
+
+    def test_event_id_derived_reserved_name_raises(self, tmp_path):
+        """The no-task-config path (event_id keys) is guarded too."""
+        epochs = _condition_epochs(n_one=20, n_two=20)
+        epochs.event_id = {"roi_names": 1, "ok": 2}
+        module = SourceReconstructionModule({}, tmp_path)
+        with pytest.raises(ValueError, match="reserved"):
+            module._select_condition_epochs(epochs)
+
+
+@pytest.mark.fsaverage
+class TestSourceConditionSelection:
+    """P2-F7/F8/F9: requested/missing/skipped conditions, nave, loud failures."""
+
+    @pytest.mark.slow
+    def test_missing_and_below_min_trials_listed(
+        self, source_erp_forward, tmp_path
+    ):
+        """Requested conditions are all accounted for; no arrays for missing/skipped."""
+        task_config = {
+            "conditions": [
+                {"name": "many", "event_codes": [1]},
+                {"name": "few", "event_codes": [2]},
+                {"name": "absent", "event_codes": [99]},
+            ]
+        }
+        module = SourceReconstructionModule(
+            {"method": "dSPM", "min_trials": 10,
+             "output": {"generate_qc": False}},
+            tmp_path,
+            task_config=task_config,
+        )
+        result = module.process(
+            _condition_epochs(n_one=20, n_two=3), forward=source_erp_forward["fwd"]
+        )
+        assert result.success, result.errors
+
+        meta = result.metadata
+        assert meta["conditions_requested"] == ["many", "few", "absent"]
+        assert meta["conditions_produced"] == ["many"]
+        assert meta["conditions_missing"] == ["absent"]
+        assert meta["conditions_skipped"] == {
+            "few": {"n_trials": 3, "reason": "below_min_trials"}
+        }
+        assert meta["nave"] == {"many": 20}
+        # noise-normalised amplitudes scale with sqrt(nave): flagged as a covariate
+        assert meta["nave_confound_warning"] is True
+
+        npz = np.load(tmp_path / "unknown_roi_tc.npz")
+        assert "many" in npz.files
+        assert "few" not in npz.files
+        assert "absent" not in npz.files
+        assert "many_times" in npz.files
+        assert int(npz["many_nave"]) == 20
+        assert npz["many"].ndim == 2  # (n_rois, n_times)
+        assert any("no matching events" in w for w in result.warnings)
+
+    @pytest.mark.slow
+    def test_all_conditions_missing_fails_loud(
+        self, source_erp_forward, tmp_path
+    ):
+        """Zero produced conditions -> success False and nothing written."""
+        task_config = {"conditions": [{"name": "absent", "event_codes": [99]}]}
+        module = SourceReconstructionModule(
+            {"method": "dSPM", "output": {"generate_qc": False}},
+            tmp_path,
+            task_config=task_config,
+        )
+        result = module.process(
+            _condition_epochs(n_one=5, n_two=5), forward=source_erp_forward["fwd"]
+        )
+        assert result.success is False
+        assert "no conditions produced" in result.errors[0]
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.slow
+    def test_equalize_trials_seeded_identical_outputs(
+        self, source_erp_forward, tmp_path
+    ):
+        """equalize_trials=5: seeded determinism, seed sensitivity, real subsetting.
+
+        B4-K4: same seed -> identical arrays and ``{cond}_nave == 5``; a
+        different seed -> different arrays (a regression to first-N would be
+        seed-independent); and the selected trial indices are a random draw, not
+        ``arange(5)``.
+        """
+        config = {
+            "method": "dSPM",
+            "min_trials": 10,
+            "equalize_trials": 5,
+            "random_seed": 42,
+            "output": {"generate_qc": False},
+        }
+        epochs = _condition_epochs(n_one=20, n_two=20)
+        results = []
+        for name in ("run1", "run2"):
+            out_dir = tmp_path / name
+            module = SourceReconstructionModule(config, out_dir)
+            result = module.process(epochs, forward=source_erp_forward["fwd"])
+            assert result.success, result.errors
+            results.append((out_dir, result))
+
+        npz1 = np.load(results[0][0] / "unknown_roi_tc.npz")
+        npz2 = np.load(results[1][0] / "unknown_roi_tc.npz")
+        assert int(npz1["1_nave"]) == 5
+        assert int(npz1["2_nave"]) == 5
+        for key in ("1", "2", "1_times", "2_times", "1_nave", "2_nave"):
+            assert np.array_equal(npz1[key], npz2[key]), key
+        assert results[0][1].metadata["nave"] == {"1": 5, "2": 5}
+
+        # A different seed must yield a different selection (and output array).
+        out_dir3 = tmp_path / "run3"
+        module3 = SourceReconstructionModule(
+            {**config, "random_seed": 43}, out_dir3
+        )
+        result3 = module3.process(epochs, forward=source_erp_forward["fwd"])
+        assert result3.success, result3.errors
+        npz3 = np.load(out_dir3 / "unknown_roi_tc.npz")
+        assert int(npz3["1_nave"]) == 5
+        assert int(npz3["2_nave"]) == 5
+        assert not np.array_equal(npz1["1"], npz3["1"])
+        assert not np.array_equal(npz1["2"], npz3["2"])
+
+        # The subset is a real random draw, not the first N trials.
+        selected, selection = module3._select_condition_epochs(epochs)
+        assert selection["nave"] == {"1": 5, "2": 5}
+        for cond in ("1", "2"):
+            indices = np.sort(np.asarray(selected[cond].selection))
+            assert indices.tolist() != [0, 1, 2, 3, 4]
+
+    @pytest.mark.slow
+    def test_equalize_below_target_skipped(self, source_erp_forward, tmp_path):
+        """A condition with fewer trials than equalize_trials is skipped, not cut."""
+        module = SourceReconstructionModule(
+            {"method": "dSPM", "min_trials": 10, "equalize_trials": 15,
+             "output": {"generate_qc": False}},
+            tmp_path,
+        )
+        result = module.process(
+            _condition_epochs(n_one=20, n_two=12), forward=source_erp_forward["fwd"]
+        )
+        assert result.success, result.errors
+        assert result.metadata["nave"] == {"1": 15}
+        assert result.metadata["conditions_skipped"] == {
+            "2": {"n_trials": 12, "reason": "below_equalize_trials"}
+        }
+
+    @pytest.mark.slow
+    def test_mode_both_writes_evoked_and_trials(
+        self, source_erp_forward, tmp_path
+    ):
+        """mode='both' -> 2-D evoked archive + 3-D trial archive, both with nave."""
+        module = SourceReconstructionModule(
+            {"method": "dSPM", "mode": "both"}, tmp_path
+        )
+        result = module.process(
+            _condition_epochs(n_one=20, n_two=20), forward=source_erp_forward["fwd"]
+        )
+        assert result.success, result.errors
+
+        evoked = np.load(tmp_path / "unknown_roi_tc.npz")
+        trials = np.load(tmp_path / "unknown_roi_tc_trials.npz")
+        assert evoked["1"].ndim == 2
+        assert trials["1"].ndim == 3
+        assert trials["1"].shape[0] == 20
+        assert int(evoked["1_nave"]) == 20
+        assert int(trials["1_nave"]) == 20
+        assert evoked["1"].shape[1] == len(evoked["1_times"])
+
+    @pytest.mark.slow
+    def test_mode_trials_writes_only_trials_archive(
+        self, source_erp_forward, tmp_path
+    ):
+        module = SourceReconstructionModule(
+            {"method": "dSPM", "mode": "trials", "output": {"generate_qc": False}},
+            tmp_path,
+        )
+        result = module.process(
+            _condition_epochs(n_one=20, n_two=20), forward=source_erp_forward["fwd"]
+        )
+        assert result.success, result.errors
+        assert not (tmp_path / "unknown_roi_tc.npz").exists()
+        assert (tmp_path / "unknown_roi_tc_trials.npz").exists()
+
+    @pytest.mark.slow
+    def test_save_roi_tc_and_stc_disabled_writes_nothing(
+        self, source_erp_forward, tmp_path
+    ):
+        """output.save_roi_tc / save_stc / generate_qc are honoured."""
+        module = SourceReconstructionModule(
+            {
+                "method": "dSPM",
+                "output": {
+                    "save_stc": False,
+                    "save_roi_tc": False,
+                    "generate_qc": False,
+                },
+            },
+            tmp_path,
+        )
+        result = module.process(
+            _condition_epochs(n_one=20, n_two=20), forward=source_erp_forward["fwd"]
+        )
+        assert result.success, result.errors
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.slow
+    def test_qc_html_generated_when_enabled(self, source_erp_forward, tmp_path):
+        """output.generate_qc=True still produces the QC HTML on the new contract."""
+        module = SourceReconstructionModule(
+            {"method": "dSPM", "output": {"generate_qc": True}}, tmp_path
+        )
+        result = module.process(
+            _condition_epochs(n_one=20, n_two=20), forward=source_erp_forward["fwd"]
+        )
+        assert result.success, result.errors
+        htmls = list(tmp_path.glob("*_source_qc.html"))
+        assert htmls, "QC HTML was not generated"

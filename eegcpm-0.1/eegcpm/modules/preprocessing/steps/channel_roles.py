@@ -2,14 +2,18 @@
 Channel roles step (per S19 in the spec).
 
 Assigns channel roles for EGI HydroCel 129-channel net. The Cz channel
-is kept `eeg`-typed with an `is_reference` flag consumed by the
-bad-channel detector's exemption, so `picks: eeg` INCLUDES Cz in the
-average-reference computation (this is required for reference recovery).
+is kept `eeg`-typed so `picks: eeg` INCLUDES Cz in the average-reference
+computation (this is required for reference recovery).
 
 Cz is EXEMPT from:
   - flat-channel detection
   - bad-channel budget
   - the `<=11/109` interpolation cap (Cz is not interpolated)
+
+The exemption travels as `metadata['channel_roles']['reference_channel']`
+(the only source of truth, P1-F5): the bad-channel detector consumes it as
+`exempt=(...)`. The old `raw._eegcpm_reference_channels` object attribute was
+an untracked side channel (not preserved by MNE copies/saves) and was removed.
 
 Neck/face channels are dropped; 9 EOG channels are retained for EOG
 regression; 109 scalp channels are the analysis set.
@@ -42,12 +46,12 @@ EGI_129_REFERENCE_CHANNEL: str = "Cz"
 class ChannelRolesStep(ProcessingStep):
     """Assign channel roles for EGI HydroCel 129-channel net.
 
-    Cz is typed `eeg` with `is_reference: true`; the
-    bad-channel detector's exemption consumes the flag, so Cz is
-    exempt from flat-channel and bad-channel detection and from
-    the bad-channel budget. Post-referencing, the post-ref Cz
-    variance is asserted > 0; the post-ref Cz column is marked
-    RECOVERED in the feature frame.
+    Cz is typed `eeg` and reported as
+    `metadata['channel_roles']['reference_channel']`; the bad-channel
+    detector's exemption consumes that metadata (P1-F5), so Cz is exempt
+    from flat-channel and bad-channel detection and from the bad-channel
+    budget. Post-referencing, the post-ref Cz variance is asserted > 0;
+    the post-ref Cz column is marked RECOVERED in the feature frame.
     """
 
     name = "channel_roles"
@@ -84,20 +88,12 @@ class ChannelRolesStep(ProcessingStep):
         if neck_face_present:
             raw.drop_channels(neck_face_present)
 
-        # Set Cz as reference channel: keep eeg-typed with is_reference
-        # flag. The flag is stored on the raw object as a custom
-        # attribute (MNE info['chs'] keys are restricted). It is
-        # consumed by the bad-channel detector's exemption and by
-        # the reference step's Cz-include check.
+        # Keep Cz eeg-typed so `picks: eeg` includes it in the
+        # average-reference computation (S19). The exemption is reported
+        # through `step_meta['reference_channel']`; no side-channel
+        # attributes (P1-F5).
         if self.reference_channel in raw.ch_names:
-            ch_idx = raw.ch_names.index(self.reference_channel)
-            # Reaffirm eeg typing
             raw.set_channel_types({self.reference_channel: "eeg"})
-            # Store reference info on the raw object (not info dict,
-            # which is restricted by MNE)
-            if not hasattr(raw, "_eegcpm_reference_channels"):
-                raw._eegcpm_reference_channels = {}
-            raw._eegcpm_reference_channels[self.reference_channel] = True
 
         step_meta = {
             "eog_channels": eog_present,

@@ -5,11 +5,14 @@ The ONE binding ordered step list. The F1 + F1.1 prose variants in
 plan-v1.md are SUPERSEDED; this is the only canonical list.
 
 Steps (in order):
-  1. channel_roles (Cz eeg-typed + is_reference; neck/face dropped)
+  1. channel_roles (Cz eeg-typed; reference channel reported via metadata;
+     neck/face dropped)
   2. zapline (BEFORE low-pass; per METH-019)
   3. filter (0.1-45 Hz FIR)
   4. bad_channel_detection (post-filter order; documented deviation
-     from Langer per S19a; ≤11/109 budget RECALIBRATED in pilot-50)
+     from Langer per S19a; ≤11/109 budget RECALIBRATED in pilot-50;
+     P1-F5 robust median/MAD stats, explicit exemption, exclusion above
+     the budget)
   5. interpolate (spherical_spline; max 11/109)
   6. eog_regression (9 EOG channels)
   7. robust_pca (IALM, lam=0.003162 per S20b)
@@ -22,7 +25,8 @@ Steps (in order):
   10. reference (average over 109 scalp; Cz INCLUDED via eeg typing;
       post-ref Cz variance > 0; RECOVERED column)
 
-Cz is EXEMPT from bad-channel detection and budget (is_reference flag).
+Cz is EXEMPT from bad-channel detection and budget (reference channel
+passed explicitly via ``exempt=`` from the channel_roles metadata).
 """
 
 from __future__ import annotations
@@ -62,7 +66,8 @@ def build_hbn_langer_chain() -> List[Any]:
         _FilterStepWrapper(l_freq=0.1, h_freq=45.0,
                            method="fir", fir_design="firwin"),
         # Bad-channel detection: post-filter order (S19a deviation from
-        # Langer; RECALIBRATED ≤11/109 budget; Cz EXEMPT via is_reference).
+        # Langer; RECALIBRATED ≤11/109 budget; Cz EXEMPT via the
+        # channel_roles metadata, P1-F5).
         _BadChannelDetectorWrapper(threshold_sd=3.0, exclude_cz=True),
         InterpolateBadChannelsStep(max_bad_percent=11/109*100),
         EOGRegressionStep(),
@@ -78,8 +83,8 @@ def build_hbn_langer_chain() -> List[Any]:
         # with safety.md EC≥160/200).
         _BlockRejectionStepWrapper(max_rejected_fraction=0.20,
                                        window_seconds=2.0),
-        # Average reference: picks:eeg INCLUDES Cz (eeg-typed with
-        # is_reference flag). Post-ref Cz variance>0; RECOVERED
+        # Average reference: picks:eeg INCLUDES Cz (eeg-typed by
+        # channel_roles). Post-ref Cz variance>0; RECOVERED
         # column downstream.
         ReferenceStep(type="average", projection=False, exclude_bads=True),
     ]
@@ -127,20 +132,28 @@ class _BadChannelDetectorWrapper(_PS):
         self.exclude_cz = exclude_cz
 
     def process(self, raw, metadata):
-        # R-004: pinned variance/kurtosis/spectrum >3-SD detector,
-        # mark-only. Cz is exempt BEFORE detection (the pinned
-        # detector consumes the is_reference flag). Interpolation is
-        # a separate later step.
+        # R-004 + P1-F5: pinned robust detector, mark-only. The reference
+        # channel comes from `metadata['channel_roles']['reference_channel']`
+        # (the only source of truth); a missing channel_roles entry raises
+        # KeyError and fails the run instead of silently re-flagging Cz.
+        # Interpolation is a separate later step.
         from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
             detect_bad_channels, apply_bad_channels, MAX_BAD_CHANNELS,
         )
-        new_bads = detect_bad_channels(raw, threshold_sd=self.threshold_sd)
-        out_raw = apply_bad_channels(raw, new_bads)
+        exempt = ()
+        if self.exclude_cz:
+            exempt = (metadata["channel_roles"]["reference_channel"],)
+        bads, report = detect_bad_channels(
+            raw, threshold_sd=self.threshold_sd, exempt=exempt
+        )
+        out_raw = apply_bad_channels(raw, bads, exempt=exempt)
         return out_raw, {
+            **report,
             "applied": True,
             "threshold_sd": self.threshold_sd,
             "exclude_cz": self.exclude_cz,
-            "n_bads": len(out_raw.info.get("bads") or []),
+            "exempt": list(exempt),
+            "n_bads": len(bads),
             "max_bad_channels": MAX_BAD_CHANNELS,
         }
 

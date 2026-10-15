@@ -146,6 +146,9 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
       roi_hemi/excluded_rois`) and trials live in `*_roi_tc_trials.npz` (B4); the old
       magnitude-based connectivity outputs are invalid (P2-F4) and
       `modules/connectivity/__init__.py` still treats every non-`_times` npz key as a condition.
+      `cli/connectivity.py:177` also globs `*_roi_tc.npz` (now the **evoked-only** file) and feeds it to
+      that module; it must switch to `*_roi_tc_trials.npz` when the connectivity stage moves to trial-level
+      data.
 
 ## P5 — End-to-end verification
 
@@ -164,7 +167,13 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
       `*_roi_tc.npz`. Loud failure (counted failed), deferred to P4 by deep-auditor decision —
       fix together with the schema migration (optionally raise an explicit
       "npz schema v2 unsupported" error instead of the IndexError). Do not half-enable
-      connectivity on evoked 2-D data without the P4 audit.
+      connectivity on evoked 2-D data without the P4 audit. `cli/connectivity.py:177` globs
+      `*_roi_tc.npz`, which after B4 is the **evoked-only** archive (trials are in
+      `*_roi_tc_trials.npz`). UI page 10 (`ui/pages/10_source_reconstruction.py:91`) still hardcodes the
+      default variant `eLORETA-CONN32` next to a free method selectbox (changing the method without renaming
+      the variant now raises `ValidationError`) and still offers `aparc`/`schaefer100` parcellations +
+      `depends_on.epochs: null`, all of which the new `extra='forbid'`/`Literal` schema rejects — UI is out of
+      B4 scope.
 
 ---
 
@@ -183,6 +192,9 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | 2026-10-14 | P2 | Opus 5.5 B2 re-audit + K3 confirm | **CF-1 fixed**: label cache key now includes the source-space subject (a cache hit previously skipped the N2 subject guard — a scaled template with equal `vertno` silently reused fsaverage labels); regression test added and empirically probed non-vacuous. B2 verified; accepted residuals: trial path untested until B4/B5, connectivity IndexError until P4, single-shell BEM until B5, `fetch_fsaverage` config side-effect recorded for B5 provenance | closed |
 | 2026-10-14 | — | Validator wording note | The 2 "connectivity P4 failures" are `mne_connectivity`-missing import failures; the deferred npz-schema `IndexError` breakage (P4 backlog) is not exercised by the suite | noted |
 | 2026-10-15 | P2 | Qwen3.8-Max B3 final audit (user-approved Opus stand-in) | `approve` — new findings: **K6** `append_bad_annotations` lacked an append-only self-check; **K7** mask-on-repaired-data semantics undocumented + suite could not detect a regression to pre-repair `clean_windows`; **K8** `montage_restored` phantom key; **K10** tautological `n_samples_before`; **K11** stale counts; **K9** (pre-existing, default-reachable) four uncorrected `artifacts.py` append sites corrupt the timeline when `meas_date=None` + `first_samp≠0`; K3–K5 arbitrated | **rev2 applied + confirmed; B3 verified 2026-10-15** |
+| 2026-10-15 | P1/P2 | Opus 5.5 B4 final audit (Pass B) | `revise` — decisive: the new detector's raw-scale two-sided variance/HF rule flags 11–97 channels on real HBN pilot recordings (8/10 would be excluded); minors K1–K6 (condition matching, duplicates, degeneracy float-rounding, equalize test honesty, `mode='both'` partial writes, `--input-dir`) | rev1 fixes applied 2026-10-15 — awaiting re-audit |
+| 2026-10-15 | P1 | User decision (B4 rev1) | Bad-channel detector variance/HF statistics move to **log-scale robust z with upper-tail detection** (option a); kurtosis stays two-sided on the raw scale; degeneracy becomes a relative-epsilon test | applied in B4 rev1 (pilot5 validation recorded) |
+| 2026-10-15 | P1 | Opus B4 re-audit — **open ⛔ decision (B4-D2)** | Detector calibration on real HBN remains over-budget: **5/12 non-corrupt pilot recordings within budget**; over-flagging driven by kurtosis (frontal blink clusters — detector runs before EOG regression) + variance in movie tasks; plus a near-flat lower-tail blind spot (upper-tail-only rule passes a ~1 nV SD channel above the absolute 1e-20 V² floor). Options: (i) kurtosis after EOG regression / exclude blink segments; (ii) log-scale or upper-tail kurtosis; (iii) relative near-flat floor (`var < 1e-3 × median` or log-variance z < −K) as `flat`; (iv) recalibrate the budget on pilot-50. **Blocks any real-data chain run (B6 tier-2 / B8 Checkpoint B); owner B6 tier-2.** | open |
 
 ## Remediation batches — `plan/261013-2240-p1p2-remediation.md`
 
@@ -191,7 +203,7 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | **B1** | Executor fail-fast + exclusion + dependency preflight + one preprocessing schema + status persistence (P1-F1, F4, F6, F9 blanket-except only, F17 ImportError only) | `[x]` **verified 2026-10-14** — Opus rev2 approval, no conditions left (residuals → B3/B6) |
 | B2 | Source-ERP core: anatomical labels, unique names, geometry, signed output + dipole ground truth | `[x]` **verified 2026-10-14** — Opus conditions met (F2/N1/N2/N3 + CF-1 fixed, K3-confirmed) |
 | B3 | Timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper metadata | `[x]` **verified 2026-10-15** — final audit by Qwen3.8-Max (user-approved Opus 5.5 stand-in): `approve`; rev2 confirmed (`confirm-with-notes`) |
-| B4 | Source usability + config wiring + P1 bad-channel detector | `[ ]` not started |
+| B4 | Source usability + config wiring + P1 bad-channel detector | `[x]` **verified 2026-10-15 (code scope)** — Opus final audit `revise` → rev1 applied (log-scale detector + config bounds + condition guards + test honesty) → scoped re-audit `approve`; **⛔ B4-D2 open real-data calibration decision (kurtosis/near-flat/EOG-order) gates any real-data chain run (B6 tier-2 / B8)** |
 | B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[ ]` not started |
 | B6 | ⛔ Checkpoint A (RPCA) + instrumentation + golden resolved-config hash + P1 tier-2 debt | `[ ]` not started |
 | B7 | QC truthfulness, test-suite honesty, CI job | `[ ]` not started |
@@ -306,6 +318,138 @@ truthful metadata); plain `pytest tests/unit` interrupts on the two specparam co
 Re-audit scope: `steps/asr.py` (incl. `append_bad_annotations`), `_ASRStepWrapper`,
 block-rejection append, `hbn_recording_qc` ASR fields, `workflow/state.py` encoder, the test files.
 
+B4 evidence (2026-10-15, working tree on `remediation/p1p2`, not committed) — **P2-F5/F6/F7/F8/F9
+and P1-F5**:
+- **P2-F5 schema**: `ForwardConfig`/`InverseConfig`/`SourceOutputConfig`/`SourceConfig` are
+  `extra='forbid'`; `InverseConfig` gains `snr_trial`/`method_params`, `SourceOutputConfig` gains
+  `compute_crosstalk`, `SourceConfig` gains `mode`/`min_trials`/`equalize_trials`/`random_seed` +
+  `variant` defaulting to `{method}-CONN32` (mismatch → `ValidationError`); `SourceReconstructionModule`
+  now does `SourceConfig.model_validate(config)` (flat `snr`/`spacing`/`trial_level` raise) while
+  keeping the test-facing attributes (`method, parcellation, snr, snr_trial, loose, depth, spacing,
+  roi_radius, mode`); the CLI exits 1 on `ValidationError`; `examples/configs/source/dspm-conn32.yaml`
+  rewritten to the nested dialect (flat keys/`name`/`use_conn_rois`/`conductivity` dropped) and both
+  `eegcpm/config/source/*.yaml` validate.
+- **P2-F7/F8/F9 outputs**: `mode` evoked/trials/both → `{subject}_roi_tc.npz` (`{cond}: (n_rois,
+  n_times)`) / `{subject}_roi_tc_trials.npz` (`{cond}: (n_trials, n_rois, n_times)`) / both; every
+  file carries `{cond}_times`, `{cond}_nave`, `sfreq` + label metadata; `output.save_stc` (evoked
+  only) / `save_roi_tc` / `generate_qc` are honoured; one `_select_condition_epochs` helper:
+  requested = task-config names else `event_id` keys, no matching events → `conditions_missing`,
+  `n < min_trials` → `conditions_skipped` (`below_min_trials`), `equalize_trials` draws a seeded
+  (`random_seed`) per-condition subset in sorted order (short conditions → `below_equalize_trials`),
+  zero produced → `ModuleResult(success=False, "no conditions produced; requested=…, missing=…,
+  skipped=…")` with nothing written; metadata gains `conditions_requested/produced/missing/skipped`,
+  `nave`, `nave_confound_warning` (dSPM/sLORETA/eLORETA without equalize). Selection runs **after**
+  the inverse operator so the forward error stays `errors[0]` and the covariance guards keep
+  precedence. **B5 note:** the trial path still uses the evoked lambda2; `snr_trial` →
+  `lambda2_trial` + `method_params` remain B5 task 2 as planned.
+- **P2-F6 consumer**: `SourceERPFeatureModule` accepts `Mapping`/`NpzFile`/path, derives conditions
+  from `{k}_times` keys (no deny-list), keeps negative tmin from `{cond}_times`, derives `sfreq`
+  from the axis (500.0 default deleted), writes per-condition columns `{cond}_{roi}_{comp}_{metric}`
+  (metric = the real metric key, e.g. `N1_peak_latency`; mean windows `{cond}_{roi}_mean_amp_{w}`)
+  + `{cond}_nave`, uses `np.trapezoid`, and raises `ValueError` for 3-D arrays / zero matched
+  conditions/ROIs **before** writing the CSV (written once at the end); CLI gains
+  `--feature-type source_erp` + `--source/--preprocessing/--task/--subjects/--sessions` (input-dir
+  mode or `paths.get_source_dir(...) / f"{subject}_roi_tc.npz"`).
+- **P1-F5 detector**: `channel_roles` drops the `raw._eegcpm_reference_channels` hack
+  (`metadata['channel_roles']['reference_channel']` is the only source of truth);
+  `detect_bad_channels(raw, threshold_sd, exempt, max_bad) -> (bads, report)` uses NaN-safe
+  median/MAD robust z (`mad==0 → std → degenerate`), flat (`ptp==0 or var<=1e-20`) non-exempt
+  channels bad outright and excluded from the stats, HF band **25–40 Hz** documented
+  (`hf_band_hz`, post-45 Hz-lowpass deviation), non-finite z → bad, `> max_bad` →
+  `RecordingExcluded('too_many_bad_channels', {n_detected, max_bad_channels, detected})` (no
+  truncation), report keys `detected/reasons/z_scores/n_detected_precap/flat/exempt/hf_band_hz/
+  degenerate_metrics`; `apply_bad_channels(..., exempt=)` never adds exempt names;
+  `_BadChannelDetectorWrapper` passes `exempt` from the channel_roles metadata (missing metadata →
+  `KeyError` fails the run) and returns the report + `n_bads`; `interpolate` raises
+  `RecordingExcluded('too_many_bad_channels_for_interpolation', {n_bad, pct_bad, max_bad_percent})`
+  instead of dropping channels.
+- **Validation**: B4 command (`test_source + test_source_config + test_source_erp_features +
+  test_source_dipole_groundtruth + test_bad_channel_detector + test_preprocessing_chain +
+  test_preprocessing_reachability`) → **116 passed / 2 skipped**; full standard suite → **3 failed /
+  616 passed / 2 skipped**, failures exactly the documented baseline (2 `mne_connectivity` P4 + 1
+  `robust_pca` B6); greps clean (`trapz|500.0` absent from `source_erp_features.py`, no `except` in
+  `bad_channels_pinned.py`); dipole ground truth unchanged; new tests: `test_source_config.py` (17),
+  `test_source_erp_features.py` (12), `test_bad_channel_detector.py` (9), 9 `fsaverage`-marked
+  condition-selection tests in `test_source.py` (missing/below-min trials, all-missing loud failure,
+  seeded equalize identity, below-equalize skip, mode both/trials file shapes, save flags, QC HTML).
+
+**B4 rev1 — Opus 5.5 final-audit conditions applied (2026-10-15)** — verdict `revise`; the decisive finding
+was the detector's raw-scale two-sided variance/HF rule flagging 11–97 channels on real HBN pilot recordings
+(8/10 excluded). User decision recorded: **log-scale robust z** (option a).
+- **B4-D1 detector recalibration** (`steps/bad_channels_pinned.py`; structure kept: flat bad outright and
+  excluded from the stats, budget `> max_bad` → `RecordingExcluded`, no `except`, report keys kept): variance
+  and 25–40 Hz power are z-scored on the **`log`** scale with the **upper tail only** (`z > threshold_sd`);
+  kurtosis stays **two-sided on the raw scale**; the reported z-scores are **signed**; the report gains
+  `tails = {'variance': 'upper', 'hf_power': 'upper', 'kurtosis': 'two-sided'}`. Degeneracy is now a
+  **relative-epsilon** test (B4-K3): scale `<= 1e-12 * max(|median|, 1.0)` → degenerate (MAD → std fallback
+  kept), `z = 0`, metric recorded in `degenerate_metrics`; the log is computed only on stats-eligible
+  channels (flat channels would be `log(0)`).
+- **Regression fixture** (`test_bad_channel_detector.py::test_healthy_cz_referenced_recording_stays_within_budget`):
+  GSN-HydroCel-129-like, spatially correlated (3 cm), Cz-referenced healthy synthetic recording + one injected
+  heavy-tailed channel → 2 detections (injected `E70` + one chance kurtosis outlier) `<= MAX_BAD_CHANNELS`,
+  lower tail never flagged, flat Cz exempt; the pre-rev1 raw-scale two-sided rule flags 23 channels on the same
+  fixture (would raise `RecordingExcluded`). New unit test for the relative-epsilon degeneracy (ulp-level
+  spread → degenerate, `z = 0`; `MAD == 0` with a real outlier still falls back to std).
+- **Real-data validation (read-only; chain order channel roles → 0.1–45 Hz filter → detector)** on the 5 pilot
+  recordings `~/proj/adhd-hbn/data_raw/hbn-eeg/pilot5/*/eeg/*_task-RestingState_eeg.set` (`exempt=('Cz',)`,
+  `max_bad=1e9` to count instead of raise; nothing written into the data directory). The canonical chain also
+  runs `ZaplineStep(fline=60)` between channel roles and the filter; it is immaterial for the 25–40 Hz band
+  and was omitted to match the audit's decisive probe exactly:
+
+| recording | pre-rev1 (raw two-sided) | rev1 (log upper-tail) | rev1 reasons |
+|---|---|---|---|
+| sub-NDARAC853CR6/RestingState | 28 → EXCLUDED | 19 → EXCLUDED | flat 1, variance 3, kurtosis 16, hf_power 1 |
+| sub-NDARAC904DMU/RestingState | 9 | 8 | variance 8, hf_power 3, kurtosis 1 |
+| sub-NDARAM487XU3/RestingState | 97 → EXCLUDED | 97 → EXCLUDED | **flat 94**, kurtosis 2, hf_power 1 |
+| sub-NDARAM873GAC/RestingState | 24 → EXCLUDED | 9 | flat 1, variance 1, hf_power 4, kurtosis 4 |
+| sub-NDARCD661GL0/RestingState | 11 | 9 | variance 7, hf_power 7, kurtosis 6 |
+
+| recording | rev1 — DespicableMe | rev1 — FunwithFractals |
+|---|---|---|
+| sub-NDARAC853CR6 | 7 | 27 → EXCLUDED |
+| sub-NDARAC904DMU | 25 → EXCLUDED | 17 → EXCLUDED |
+| sub-NDARAM487XU3 | 97 → EXCLUDED (corrupt) | 95 → EXCLUDED (corrupt) |
+| sub-NDARAM873GAC | 36 → EXCLUDED | 21 → EXCLUDED |
+| sub-NDARCD661GL0 | 12 → EXCLUDED | 11 |
+
+  **Summary across the 12 non-corrupt recordings: only 5 stay within budget** (3/4 RestingState,
+  1/4 DespicableMe, 1/4 FunwithFractals). Over-budget recordings are flagged by both kurtosis (up to
+  23 channels, often a frontal cluster) and variance (up to 19). Honest residuals:
+  (a) **sub-NDARAC853CR6** stays over budget on RestingState (19) and FunwithFractals (27), dominated
+  by kurtosis detections (frontal cluster E4–E19 + E54/E78/E113/E119, excess-kurtosis z 3.2–9.1) —
+  the kurtosis rule was kept two-sided/raw as pinned by the user decision, so this is a real
+  over-budget recording under the current rule (not a log-scale artifact); (b) **sub-NDARAM487XU3 is
+  a corrupt recording**: 114 of 129 raw channels are identically zero
+  (94 of the 109 EEG channels flat), so exclusion is correct data-quality behaviour, not detector
+  over-flagging.
+- **B4-N1 config bounds** (`core/config.py::SourceConfig`): `min_trials: int = Field(10, ge=1)`,
+  `equalize_trials: Optional[int] = Field(None, ge=1)`, `random_seed: int = Field(42, ge=0)`; tests:
+  `equalize_trials` 0/−1 → `ValidationError`, `min_trials=0` → `ValidationError`, `random_seed=-1` →
+  `ValidationError`, bounds reach module construction.
+- **B4-K2/N2 condition-name guards** (`modules/source/__init__.py::_select_condition_epochs`): `ValueError`
+  for (i) duplicate condition names, (ii) reserved names (`roi_names`/`sfreq`/`excluded_rois`/
+  `excluded_reasons`, any `roi_*` prefix), (iii) names ending in `_times`/`_nave`; the guard runs on
+  task-config names **and** on the `event_id`-derived path. Tests: duplicate, 5 reserved names, 2 companion
+  suffixes, event_id-derived reserved name.
+- **B4-K4 test honesty**: `test_equalize_trials_seeded_identical_outputs` now also pins that a different seed
+  yields different output arrays (`{cond}_nave == 5` kept) and that the selected trial indices are not
+  `arange(5)` (checks `Epochs.selection`).
+- **Accepted items assigned**: plan B5 tasks 7–9 (event-code-value condition matching + numeric fallback
+  (K1/N3); atomic/stale-output-safe source writes + provenance-requiring consumer (K5 widened); features CLI
+  missing subjects/sessions (N4)) + B5 task 2 λ² spy note (N5); plan B7 task 11 (`--input-dir`
+  per-feature-type argparse validation, K6); `examples/configs/source/dspm-conn32.yaml` `snr_trial` comment
+  annotated "(wired in B5)".
+- **Known breaks recorded (deferred, do not fix here)**: the evoked/trials schema change keeps the
+  documented P4 connectivity break (unchanged; `cli/connectivity.py:177` globs `*_roi_tc.npz`, now the
+  **evoked-only** archive — trials live in `*_roi_tc_trials.npz`); the Streamlit source page
+  (`ui/pages/10_source_reconstruction.py`) still offers `aparc`/`schaefer100` parcellations, a free-text
+  variant (default `eLORETA-CONN32`, line 91 — changing the method without renaming the variant now raises
+  `ValidationError`) and `depends_on.epochs: null`, all rejected by the new schema — UI is out of B4 scope.
+- Re-audit scope: `core/config.py` source models, `modules/source/__init__.py` (config/selection/
+  output paths), `cli/source_reconstruct.py`, `modules/features/source_erp_features.py`,
+  `cli/features.py` + parser, `steps/channel_roles.py`, `steps/bad_channels_pinned.py`,
+  `steps/interpolate.py`, `_BadChannelDetectorWrapper`, the new/updated tests.
+
 ## Next actions (queue)
 
 - [x] Batch 0 — environment, skill, AGENTS.md, audit brief (done 2026-10-13)
@@ -324,8 +468,10 @@ block-rejection append, `hbn_recording_qc` ASR fields, `workflow/state.py` encod
 - [ ] Implementation batches B1…B8 (DeepSeek V4.1 Flash `#max`): per batch → builder-validator →
       K3 pre-audit → Opus 5.5 final audit on milestone batches (B1, B2, B4, B6, B7) and whenever
       K3 flags a blocker. → **B1 verified 2026-10-14; B2 verified 2026-10-14; B3 verified 2026-10-15
-      (Qwen3.8-Max stand-in audit + rev2 confirmation). Next: B4** (source config wiring + modes +
-      consumer + P1 bad-channel detector) — ready to start.
+      (Qwen3.8-Max stand-in audit + rev2 confirmation). B4 implemented 2026-10-15; Opus 5.5 final
+      audit → `revise`; rev1 fixes applied 2026-10-15 (log-scale detector + real-data validation,
+      config bounds, condition-name guards, test honesty, accepted items assigned) — awaiting
+      re-audit. Next after B4 re-audit: B5** (source hardening + provenance).
 - [ ] **Final-audit model note:** Opus 5.5 was intermittently unavailable for B3; per user decision
       the B3 final audit ran on Qwen3.8-Max. B4/B6/B7 milestone audits: try Opus 5.5 first, fall back
       to Qwen3.8-Max (or Kimi K3) only with a recorded note.

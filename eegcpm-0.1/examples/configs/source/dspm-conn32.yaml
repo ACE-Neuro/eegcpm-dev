@@ -1,8 +1,11 @@
 # Source Reconstruction Configuration
-# dSPM with CONN 32-ROI parcellation
+# dSPM with CONN 32-ROI parcellation (evoked source-ERP path)
+#
+# Single schema (P2-F5): nested forward/inverse sections; unknown or flat keys
+# raise. The variant must start with the method (variant: dSPM-CONN32).
 
 stage: source
-name: dSPM-CONN32
+variant: dSPM-CONN32
 description: dSPM inverse solution with CONN network ROIs
 depends_on:
   preprocessing: standard
@@ -10,17 +13,35 @@ depends_on:
 
 # Inverse solution parameters
 method: dSPM
-snr: 3.0
-loose: 0.2
-depth: 0.8
-
-# Parcellation
-parcellation: conn_networks  # Use CONN 32-ROI template
-use_conn_rois: true
 
 # Forward model
-spacing: oct6
-conductivity: [0.3, 0.006, 0.3]  # 3-layer BEM (brain, skull, scalp)
+forward:
+  template: fsaverage
+  spacing: oct6
+
+# Inverse parameters
+inverse:
+  snr: 3.0        # lambda2 = 1/snr**2 for the evoked ROI ERP
+  snr_trial: 1.0  # lambda2 for single trials (mode: trials/both); wired in B5
+  loose: 0.2
+  depth: 0.8
+
+# Parcellation (conn_networks is the only implemented scheme)
+parcellation: conn_networks
+roi_radius: 10.0          # mm; midline ROIs use 15 mm
+roi_radius_midline: 15.0
+roi_min_vertices: 3
+
+# Output mode: evoked (2-D ROI ERP) | trials (3-D) | both
+mode: evoked
+min_trials: 10            # fewer trials -> condition skipped loudly
+# equalize_trials: 20     # optional: seeded per-condition trial count (removes sqrt(nave) confound)
+
+# Output options
+output:
+  save_stc: true          # full source estimates (evoked mode only)
+  save_roi_tc: true       # {subject}_roi_tc.npz / {subject}_roi_tc_trials.npz
+  generate_qc: true       # QC report
 
 # Output location automatically determined by:
 # derivatives/source/{preprocessing}/{task}/variant-dSPM-CONN32/{subject}/ses-{session}/

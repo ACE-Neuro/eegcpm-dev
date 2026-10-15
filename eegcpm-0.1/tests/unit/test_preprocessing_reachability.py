@@ -27,6 +27,7 @@ from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
     detect_bad_channels,
     apply_bad_channels,
 )
+from eegcpm.modules.preprocessing.steps.base import RecordingExcluded
 from eegcpm.modules.preprocessing.steps.channel_roles import (
     ChannelRolesStep,
     EGI_129_REFERENCE_CHANNEL,
@@ -60,9 +61,10 @@ def _make_egi_129_raw_with_montage(duration_s=10, sfreq=500, seed=42,
 def test_pinned_detector_marks_high_amplitude_channels():
     """A channel with large amplitude should be detected."""
     raw = _make_egi_129_raw_with_montage(n_bad_channels=3, bad_amplitude=50.0)
-    # Apply channel roles so Cz has is_reference
+    # Apply channel roles; the exemption travels as metadata (P1-F5)
     raw, _ = ChannelRolesStep().process(raw, {})
-    bads = detect_bad_channels(raw, threshold_sd=THRESHOLD_SD)
+    bads, _report = detect_bad_channels(
+        raw, threshold_sd=THRESHOLD_SD, exempt=(EGI_129_REFERENCE_CHANNEL,))
     assert "E1" in bads or "E2" in bads or "E3" in bads, (
         f"Pinned detector did not flag the high-amplitude channels; "
         f"got {bads}"
@@ -70,31 +72,36 @@ def test_pinned_detector_marks_high_amplitude_channels():
 
 
 def test_pinned_detector_caps_at_max_bad_channels():
-    """The detector caps bad channels at MAX_BAD_CHANNELS."""
+    """The old silent cap was replaced by exclusion (P1-F5): MORE than
+    MAX_BAD_CHANNELS detections raise ``RecordingExcluded`` with the full
+    detected list — never a truncated bad list."""
     # Inject MORE than MAX_BAD_CHANNELS high-amplitude channels
     raw = _make_egi_129_raw_with_montage(
         n_bad_channels=MAX_BAD_CHANNELS + 5, bad_amplitude=100.0)
     raw, _ = ChannelRolesStep().process(raw, {})
-    bads = detect_bad_channels(raw, threshold_sd=THRESHOLD_SD)
-    assert len(bads) <= MAX_BAD_CHANNELS, (
-        f"Detector returned {len(bads)} bads; cap is "
-        f"{MAX_BAD_CHANNELS}"
-    )
+    with pytest.raises(RecordingExcluded) as excinfo:
+        detect_bad_channels(
+            raw, threshold_sd=THRESHOLD_SD, exempt=(EGI_129_REFERENCE_CHANNEL,))
+    assert excinfo.value.reason == "too_many_bad_channels"
+    assert excinfo.value.metrics["n_detected"] > MAX_BAD_CHANNELS
+    assert len(excinfo.value.metrics["detected"]) == excinfo.value.metrics["n_detected"]
 
 
 def test_pinned_detector_exempts_cz_before_detection():
-    """Cz is exempt BEFORE detection. Even if Cz is identically
-    zero (which would otherwise be flagged by the variance
-    detector), it is NEVER in the bad list."""
+    """Cz is exempt BEFORE detection via ``exempt=``. Even if Cz is identically
+    zero (which would otherwise be flagged by the flat/variance detector), it is
+    NEVER in the bad list."""
     raw = _make_egi_129_raw_with_montage(n_bad_channels=2, bad_amplitude=50.0)
     raw, _ = ChannelRolesStep().process(raw, {})
     # Cz is the recording reference; it's identically zero pre-ref
     cz_idx = raw.ch_names.index(EGI_129_REFERENCE_CHANNEL)
     raw._data[cz_idx] = 0.0   # fully zero
-    bads = detect_bad_channels(raw, threshold_sd=THRESHOLD_SD)
+    bads, report = detect_bad_channels(
+        raw, threshold_sd=THRESHOLD_SD, exempt=(EGI_129_REFERENCE_CHANNEL,))
     assert EGI_129_REFERENCE_CHANNEL not in bads, (
         f"Cz was incorrectly flagged as bad: {bads}"
     )
+    assert EGI_129_REFERENCE_CHANNEL not in report["flat"]
 
 
 def test_pinned_detector_apply_does_not_interpolate():
@@ -102,8 +109,9 @@ def test_pinned_detector_apply_does_not_interpolate():
     later step (not applied here)."""
     raw = _make_egi_129_raw_with_montage(n_bad_channels=2, bad_amplitude=50.0)
     raw, _ = ChannelRolesStep().process(raw, {})
-    new_bads = detect_bad_channels(raw, threshold_sd=THRESHOLD_SD)
-    raw = apply_bad_channels(raw, new_bads)
+    new_bads, _report = detect_bad_channels(
+        raw, threshold_sd=THRESHOLD_SD, exempt=(EGI_129_REFERENCE_CHANNEL,))
+    raw = apply_bad_channels(raw, new_bads, exempt=(EGI_129_REFERENCE_CHANNEL,))
     # The data values are unchanged (mark-only)
     pre_data = raw._data.copy()
     # The bads list is updated

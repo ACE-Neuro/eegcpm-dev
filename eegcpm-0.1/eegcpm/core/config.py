@@ -379,37 +379,74 @@ class EpochsConfig(BaseModel):
 
 
 class ForwardConfig(BaseModel):
-    """Forward model configuration for source reconstruction."""
+    """Forward model configuration for source reconstruction.
+
+    ``extra='forbid'`` (P2-F5): the nested ``forward`` section must actually be
+    consumed; unknown/misplaced keys (e.g. a flat top-level ``spacing``) raise
+    instead of being silently ignored.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     template: str = Field(default="fsaverage", description="Template head model")
     spacing: str = Field(default="oct6", description="Source space spacing (oct5, oct6, ico4, ico5)")
 
 
 class InverseConfig(BaseModel):
-    """Inverse operator configuration for source reconstruction."""
-    snr: float = Field(default=3.0, description="Signal-to-noise ratio")
+    """Inverse operator configuration for source reconstruction.
+
+    ``extra='forbid'`` (P2-F5). ``snr`` drives the evoked lambda2 (1/snr**2);
+    ``snr_trial`` drives the single-trial lambda2 (wired in B5).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    snr: float = Field(default=3.0, description="Signal-to-noise ratio (evoked)")
+    snr_trial: float = Field(default=1.0, description="Signal-to-noise ratio (single trials)")
     loose: float = Field(default=0.2, description="Loose orientation constraint (0-1, 0=fixed, 1=free)")
     depth: float = Field(default=0.8, description="Depth weighting (0-1)")
+    method_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Extra method parameters passed to apply_inverse (e.g. eLORETA force_equal)",
+    )
 
 
 class SourceOutputConfig(BaseModel):
-    """Source reconstruction output configuration."""
+    """Source reconstruction output configuration (``extra='forbid'``, P2-F5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
     save_stc: bool = Field(default=True, description="Save full source estimates")
     save_roi_tc: bool = Field(default=True, description="Save ROI time courses")
     generate_qc: bool = Field(default=True, description="Generate QC report")
+    compute_crosstalk: bool = Field(
+        default=True, description="Compute ROI x ROI crosstalk for QC (B7)"
+    )
 
 
 class SourceConfig(BaseModel):
-    """Source reconstruction configuration."""
+    """Source reconstruction configuration.
+
+    One schema for the source stage (P2-F5): ``extra='forbid'`` so the two legacy
+    dialects (flat ``snr``/``spacing``/``trial_level`` keys, or unlisted keys) are
+    hard errors instead of silently-ignored parameters. ``variant`` defaults to
+    ``f"{method}-CONN32"`` and must match ``method`` when given.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     stage: str = Field(default="source", description="Processing stage")
-    variant: str = Field(default="sLORETA-CONN32", description="Variant name (e.g., 'dSPM-CONN32')")
+    variant: Optional[str] = Field(
+        default=None, description="Variant name (e.g., 'dSPM-CONN32'); defaults to '{method}-CONN32'"
+    )
+    description: Optional[str] = Field(default=None, description="Config description")
 
     depends_on: Dict[str, str] = Field(
         default_factory=dict,
         description="Dependencies: {preprocessing: variant, task: name, epochs: variant}"
     )
 
-    method: str = Field(
+    method: Literal["dSPM", "sLORETA", "eLORETA", "MNE"] = Field(
         default="sLORETA",
         description="Inverse method: dSPM, sLORETA, eLORETA, MNE"
     )
@@ -417,9 +454,9 @@ class SourceConfig(BaseModel):
     forward: ForwardConfig = Field(default_factory=ForwardConfig, description="Forward model parameters")
     inverse: InverseConfig = Field(default_factory=InverseConfig, description="Inverse operator parameters")
 
-    parcellation: str = Field(
+    parcellation: Literal["conn_networks"] = Field(
         default="conn_networks",
-        description="Parcellation: conn_networks (32 ROIs), aparc (68), schaefer100, etc."
+        description="Parcellation: conn_networks (32 ROIs) is the only implemented scheme",
     )
     roi_radius: float = Field(default=10.0, description="ROI extraction radius in mm")
     roi_radius_midline: float = Field(
@@ -436,8 +473,43 @@ class SourceConfig(BaseModel):
         default=None, description="Subjects directory for the source space (default: cached fsaverage)"
     )
 
+    mode: Literal["evoked", "trials", "both"] = Field(
+        default="evoked",
+        description="Output mode: evoked ROI ERP (2-D), single trials (3-D), or both",
+    )
+    min_trials: int = Field(
+        default=10,
+        ge=1,
+        description="Minimum trials per condition; fewer are skipped loudly",
+    )
+    equalize_trials: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Randomly select this many trials per condition (seeded) to remove "
+            "the sqrt(nave) confound; must be >= 1 (0 would write zero-trial arrays)"
+        ),
+    )
+    random_seed: int = Field(
+        default=42,
+        ge=0,
+        description="Seed for equalize_trials selection (numpy Generator seeds are non-negative)",
+    )
+
     subjects: Any = Field(default="all", description="Subject selection ('all' or list of subject IDs)")
     output: SourceOutputConfig = Field(default_factory=SourceOutputConfig, description="Output options")
+
+    @model_validator(mode="after")
+    def _derive_and_check_variant(self) -> "SourceConfig":
+        """Default ``variant`` to ``{method}-CONN32``; reject method mismatches."""
+        if self.variant is None:
+            self.variant = f"{self.method}-CONN32"
+        elif self.variant.split("-")[0].lower() != self.method.lower():
+            raise ValueError(
+                f"variant {self.variant!r} does not match method {self.method!r}; "
+                f"the variant must start with the method (e.g. '{self.method}-CONN32')"
+            )
+        return self
 
     @classmethod
     def from_yaml(cls, config_path: Path) -> "SourceConfig":

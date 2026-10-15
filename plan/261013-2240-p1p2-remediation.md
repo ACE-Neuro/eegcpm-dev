@@ -627,6 +627,9 @@ module config/condition logic, consumer + CLI entry, detector/interpolate/channe
    in `apply_inverse_epochs`. Helper `_resolve_method_params(method, loose, user)` → for `eLORETA` with
    `0 < loose < 1` returns `{'force_equal': True, **(user or {})}`, else `user` (may be None). Pass
    `method_params=` to both `apply_inverse` and `apply_inverse_epochs`.
+   **B4-N5 spy note:** the λ² spy test must wrap the *original* `apply_inverse_epochs` and assert
+   `lambda2 == 1.0/snr_trial**2` on a config with a non-default `snr_trial` (a missing kwarg silently
+   falls back to the evoked lambda2; asserting the default 1.0 would not catch it).
 3. **Forward (F13)**: delete the single-shell branch and the dead `bem_path` reassignment; helper
    `_load_bem(subjects_dir)` raises `FileNotFoundError` if `fsaverage/bem/fsaverage-5120-5120-5120-bem-sol.fif`
    is missing. `make_forward_solution(info, trans='fsaverage', src=src, bem=bem_sol, eeg=True, meg=False, mindist=5.0)`.
@@ -654,13 +657,27 @@ module config/condition logic, consumer + CLI entry, detector/interpolate/channe
    `_select_epoch_file(session_dir) -> Path` raises on 0 or >1 `*_epo.fif` (session counted failed with that
    message); pass `epochs_path`. Remove the `except Exception: continue` in the task-config scan (line ~92):
    report the unreadable file and fail.
+7. **Condition selection by event-code values (B4-N3, folds in B4-K1)**: replace the exact
+   `str(code) in epochs.event_id` key membership with `np.isin(epochs.events[:, 2], [epochs.event_id[k] for k in
+   codes if k in epochs.event_id])` (task-config codes may be names *or* numeric strings), plus the numeric-code
+   fallback of `EventSorter.sort_by_condition` (`core/task_config.py:150-157`). Fixes both the loud
+   "no matching events" for epochs not produced by this repo's stage and the `/`-tag over-selection (e.g. an
+   event named `a/b` matching a task-config code `a`).
+8. **Atomic / stale-output-safe source writes (B4-K5 widened)**: write stc/npz/QC/provenance outputs to a temp
+   name and rename, or delete the target at start, so an IO failure mid-write never leaves partial artifacts
+   behind a `success=False` result (and a re-run never mixes old and new files). The features consumer must
+   require provenance/config-hash (reject a `*_roi_tc.npz` without one) so stale outputs from a previous config
+   are not silently consumed.
+9. **Features CLI reporting (B4-N4)**: `source_erp` discovery reports missing subjects/sessions loudly (counted
+   in the summary) instead of silently producing an empty feature CSV.
 
 **Tests** — `test_source_hardening.py` (covariance guard tests live in B2):
 `_resolve_method_params('eLORETA', 0.2, None) == {'force_equal': True}`, `('dSPM', 0.2, None) is None`;
 `_load_bem(tmp_path)` → `FileNotFoundError`; pre-flight: no montage → "montage"; `make_dig_montage(ch_pos=..., coord_frame='head')`
 without fiducials → "fiducials"; standard GSN-HydroCel-129 passes with `max_mm < 25`; all positions shifted
-+40 mm → fails; spy on `eegcpm.modules.source.apply_inverse_epochs` (wrap original) in `mode='trials'` captures
-`lambda2 == 1.0` and `pick_ori == 'normal'`; after a dipole-fixture run, provenance JSON contains every key of
++40 mm → fails; spy on `eegcpm.modules.source.apply_inverse_epochs` (wrap original) in `mode='trials'` with a
+**non-default** `snr_trial` captures `lambda2 == 1.0/snr_trial**2` and `pick_ori == 'normal'` (N5: asserting
+the default 1.0 would not catch a missing kwarg); after a dipole-fixture run, provenance JSON contains every key of
 task 5, `mne.read_cov` and `mne.minimum_norm.read_inverse_operator` reload the files;
 `_select_epoch_file` raises for two files. eLORETA smoke run (`fsaverage`, `slow`) succeeds.
 
@@ -827,6 +844,11 @@ new `tests/unit/test_hbn_chain_e2e.py`, `tests/unit/test_source.py`, `.github/wo
     off-diagonal entry is finite and < 1; (b) permuting two label indices permutes the corresponding
     rows/columns of `C` (proves per-label vertex indexing; fails for whole-brain averaging). If (a) fails
     physically (leakage), report the value to the auditor — never loosen the assertion.
+11. **Features CLI argparse validation (B4-K6)**: `--input-dir` is optional for every `--feature-type`, so a
+    non-`source_erp` type with `--input-dir` (or `source_erp` without a resolvable `--source` variant) fails at
+    runtime with a `FileNotFoundError` instead of an argparse error. Validate the per-feature-type argument
+    combinations in the argparse layer (reject/require `--input-dir` per type) so the CLI exits 2 with a usage
+    message instead of a traceback.
 
 **Validation:** full standard command (only the 2 baseline connectivity failures may remain);
 `.venv/bin/python -m pytest tests/unit/test_no_silent_continue.py -q --no-cov -p no:cacheprovider -rA` shows files scanned > 50.
@@ -922,3 +944,12 @@ renaming hard-coded ROI names; REST API; user management; `_legacy` code (exclud
    (b) switch to `pca_flip` (still signed), (c) redefine midline ROIs (split by hemisphere or use
    surface patches instead of spheres). **User decision required before P2 condition 4 is
    marked verified.**
+5. **Bad-channel detector calibration on real data (B4-D2, Opus B4 re-audit 2026-10-15 — ⛔ blocks
+   any real-data chain run; owner B6 tier-2):** with the user-chosen log-scale rule, only **5/12**
+   non-corrupt pilot recordings stay within the 11-channel budget. Over-flagging comes from
+   kurtosis (frontal blink clusters — the detector runs before EOG regression) and variance in
+   movie tasks; the upper-tail-only rule also misses near-flat channels above the absolute
+   1e-20 V² floor. Options: (i) kurtosis after EOG regression / exclude blink segments;
+   (ii) log-scale or upper-tail kurtosis; (iii) relative near-flat floor (`var < 1e-3 × median`
+   or log-variance z < −K) as `flat`; (iv) recalibrate the budget on pilot-50. Decide before
+   B6/B8 real-data runs.

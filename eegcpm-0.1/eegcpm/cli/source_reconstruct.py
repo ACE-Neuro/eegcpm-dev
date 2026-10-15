@@ -1,8 +1,11 @@
 """CLI command for source reconstruction."""
 
+import sys
 from pathlib import Path
 from typing import List, Optional
 import mne
+
+from pydantic import ValidationError
 
 from eegcpm.core.config import SourceConfig
 from eegcpm.core.task_config import TaskConfig
@@ -35,10 +38,17 @@ def source_reconstruct_command(args):
 
     # Load configuration
     print(f"Loading config: {config_path}")
-    source_config = SourceConfig.from_yaml(config_path)
+    try:
+        source_config = SourceConfig.from_yaml(config_path)
+    except ValidationError as exc:
+        # B4/P2-F5: the source config is a single extra='forbid' schema; an
+        # invalid/flat config must exit non-zero instead of silently no-op'ing.
+        print(f"❌ Invalid source configuration: {exc}", file=sys.stderr)
+        raise SystemExit(1)
     print(f"   Method: {source_config.method}")
     print(f"   Variant: {source_config.variant}")
     print(f"   Parcellation: {source_config.parcellation}")
+    print(f"   Mode: {source_config.mode}")
 
     # Initialize paths
     paths = EEGCPMPaths(project_root)

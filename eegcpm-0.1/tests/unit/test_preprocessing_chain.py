@@ -69,9 +69,10 @@ def test_channel_roles_keeps_cz_eeg_typed_with_is_reference():
     step = ChannelRolesStep()
     out, meta = step.process(raw, {})
     assert EGI_129_REFERENCE_CHANNEL in out.ch_names
-    # is_reference is stored on the raw object (MNE info['chs'] is
-    # restricted; we use raw._eegcpm_reference_channels).
-    assert out._eegcpm_reference_channels.get(EGI_129_REFERENCE_CHANNEL) is True
+    # The reference channel travels as metadata (P1-F5); the old
+    # raw._eegcpm_reference_channels side attribute was removed.
+    assert meta["reference_channel"] == EGI_129_REFERENCE_CHANNEL
+    assert not hasattr(out, "_eegcpm_reference_channels")
     assert out.get_channel_types(picks=[EGI_129_REFERENCE_CHANNEL])[0] == "eeg"
 
 
@@ -190,18 +191,42 @@ def test_reference_includes_cz_via_eeg_typing():
 # --- Cz-exemption fixture test (S19) ---
 
 def test_cz_exempt_from_bad_channel_detection():
-    """A recording with Cz as a flat (zero) channel must NOT
-    fail the bad-channel gate. Other flat channels MUST be
-    detected."""
-    raw = _make_egi_129_raw()
+    """Flat Cz + a heavy-tailed channel: Cz stays out of the bad list, the
+    heavy-tailed channel is detected, and every non-exempt kurtosis z-score
+    stays finite (P1-F5: a single flat channel must not NaN the criterion for
+    all channels)."""
+    from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
+        detect_bad_channels,
+    )
+    raw = _make_egi_129_raw(seed=1)
+    rng = np.random.RandomState(7)
+
     # Make Cz identically zero (the flat-channel case)
     cz_idx = raw.ch_names.index(EGI_129_REFERENCE_CHANNEL)
     raw._data[cz_idx] = 0.0
-    # Apply channel_roles
+
+    # One heavy-tailed channel: Gaussian + 50 spikes at 20x SD
+    ht_idx = raw.ch_names.index("E50")
+    spikes = rng.choice(raw.n_times, 50, replace=False)
+    raw._data[ht_idx, spikes] += 20.0 * raw._data[ht_idx].std()
+
+    # Apply channel_roles; the exemption travels as metadata.
     step = ChannelRolesStep()
-    raw, _ = step.process(raw, {})
-    # Cz is still in the channels
-    assert EGI_129_REFERENCE_CHANNEL in raw.ch_names
+    raw, roles_meta = step.process(raw, {})
+
+    bads, report = detect_bad_channels(
+        raw, exempt=(roles_meta["reference_channel"],)
+    )
+    assert "E50" in bads, f"heavy-tailed channel not detected; got {bads}"
+    assert "kurtosis" in report["reasons"]["E50"]
+    assert EGI_129_REFERENCE_CHANNEL not in bads
+    assert report["exempt"] == [EGI_129_REFERENCE_CHANNEL]
+
+    kurt_z = [entry["kurtosis"] for entry in report["z_scores"].values()]
+    assert kurt_z
+    assert all(z is not None and np.isfinite(z) for z in kurt_z), (
+        "kurtosis z-scores are not all finite; a flat channel disabled the criterion"
+    )
 
 
 # --- Reachability test for Cz-included-in-average-reference ---
