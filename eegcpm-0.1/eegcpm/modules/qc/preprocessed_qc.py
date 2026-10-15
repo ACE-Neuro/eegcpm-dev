@@ -311,7 +311,12 @@ class PreprocessedQC(BaseQC):
             zapline_meta = preprocessing_metadata.get('zapline', {})
             if zapline_meta and zapline_meta.get('applied', False):
                 detected_freq = zapline_meta.get('detected_freq')
-                n_components = zapline_meta.get('n_components_removed', 0)
+                # B6: `n_components_removed` is the per-frequency dict from the
+                # pyzaplineplus analytics; the scalar total is the readable value
+                # (same read as run_processor.py).
+                n_components = zapline_meta.get(
+                    'n_components_removed_total',
+                    zapline_meta.get('n_components_removed', 0))
                 line_reduction_db = zapline_meta.get('line_reduction_db', 0)
 
                 if detected_freq is not None:
@@ -444,7 +449,10 @@ class PreprocessedQC(BaseQC):
             if zapline_meta.get('applied', False):
                 detected_freq = zapline_meta.get('detected_freq')
                 line_reduction_db = zapline_meta.get('line_reduction_db', 0)
-                n_components = zapline_meta.get('n_components_removed', 0)
+                # B6: scalar total, not the per-frequency dict (see above).
+                n_components = zapline_meta.get(
+                    'n_components_removed_total',
+                    zapline_meta.get('n_components_removed', 0))
 
                 # Status: good if >10 dB, warning if 5-10 dB, bad if <5 dB
                 if line_reduction_db >= 10:

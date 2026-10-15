@@ -116,6 +116,10 @@ logs/
 *.pkl
 *.pickle
 
+# Pinned test fixtures are inputs, not generated data (B6 task 2): the
+# robust-PCA exact-recovery fixture must stay versioned.
+!tests/fixtures/**/*.npz
+
 # Temporary files
 tmp/
 temp/

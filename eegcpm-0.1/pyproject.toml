@@ -52,6 +52,22 @@ asr = [
     "eegprep>=0.0.4",
     "eeglabio>=0.1.3",
 ]
+pipeline = [
+    # The verified pipeline environment (P1-F21). Exact pins: the golden
+    # resolved-config hash covers these library versions, so a bump must be
+    # deliberate (re-pin GOLDEN_RESOLVED_HASHES after any change; see
+    # eegcpm/core/config_hash.py for the one-liner).
+    # NEW-5 (B6 rev2): numpy/scipy pinned too — mne's filter/PSD/SVD numerics
+    # are what the detector and the resolved hash depend on.
+    "numpy==2.5.4",
+    "scipy==1.18.1",
+    "mne==1.13.2",
+    "mne-icalabel==0.10.0",
+    "eegprep==0.4.0",
+    "pyzaplineplus==0.1.0",
+    "eeglabio==0.1.4",
+    "autoreject==0.5.1",
+]
 all = [
     "streamlit>=1.20",
     "streamlit-local-storage==0.0.25",

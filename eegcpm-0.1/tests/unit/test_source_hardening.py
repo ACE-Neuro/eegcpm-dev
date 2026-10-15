@@ -357,6 +357,7 @@ PROVENANCE_KEYS = {
     "method",
     "parcellation",
     "mode",
+    "forward_source",
     "spacing",
     "subjects_dir",
     "bem",
@@ -381,6 +382,8 @@ PROVENANCE_KEYS = {
     "conditions_produced",
     "conditions_missing",
     "conditions_skipped",
+    "resolved_event_codes",
+    "run_identity_hash",
     "labels",
     "roi_flip_summary",
     "montage_check",
@@ -393,6 +396,68 @@ PROVENANCE_KEYS = {
 
 @pytest.mark.fsaverage
 @pytest.mark.slow
+def test_template_asset_key_tracks_mtime_and_size(tmp_path):
+    """B5-A4: replacing the template BEM/trans contents in place changes the key.
+
+    The forward cache key used to cover the filenames only, so a replaced BEM
+    file kept handing out the stale forward.
+    """
+    import os
+    import time
+
+    from eegcpm.modules.source import SourceReconstructionModule
+
+    bem_dir = tmp_path / "fsaverage" / "bem"
+    bem_dir.mkdir(parents=True)
+    bem = bem_dir / "fsaverage-5120-5120-5120-bem-sol.fif"
+    trans = bem_dir / "fsaverage-trans.fif"
+    bem.write_bytes(b"a" * 10)
+    trans.write_bytes(b"b" * 10)
+
+    key1 = SourceReconstructionModule._template_asset_key(tmp_path)
+    assert key1 == SourceReconstructionModule._template_asset_key(tmp_path)
+    assert "missing" not in key1
+
+    bem.write_bytes(b"a" * 20)
+    os.utime(bem, (time.time() + 10, time.time() + 10))
+    key2 = SourceReconstructionModule._template_asset_key(tmp_path)
+    assert key2 != key1
+
+    missing = SourceReconstructionModule._template_asset_key(tmp_path / "nope")
+    assert missing.count("missing") == 2
+
+
+def test_run_identity_hash_combines_config_and_condition_mapping(tmp_path):
+    """B5-N3: the identity is config hash + resolved condition mapping.
+
+    Two runs with the same ``SourceConfig`` but different resolved
+    ``{condition: codes, matched_event_values}`` mappings are different runs
+    and must not share an identity hash.
+    """
+    from eegcpm.modules.source import SourceReconstructionModule
+
+    module = SourceReconstructionModule({"method": "dSPM"}, tmp_path)
+    selection_a = {
+        "resolved_event_codes": {
+            "stim": {"codes": ["stim"], "matched_event_values": [1]},
+        },
+    }
+    selection_b = {
+        "resolved_event_codes": {
+            "stim": {"codes": ["stim"], "matched_event_values": [2]},
+        },
+    }
+    hash_a = module.run_identity_hash(selection_a)
+    assert hash_a == module.run_identity_hash(selection_a)
+    assert hash_a != module.run_identity_hash(selection_b)
+
+    # A config change changes the identity even for the same mapping.
+    module_other = SourceReconstructionModule(
+        {"method": "dSPM", "inverse": {"snr": 5.0}}, tmp_path)
+    assert module_other.config_hash() != module.config_hash()
+    assert module_other.run_identity_hash(selection_a) != hash_a
+
+
 def test_provenance_and_reloadable_artifacts(hardening_forward, tmp_path):
     subjects_dir = hardening_forward["subjects_dir"]
     # Stale artifacts of a previous run: a dropped condition's stc and a trials
@@ -431,6 +496,7 @@ def test_provenance_and_reloadable_artifacts(hardening_forward, tmp_path):
     assert not missing_keys, f"provenance keys missing: {sorted(missing_keys)}"
 
     assert provenance["config_hash"] == sha256_json(module.cfg.model_dump(mode="json"))
+    assert provenance["forward_source"] == "template"
     assert provenance["method"] == "dSPM"
     assert provenance["pick_ori"] == "normal"
     assert provenance["label_extraction_mode"] == "mean_flip"

@@ -6,8 +6,11 @@
 # pinned values, NOT consumed configuration — do not re-introduce them
 # as real keys (the schema forbids unknown keys).
 #
-# Any content change breaks the golden-config-hash CI test — change
-# requires a new parity run.
+# P1-F7: the preprocessing stage is pinned by the *resolved* config hash
+# (`resolved_config_hash(PreprocessingPipeline('hbn_langer'))`, literal in
+# eegcpm/core/config_hash.py::GOLDEN_RESOLVED_HASHES), not by this file's
+# bytes — a chain or step-parameter change breaks the golden-hash test;
+# editing comments here does not.
 stage: preprocessing
 variant: hbn_langer
 description: Deterministic Langer+ASR chain (code-defined; see build_hbn_langer_chain)
@@ -39,6 +42,8 @@ is_primary: true
 #   mark_only: true                # interpolation is a separate later step
 #   exempt_reference: true         # Cz exempt BEFORE detection
 #   max_bad_scalp: 11              # of 109 (per-recording inclusion gate)
+#   kurtosis_on_blink_free_samples: true   # B4-D2: +/-200 ms around find_eog_events
+#   relative_near_flat_floor: true         # B4-D2: variance < 1e-3 x median -> flat
 #
 # interpolate:
 #   method: spherical_spline
@@ -46,14 +51,14 @@ is_primary: true
 #
 # eog_regression:
 #   enabled: true
-#   solver: lstsq                  # SVD-based, rank/condition diagnostics
+#   solver: lstsq                  # single multi-target solve, rank/condition diagnostics
 #
 # robust_pca:
-#   enabled: true
-#   method: ialm
-#   lam: 0.00316227766             # 1/sqrt(max(n_channels=109, n_times=100000)) canonical
-#   max_iter: 1000
-#   tol: 1.0e-7
+#   REMOVED from the chain (P1-F2, Checkpoint A decision (a) 2026-10-15):
+#   the pinned IALM solve absorbs most of the ERP into the discarded sparse
+#   component (synthetic retention 2-28%). The step class stays available for
+#   standalone use; the removal is a recorded spec deviation
+#   (HBN_LANGER_SPEC_DEVIATIONS / get_config()['spec_deviations']).
 #
 # asr:
 #   enabled: true

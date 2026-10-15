@@ -313,8 +313,16 @@ class WorkflowStateManager:
             if state.created_at is None:
                 state.created_at = state.updated_at
 
-            # Serialize metadata
-            metadata_json = json.dumps(state.metadata) if state.metadata else None
+            # Serialize metadata. B3-K5: route through the numpy-aware
+            # encoder — a bare json.dumps raises TypeError on a numpy
+            # scalar (crashing save_state) and writes non-strict JSON
+            # (`-Infinity`) for non-finite floats. The resolved_config /
+            # config_hash / library_versions provenance written by the
+            # preprocessing sidecar makes this path live.
+            metadata_json = (
+                json.dumps(_make_json_serializable(state.metadata))
+                if state.metadata else None
+            )
 
             # Insert or update workflow
             cursor = conn.execute("""

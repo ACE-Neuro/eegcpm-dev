@@ -198,6 +198,7 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | 2026-10-15 | P1 | **RPCA decision (resolved)** | Option (a): **remove `RobustPCAStep` from the ERP chain** (9 steps), recorded as a spec deviation; golden hash pinned after removal in B6 | resolved (implement in B6) |
 | 2026-10-15 | P2 | **`mean_flip` decision (resolved)** | Option (a): keep `mean_flip`; document the uniform-patch attenuation (11/30 vs 22/30) and the midline polarity convention; P2 condition 4 sign-off after the docs land | resolved (docs at B6 tier-2) |
 | 2026-10-15 | P0/B8 | **Real data (resolved)** | Checkpoint B will use a pilot5 subject (`~/proj/adhd-hbn/data_raw/hbn-eeg/pilot5`) **and** the user's other dataset ("one EP one attention"; path TBD) | resolved |
+| 2026-10-16 | P1 | B6 implementation notes (for the auditor) | **RPCA removed** from `build_hbn_langer_chain()` (9 steps) with the deviation in `get_config`/`spec_deviations`; the golden resolved hash is pinned (`f3a40cd6…` rev1 → `73175626…` rev2 → **re-pinned `72c394e7…` after the scoped-re-audit ASR fix**, which now reports the fixed-first-60 s path truthfully) and covers the 9 chain steps + spec deviations + 9 library versions + the detector/ASR algorithm constants; **`robust_pca` was never in `STEP_REGISTRY`**, so "keep the step class + registry" was implemented as "keep the class importable" (adding a registry entry would newly enable it in YAML step lists); **B4-D2 detector**: kurtosis upper-tail on blink-free samples + relative near-flat floor implemented as the ratio rule only — the decision's `log-variance z < −K` alternative is documented as unusable (the lowest channel of the healthy fixture, at 29 % of the median variance, has z = −54, i.e. it flags healthy channels); pilot5 × 3 at rev1: **6/12** (Rest 4/4, DM 1/4, FF 1/4) — **superseded by rev2: 8/12 (Rest 4/4, DM 2/4, FF 2/4)** after log-Pearson kurtosis + band-passed blink ranking + EEG+EOG filtering; the movie-task over-budget (4/8 movie recordings) is genuine artifact burden, not blinks (a vertical-EOG reference mask finds 10–40× more blinks yet changes pass/fail on zero recordings); **blink under-detection persists** (band-passed-variance ranking still picks infraorbital channels in 9/12; 2–6 blinks vs 17–88 for the vertical-EOG reference; plausibility floor 1/min fires once) — carried to B8 (vertical-EOG derivation, floor ≈5/min); follow-ups: pilot-50 budget recalibration. **B6 rev2 (2026-10-16, Opus final-audit conditions NEW-1…NEW-10): EOG band-passed by the chain filter (NEW-1), band-passed blink-channel ranking + rate plausibility (NEW-2), log-Pearson upper-tail kurtosis (NEW-3), algorithm constants in `get_config` (NEW-4), numpy/scipy pinned (NEW-5), pilot table re-run in true chain order incl. zapline (NEW-6), stale RPCA numbers fixed (NEW-7), xfail `raises=AssertionError` + normal instrumentation tests (NEW-8), behavioural detector tests (NEW-9), RPCA write-back only on convergence (NEW-10); scoped-re-audit fix: ASR wrapper `get_config` fixed-path truthfulness + hash re-pin** | implemented 2026-10-16 + rev1 K3 fixes + rev2 final-audit fixes + scoped-re-audit fix; awaiting desk-check/commit |
 
 ## Remediation batches — `plan/261013-2240-p1p2-remediation.md`
 
@@ -208,7 +209,7 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | B3 | Timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper metadata | `[x]` **verified 2026-10-15** — final audit by Qwen3.8-Max (user-approved Opus 5.5 stand-in): `approve`; rev2 confirmed (`confirm-with-notes`) |
 | B4 | Source usability + config wiring + P1 bad-channel detector | `[x]` **verified 2026-10-15 (code scope)** — Opus final audit `revise` → rev1 applied (log-scale detector + config bounds + condition guards + test honesty) → scoped re-audit `approve`; B4-D2 **resolved 2026-10-15**: blink-aware detector design at B6 tier-2 (decisions log / plan §12.5) |
 | B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev1 applied (N1/N2/A1/A2/A3/A6/A7/N6) → scoped re-audit `approve`, no conditions left (residuals → B6/B7/B8) |
-| B6 | ⛔ Checkpoint A (RPCA) + instrumentation + golden resolved-config hash + P1 tier-2 debt | `[ ]` not started |
+| B6 | ⛔ Checkpoint A (RPCA) + instrumentation + golden resolved-config hash + P1 tier-2 debt | `[~]` implemented 2026-10-16 + rev1 K3 fixes + **rev2 Opus final-audit fixes (NEW-1…NEW-10) 2026-10-16** — awaiting re-audit |
 | B7 | QC truthfulness, test-suite honesty, CI job | `[ ]` not started |
 | B8 | End-to-end verification prep; ⛔ Checkpoint B (real EGI-129 subject) | `[ ]` not started |
 
@@ -557,6 +558,191 @@ Assignments: N3 + A4 → plan B6 tasks 19–20; A5 + N4 + N5 → plan B7 tasks 1
 mixed-config refusal/override, mandatory-artifacts rejection (missing + unlisted), trials-provenance
 pairing, caller-forward provenance, montage cache key. Scoped re-audit pending.
 
+B6 evidence (2026-10-16, working tree on `remediation/p1p2`, not committed) — **Checkpoint A
+decision (a), P1-F2/F7/F9/F13–F22 + B3-K9/B3-K5/B5-N3/B5-A4 + B4-D2**, plan §B6 tasks 1–20:
+
+- **Checkpoint A (RPCA removed)**: `build_hbn_langer_chain()` is now **9 steps**
+  (`channel_roles → zapline → filter → bad_channel_detection → interpolate → eog_regression → asr →
+  block_rejection → reference`); the step class stays for standalone use (it was never in
+  `STEP_REGISTRY` — there was no registry entry to "keep"). The deviation is machine-readable:
+  `HBN_LANGER_SPEC_DEVIATIONS = ["P1-F2: robust_pca removed (destroys ERP; synthetic retention
+  2-28%)"]` is part of `PreprocessingPipeline.get_config()` and therefore of the golden resolved
+  hash; the chain docstring records it. Instrumentation: `ialm_decompose(..., return_info=True)` →
+  `{'n_iter', 'converged'}` and `RobustPCAStep` metadata `nnz_S_frac`/`energy_S_frac`/`n_iter`/
+  `converged`. ERP-injection test (`tests/unit/test_robust_pca_erp.py`): 109 ch × 60 s / 250 Hz,
+  rank-10 mixed AR(1) + fixed-topography N1/P2 at 25 onsets → **retention 0.675** (topography corr
+  0.979, `nnz_S_frac` 0.999, `energy_S_frac` 0.131, `n_iter` **31, converged**) for the plan
+  fixture and **0.188** (corr 0.834, `n_iter` 27, converged) for the audit's 30-s destruction
+  regime [corrected 2026-10-16 (B6 rev2 NEW-7): the earlier "`n_iter` 200, not converged" was
+  stale — the frozen fixture converges; the forced-`max_iter=1` unit test exercises the
+  non-converged path]; both assertions on the
+  rejected acceptance criterion `retention >= 0.95` are `xfail(strict=True, raises=AssertionError)`
+  with the instrumentation/metadata facts in normal tests (B6 rev2 NEW-8), plus a normal test
+  asserting `robust_pca` is absent from the chain and the spec deviation is recorded. Fixture
+  restored (`tests/fixtures/robust_pca/lin2011_exact_recovery.npz`, sha256
+  `2ec821810142bcfae3dba35c0f85fcbac3cb8fae1c016caa27dff12ed8210e50`, in `INDEX.md`, `.gitignore`
+  negation `!tests/fixtures/**/*.npz`), loaded via `Path(__file__).resolve().parents[1]` — the
+  `test_robust_pca.py` baseline failure is fixed.
+- **Golden config (P1-F7)**: every chain step/wrapper `get_config()` now returns all constructor
+  params + name/version/enabled/required (verified mechanically for all 9 steps).
+  `core/config_hash.py`: `library_versions()` (9 packages, `'not-installed'` fallback),
+  `resolved_config_hash(pipeline)`, and the literal
+  **`GOLDEN_RESOLVED_HASHES['hbn_langer'] = 731756264f5c1c79783acba79dee1913b491bd5e02801c3b54105f254edef975`**
+  (rev2 value, re-pinned after NEW-1…NEW-4; the rev1 value was
+  `f3a40cd6ab825513b840ffed333f1de0d425c51f584023caa8b685e28613f378`; computed in the pinned venv;
+  `library_versions` = eegcpm 0.1.0, mne 1.13.2,
+  numpy 2.5.4, scipy 1.18.1, eegprep 0.4.0, pyzaplineplus 0.1.0, eeglabio 0.1.4, autoreject 0.5.1,
+  mne-icalabel 0.10.0). `load_golden_hashes()` keeps all 5 `GOLDEN_CONFIG_NAMES` keys (parity-harness
+  compatibility): `'preprocessing'` → the resolved hash, the other 4 stages stay file-content hashes.
+  The executor sidecar records `resolved_config`/`config_hash`/`library_versions` for success,
+  FAILED and EXCLUDED runs; the CLI and `run_processor` set `workflow.config_hash` before
+  `save_state`. `ReferenceStep(check_reference_channel_variance='Cz')` (chain) asserts the
+  post-reference Cz column is finite and `> 0` else `RuntimeError` and reports
+  `reference_channel_post_ref_variance`. Tests: `test_config_hash.py` (+7 incl. the literal hash,
+  per-step param sensitivity over all 9 steps, library-version sensitivity, `'not-installed'`
+  fallback, the 5-key parity-harness golden path, `test_hbn_chain_all_required`, sidecar provenance);
+  chain-order tests updated to 9 steps.
+- **Tier-2**: zapline (`noisefreqs=[fline]` when set, real 4-tuple unpack, counts from
+  `analytics['noise_freq_<f>']['n_remove_final']` per chunk → `n_components_removed` dict +
+  `_by_chunk`/`_total`, `KeyError` on a missing key, detected freqs from `zap_config['noisefreqs']`);
+  EOG regression (single multi-target `lstsq`, equals the per-channel normal-equations solve within
+  1e-10, z-scored design condition number invariant to EOG scaling, `spec_deviation` metadata);
+  `ReferenceStep(type='rest')` → `NotImplementedError`, dead `exclude_bads` removed; correlation
+  detector over 5-cm **montage neighbours** with `np.nanmedian` (flat channel = bad; one flat channel
+  no longer NaNs everyone) and the RANSAC/PREP silent handlers now raise `RuntimeError`; ICA
+  `rank-1` = `min(max(5, r-1), r-1)` with `ValueError` for `r-1 < 1`; `pipeline` extra pins the six
+  exact versions; `MontageStep` raises `ValueError` listing NaN/zero-position EEG channels instead of
+  dropping them; `planning/EXCLUSION_CRITERIA.md` regenerated from the code; the four
+  `modules/preprocessing/artifacts.py` sites use `append_bad_annotations` (test: `meas_date=None`,
+  `first_samp=1000` → event samples unchanged in both frames); `workflow/state.py::save_state` routes
+  metadata through the numpy-aware encoder (numpy-scalar round-trip test); the source module records
+  `resolved_event_codes` + `run_identity_hash` (config hash + condition mapping) in metadata and
+  provenance, the features CLI writes `{feature_type}_{condition}.provenance.json` (source config
+  hashes, run identity hashes, parquet sha256, library versions) next to the parquet, the template
+  provenance test pins `forward_source == 'template'`, and the forward cache key includes the
+  BEM/trans `mtime_ns:size`. The `mean_flip` decision (plan §12 item 4) is documented in
+  `modules/source/__init__.py` (uniform-patch 11/30 vs 22/30 dominance; midline polarity convention
+  with `MPFC` lh −0.70 / rh +0.71 and one inverted ROI) and in plan §0.5.
+- **B4-D2 blink-aware detector** (user decision 2026-10-15, plan §12.5; rev2 fixes 2026-10-16:
+  NEW-1/NEW-2/NEW-3): kurtosis on **blink-free samples** (EOG-typed channel, else the most anterior
+  non-flat EEG proxy; `find_eog_events` ±200 ms; explicit recorded fallback to the full signal when
+  `>50%` masked or `<50%` usable; the ICLabel cross-check is documented as inapplicable — the
+  detector is chain step 4, before any ICA); the blink channel is ranked on **1–10 Hz band-passed
+  variance** (NEW-2: raw-variance ranking picks a drift-dominated infraorbital channel and
+  under-detects blinks on real data; a blink rate below `MIN_BLINK_RATE_PER_MINUTE` is recorded as
+  `blink_mask['plausibility_reason']`); kurtosis flagged on the **upper tail** on the **log scale**
+  (`log(Pearson kurtosis) = log(excess + 3)`, always defined since sample Pearson kurtosis
+  `m4/m2² ≥ 1` — corrected 2026-10-16, B6 rev2 NEW-3: the earlier "log undefined for signed excess
+  kurtosis" text applied the log to the signed excess; the auditor's probe measured 8/12 vs 6/12
+  within budget with log-kurtosis before the NEW-1/NEW-2 fixes) — this supersedes the B4-D1
+  "two-sided" note; **relative near-flat floor** `variance < 1e-3 × median` → reason `flat` (new
+  `near_flat` report key) closing the 1 nV blind spot above the absolute `1e-20 V²` floor — the
+  decision's lower-tail z alternative is deliberately **not** used because the log-variance spread of
+  a healthy recording makes z a non-flatness measure (measured: the lowest channel of the healthy
+  regression fixture at 29 % of the median variance has z = −54, i.e. the z rule flags healthy
+  channels exactly like the lower-tail rule B4-D1 rejected); report gains `blink_mask`
+  (source/channel/n_blinks/blinks_per_minute/masked_fraction/half_width_s/plausibility_reason/reason,
+  + `selection` ranking) and `tails['kurtosis'] == 'upper'`; budget and mark-only semantics
+  unchanged. The detector's module constants are part of the resolved config (`get_config()
+  ['algorithm']`, B6 rev2 NEW-4) and the chain's filter step band-passes the **EEG + EOG** picks
+  (NEW-1; `get_config()['picks']`). **Pilot5 × 3 tasks** (read-only, TRUE chain order channel roles →
+  `ZaplineStep(fline=60)` → 0.1–45 Hz filter (EEG+EOG) → detector, `exempt=('Cz',)`, `max_bad=1e9`
+  to count — re-run after the NEW-1/NEW-2/NEW-3 fixes, B6 rev2 NEW-6):
+
+| recording | task | n_bads | ≤11 | flat | near-flat | blinks (masked) | criteria |
+|---|---|---|---|---|---|---|---|
+| sub-NDARAC853CR6 | RestingState | 5 | yes | 1 | 0 | 36 (3.9 %) | flat 1, hf 1, kurt 2, var 3 |
+| sub-NDARAC853CR6 | DespicableMe | 6 | yes | 1 | 0 | 2 (0.5 %) | flat 1, hf 1, kurt 3, var 2 |
+| sub-NDARAC853CR6 | FunwithFractals | 20 | **NO** | 1 | 0 | 5 (1.2 %) | flat 1, hf 1, kurt 14, var 6 |
+| sub-NDARAC904DMU | RestingState | 8 | yes | 0 | 0 | 17 (1.7 %) | hf 3, var 8 |
+| sub-NDARAC904DMU | DespicableMe | 18 | **NO** | 0 | 0 | 4 (0.9 %) | hf 7, kurt 4, var 12 |
+| sub-NDARAC904DMU | FunwithFractals | 17 | **NO** | 0 | 0 | 5 (1.2 %) | hf 13, kurt 3, var 11 |
+| sub-NDARAM487XU3 | RestingState | 96 | **NO** (corrupt) | 94 | 1 | 420 (38.5 %) | flat 95, hf 1, kurt 1 |
+| sub-NDARAM487XU3 | DespicableMe | 95 | **NO** (corrupt) | 94 | 0 | 272 (40.8 %) | flat 94, kurt 1 |
+| sub-NDARAM487XU3 | FunwithFractals | 96 | **NO** (corrupt) | 94 | 0 | 253 (41.3 %) | flat 94, hf 1, kurt 1 |
+| sub-NDARAM873GAC | RestingState | 6 | yes | 1 | 0 | 23 (2.3 %) | flat 1, hf 4, var 4 |
+| sub-NDARAM873GAC | DespicableMe | 31 | **NO** | 3 | 0 | 37 (8.5 %) | flat 3, hf 3, kurt 12, var 19 |
+| sub-NDARAM873GAC | FunwithFractals | 10 | yes | 1 | 0 | 24 (5.8 %) | flat 1, hf 7, kurt 1, var 8 |
+| sub-NDARCD661GL0 | RestingState | 8 | yes | 0 | 0 | 6 (0.6 %) | hf 7, kurt 5, var 7 |
+| sub-NDARCD661GL0 | DespicableMe | 7 | yes | 1 | 0 | 3 (0.6 %) | flat 1, var 6 |
+| sub-NDARCD661GL0 | FunwithFractals | 5 | yes | 1 | 0 | 5 (1.2 %) | flat 1, var 4 |
+
+  **Summary — 12 non-corrupt recordings: 8 within budget** (RestingState **4/4**, DespicableMe
+  **2/4**, FunwithFractals **2/4**; up from 6/12 at rev1 — CD661GL0/DM 12→7 and AM873GAC/FF 24→10
+  moved inside the budget, AC853CR6/FF 26→20 and AC904DMU/DM 24→18 stayed outside). The auditor's
+  log-kurtosis-only probe (without zapline/NEW-1/NEW-2) also measured 8/12 with the same per-task
+  split. This table is the **true chain order** (`channel_roles → ZaplineStep(fline=60) → 0.1–45 Hz
+  filter (EEG+EOG) → detector`) after the NEW-1/NEW-2/NEW-3 fixes; it supersedes the rev0/rev1 table,
+  which omitted zapline and ran before those fixes (the B6-K1 arithmetic correction of that table
+  stands; this table is authoritative now; raw probe JSON `/tmp/opencode/b6r2_pilot_full.json`).
+  The blink channel is now chosen on **band-passed** variance (E126/E125/E127/E25 on the healthy
+  recordings — the drift-dominated E126/E127/E125 were the raw-variance winners; the corrupt
+  AM487XU3 picks E8 with 253–420 spurious events). `sub-NDARAC853CR6`/DespicableMe is the only row
+  where the low-rate plausibility reason fires (0.70/min < 1/min). The corrupt
+  `sub-NDARAM487XU3` (94 of 109 EEG channels identically zero) stays excluded on all three tasks.
+  **Target ("most clean recordings within budget") is met for RestingState; the movie tasks remain
+  partially over budget — reported honestly.** The remaining over-budget rows (AC853CR6/FF 20 with
+  14 kurtosis flags; AC904DMU/DM 18 and FF 17 with variance/HF flags; AM873GAC/DM 31 with variance
+  19 + kurtosis 12) are genuine movie-task artifact burden (movement/muscle) under the pinned
+  `threshold_sd=3.0` and ≤11 budget — not a blink artifact: the mask applied on every row and a
+  diagnostic that additionally masks blinks for the variance/HF criteria moves counts by ≤2 channels
+  (the rev0 diagnostic; the as-implemented kurtosis already uses the mask). Recorded follow-ups:
+  plan §12.5 option (iv) recalibrate the budget on pilot-50, and/or a user decision on extending the
+  blink mask to the variance/HF criteria. The user's other dataset ("one EP one attention", path TBD)
+  is not available yet — the second validation dataset remains open.
+- **Validation**: full standard suite → **2 failed / 713 passed / 2 skipped / 2 xfailed** (only the
+  2 `mne_connectivity` P4 baseline failures; the `robust_pca` fixture test now passes; the 2 xfails
+  are the deliberate ERP-retention documentations). New/changed tests: `test_robust_pca_erp.py`,
+  `test_robust_pca.py` (fixture path + `return_info`), `test_config_hash.py` (+7), `test_state_schema.py`
+  (+numpy round-trip), `test_asr_timeline.py` (+2 artifact-annotation cases),
+  `test_preprocessing_steps_tier2.py` (26), `test_bad_channel_detector.py` (tails/keys),
+  `test_preprocessing_chain.py`/`test_preprocessing_schema.py` (9-step order),
+  `test_source_hardening.py` (run-identity test, `forward_source` + new provenance keys),
+  `test_source_erp_features.py` (features provenance sidecar + run identity).
+  Re-audit scope: chain composition + RPCA metadata/tests, `config_hash.py`, every chain
+  `get_config`, reference/zapline/EOG/ICA/montage/bad-channels edits, the detector (B4-D2),
+  `artifacts.py`, `workflow/state.py`, `modules/source/__init__.py` (identity/provenance/docstring),
+  `cli/features.py`, the new/updated tests.
+- **B6 rev1 — K3 pre-audit fixes (2026-10-16)** (details in `implementation/CHANGELOG.md`):
+  **B6-K1** pilot5 counts corrected to **6/12** (Rest 4/4, DM 1/4, FF 1/4; table + raw probe JSON
+  re-checked; all three documents consistent now — the *arithmetic* was correct for that table; the
+  table itself is superseded by the rev2 true-chain-order re-run below); **B6-K2** module docstring
+  keeps only the `var < 1e-3 × median` near-flat disjunct + the z-rule rejection rationale;
+  **B6-K3** detector
+  docstring "raw excess kurtosis (upper tail, B4-D2)"; **B6-K4** chain docstring: the step class
+  stays importable (never registered); **B6-K5** `_find_blink_mask` retries the synthetic frontal
+  proxy when `find_eog_events` fails on a dead EOG electrode (new `blink_mask['attempts']`, test
+  pins proxy path + applied mask); **B6-K6** `preprocessed_qc.py` reads
+  `n_components_removed_total` (scalar) for the zapline note/metric (test with dict payload);
+  **B6-K7** `zapline.py` writes the cleaned data back only after the metadata reads that can raise
+  (`KeyError` leaves raw unmutated — both KeyError tests assert it); **B6-K8** `RobustPCAStep`
+  returns `applied: False` + `reason: 'ialm_not_converged'` at `max_iter` exhaustion, keeping the
+  low-rank write-back (the ERP xfail fixtures converge: `n_iter` 31/27, retention 0.675/0.188 — the
+  documented xfail regime is untouched; a forced `max_iter=1` test pins the new metadata);
+  **B6-K9 (record only)** legacy `bad_channels.py:633,645` silent drops → plan B7 task 15.
+  Validation: full standard suite (specparam files ignored per §0.1) **2 failed / 717 passed /
+  2 skipped / 2 xfailed** (only the 2 `mne_connectivity` P4 failures); targeted B6 command
+  **58 passed / 2 xfailed**; `test_preprocessed_qc.py` **21 passed**.
+- **B6 rev2 — Opus final-audit fixes NEW-1…NEW-10 (2026-10-16)** (details in
+  `implementation/CHANGELOG.md`): **NEW-1** the chain filter band-passes the EEG **+ EOG** picks
+  (`_FilterStepWrapper` v2.0, picks in metadata + `get_config`; `raw.filter()`'s default data picks
+  exclude EOG — probed) so the EOG regressors carry no drift/line noise; `EOGRegressionStep` v4.0
+  documents the contract; tests pin the mechanism and the regression non-injection (pre-fix contrast:
+  59–61 Hz ×>100). **NEW-2** blink channel ranked on 1–10 Hz band-passed variance + low-rate
+  `plausibility_reason`; **NEW-3** kurtosis on `log(Pearson)` (upper tail; the "log undefined"
+  premise corrected in all docs); **NEW-4** detector/ASR constants in `get_config`
+  (`algorithm` block; named `DATA_DRIVEN_REF_*` constants in `asr.py`), versions bumped (detector
+  3.0, filter 2.0, EOG 4.0, ASR 2.1), sensitivity test, golden hash re-pinned
+  `731756264f5c1c79783acba79dee1913b491bd5e02801c3b54105f254edef975`; **NEW-5** numpy/scipy pinned in
+  the `pipeline` extra + re-pin one-liner + library-diff failure output; **NEW-6** pilot5 true
+  chain order table above (8/12); **NEW-7** stale RPCA numbers fixed; **NEW-8** xfail
+  `raises=AssertionError` + normal instrumentation tests; **NEW-9** behavioural detector tests
+  (1 nV near-flat, blink-dominated masked vs full signal, sub-Gaussian sinusoid); **NEW-10** RPCA
+  write-back only on convergence.
+  Validation: full standard suite (specparam files ignored per §0.1) **2 failed / 728 passed /
+  2 skipped / 2 xfailed** (only the 2 `mne_connectivity` P4 failures); targeted B6 files
+  **69 passed / 2 xfailed**.
+
 ## Next actions (queue)
 
 - [x] Batch 0 — environment, skill, AGENTS.md, audit brief (done 2026-10-13)
@@ -578,8 +764,19 @@ pairing, caller-forward provenance, montage cache key. Scoped re-audit pending.
       (Qwen3.8-Max stand-in audit + rev2 confirmation). B4 verified 2026-10-15 (code scope). B5
       implemented 2026-10-15 + rev1 fixes 2026-10-16 (N1/N2/A1/A2/A3/A7/N6; A6 sign-off) — **verified
       2026-10-16 (scoped Opus re-audit `approve`)**. **Checkpoint A resolved (remove RPCA, plan §12.1).**
-      Next: **B6** — remove RPCA (chain → 9 steps), blink-aware detector design (plan §12.5), golden
-      resolved-config hash (tasks 4–8, 19–20), tier-2 debt (tasks 9–18).
+      B6 implemented 2026-10-16 (tasks 1–20 + B4-D2; full suite 2 failed / 713 passed / 2 skipped /
+      2 xfailed = only the 2 `mne_connectivity` P4 failures) + **rev1 K3 pre-audit fixes 2026-10-16**
+      (B6-K1…K9; suite 2 failed / 717 passed / 2 skipped / 2 xfailed; pilot5 corrected to 6/12) +
+      **rev2 Opus final-audit fixes 2026-10-16 (NEW-1…NEW-10)**: EOG band-passed with the EEG
+      (NEW-1), band-passed blink-channel ranking + rate plausibility (NEW-2), log-Pearson upper-tail
+      kurtosis (NEW-3), detector/ASR constants in `get_config` + re-pinned golden hash `73175626…`
+      (NEW-4), numpy/scipy pinned + library-diff failure output (NEW-5), pilot5 re-run in the true
+      chain order incl. zapline (NEW-6), stale RPCA numbers fixed (NEW-7), xfail
+      `raises=AssertionError` + normal instrumentation tests (NEW-8), behavioural detector tests
+      (NEW-9), RPCA write-back only on convergence (NEW-10) — **awaiting re-audit (Opus 5.5,
+      milestone batch)**. Next: **B7** (QC truthfulness, test honesty, CI)
+      after the B6 audit; B6 residuals to watch: movie-task detector budget + the "other dataset" half
+      of the B4-D2 validation.
 - [ ] **Final-audit model note:** Opus 5.5 was intermittently unavailable for B3; per user decision
       the B3 final audit ran on Qwen3.8-Max. B4/B6/B7 milestone audits: try Opus 5.5 first, fall back
       to Qwen3.8-Max (or Kimi K3) only with a recorded note.

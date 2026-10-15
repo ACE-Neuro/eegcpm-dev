@@ -15,6 +15,8 @@ from typing import List, Optional, Tuple
 import mne
 import numpy as np
 
+from .steps.asr import append_bad_annotations
+
 
 class ArtifactAnnotator:
     """
@@ -192,16 +194,20 @@ class ArtifactAnnotator:
         )
 
         if len(annotations) > 0:
-            annot = mne.Annotations(
-                onset=annotations[:, 0],
-                duration=annotations[:, 1],
-                description=['BAD_amplitude'] * len(annotations)
+            # B3-K9: append-only. The four artifact sites previously used
+            # the uncorrected `set_annotations(raw.annotations + annot)`
+            # recipe, which shifts every existing annotation by
+            # `first_time` whenever `meas_date is None` and
+            # `first_samp != 0` (mne 1.13.2) — corrupting the timeline on
+            # re-processed FIF derivatives. `append_bad_annotations`
+            # applies the offset recipe with the frame correction, so
+            # every pre-existing annotation keeps its sample.
+            append_bad_annotations(
+                raw,
+                annotations[:, 0],
+                annotations[:, 1],
+                ['BAD_amplitude'] * len(annotations),
             )
-
-            if raw.annotations is not None:
-                raw.set_annotations(raw.annotations + annot)
-            else:
-                raw.set_annotations(annot)
 
         return raw
 
@@ -232,16 +238,13 @@ class ArtifactAnnotator:
         )
 
         if len(annotations) > 0:
-            annot = mne.Annotations(
-                onset=annotations[:, 0],
-                duration=annotations[:, 1],
-                description=['BAD_gradient'] * len(annotations)
+            # B3-K9: append-only (see _annotate_amplitude).
+            append_bad_annotations(
+                raw,
+                annotations[:, 0],
+                annotations[:, 1],
+                ['BAD_gradient'] * len(annotations),
             )
-
-            if raw.annotations is not None:
-                raw.set_annotations(raw.annotations + annot)
-            else:
-                raw.set_annotations(annot)
 
         return raw
 
@@ -296,16 +299,13 @@ class ArtifactAnnotator:
         )
 
         if len(annotations) > 0:
-            annot = mne.Annotations(
-                onset=annotations[:, 0],
-                duration=annotations[:, 1],
-                description=['BAD_flatline'] * len(annotations)
+            # B3-K9: append-only (see _annotate_amplitude).
+            append_bad_annotations(
+                raw,
+                annotations[:, 0],
+                annotations[:, 1],
+                ['BAD_flatline'] * len(annotations),
             )
-
-            if raw.annotations is not None:
-                raw.set_annotations(raw.annotations + annot)
-            else:
-                raw.set_annotations(annot)
 
         return raw
 
@@ -348,16 +348,13 @@ class ArtifactAnnotator:
         )
 
         if len(annotations) > 0:
-            annot = mne.Annotations(
-                onset=annotations[:, 0],
-                duration=annotations[:, 1],
-                description=['BAD_muscle'] * len(annotations)
+            # B3-K9: append-only (see _annotate_amplitude).
+            append_bad_annotations(
+                raw,
+                annotations[:, 0],
+                annotations[:, 1],
+                ['BAD_muscle'] * len(annotations),
             )
-
-            if raw.annotations is not None:
-                raw.set_annotations(raw.annotations + annot)
-            else:
-                raw.set_annotations(annot)
 
         return raw
 

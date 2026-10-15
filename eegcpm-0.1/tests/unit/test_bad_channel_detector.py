@@ -30,6 +30,7 @@ from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
     HF_BAND_HZ,
     MAX_BAD_CHANNELS,
     TAILS,
+    THRESHOLD_SD,
     _robust_z,
     apply_bad_channels,
     detect_bad_channels,
@@ -148,12 +149,21 @@ def test_report_keys_present():
     for key in (
         "detected", "reasons", "z_scores", "n_detected_precap", "flat",
         "exempt", "hf_band_hz", "tails", "degenerate_metrics",
+        # B4-D2 additions
+        "near_flat", "blink_mask",
     ):
         assert key in report
     assert report["tails"] == TAILS
     assert report["tails"] == {
-        "variance": "upper", "hf_power": "upper", "kurtosis": "two-sided",
+        "variance": "upper", "hf_power": "upper", "kurtosis": "upper",
     }
+    # Blink-mask reporting (B4-D2): every key is present, whether or not a
+    # mask was applied, so the fallback is never silent.
+    for key in (
+        "applied", "source", "channel", "n_blinks", "masked_fraction",
+        "half_width_s", "reason",
+    ):
+        assert key in report["blink_mask"]
 
 
 def test_healthy_cz_referenced_recording_stays_within_budget():
@@ -194,6 +204,351 @@ def test_healthy_cz_referenced_recording_stays_within_budget():
     lowest = sorted(var_z, key=var_z.get)[:10]
     assert min(var_z[ch] for ch in lowest) < 0
     assert all("variance" not in report["reasons"].get(ch, []) for ch in lowest)
+
+
+def test_blink_mask_uses_data_frame_with_first_samp_offset():
+    """B4-D2 frame check: `find_eog_events` returns **raw-frame** samples.
+
+    Probed 2026-10-16 on mne 1.13.2: the returned sample column includes
+    ``raw.first_samp``. The mask indexes the data array, so a missing
+    subtraction would shift the blink-free samples by ``first_samp`` — the
+    kurtosis criterion would then keep the blink peaks and remove clean data.
+    """
+    from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
+        BLINK_MASK_HALF_WIDTH_S,
+        _find_blink_mask,
+    )
+
+    sfreq = 250.0
+    duration = 30.0
+    n_times = int(duration * sfreq)
+    first_samp = 1000
+    rng = np.random.RandomState(11)
+    ch_names = [f"E{i}" for i in range(1, 129)] + ["Cz"]
+    raw = mne.io.RawArray(
+        rng.randn(len(ch_names), n_times) * 1e-6,
+        mne.create_info(ch_names, sfreq, "eeg"),
+        first_samp=first_samp,
+    )
+    raw.set_montage(mne.channels.make_standard_montage("GSN-HydroCel-129"),
+                    match_case=False, on_missing="ignore")
+    raw.set_channel_types({"E8": "eog"})
+
+    blink_data_samples = [int(t * sfreq) for t in (5.0, 15.0, 25.0)]
+    e8 = raw.ch_names.index("E8")
+    for sample in blink_data_samples:
+        raw._data[e8, sample:sample + 50] += 300e-6
+
+    picks = [p for p in mne.pick_types(raw.info, eeg=True, exclude="bads")
+             if raw.ch_names[p] != "Cz"]
+    mask, report = _find_blink_mask(raw, picks)
+
+    assert report["source"] == "eog"
+    assert report["channel"] == "E8"
+    assert report["applied"] is True
+    assert report["n_blinks"] >= 3
+
+    half_width = int(BLINK_MASK_HALF_WIDTH_S * sfreq)
+    for sample in blink_data_samples:
+        window = mask[max(0, sample - half_width):sample + half_width]
+        assert window.mean() > 0.5, (
+            f"injected blink at data sample {sample} is not masked "
+            f"(coverage {window.mean():.2f})")
+        # ... and the first_samp-shifted position is NOT the masked one.
+        shifted = sample + first_samp
+        if shifted + half_width <= n_times:
+            shifted_window = mask[
+                shifted - half_width:shifted + half_width]
+            assert shifted_window.mean() < 0.5, (
+                "mask appears shifted by first_samp")
+
+
+def test_blink_mask_dead_eog_retries_frontal_proxy():
+    """B6-K5: a dead EOG electrode must not disable blink masking.
+
+    ``find_eog_events`` raises ``TypeError`` on a flat channel (probed on
+    mne 1.13.2). The old code fell straight back to the full signal; the
+    detector must retry the synthetic frontal proxy, mask the blinks there
+    and record both attempts.
+    """
+    from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
+        BLINK_MASK_HALF_WIDTH_S,
+        _find_blink_mask,
+    )
+
+    sfreq = 250.0
+    duration = 30.0
+    n_times = int(duration * sfreq)
+    rng = np.random.RandomState(13)
+    ch_names = [f"E{i}" for i in range(1, 129)] + ["Cz"]
+    raw = mne.io.RawArray(
+        rng.randn(len(ch_names), n_times) * 1e-6,
+        mne.create_info(ch_names, sfreq, "eeg"),
+    )
+    raw.set_montage(mne.channels.make_standard_montage("GSN-HydroCel-129"),
+                    match_case=False, on_missing="ignore")
+    raw.set_channel_types({"E8": "eog"})
+    raw._data[raw.ch_names.index("E8")] = 0.0  # dead EOG electrode
+
+    picks = [p for p in mne.pick_types(raw.info, eeg=True, exclude="bads")
+             if raw.ch_names[p] != "Cz"]
+    positions = np.array([raw.info["chs"][p]["loc"][:3] for p in picks])
+    proxy = raw.ch_names[picks[int(np.argmax(positions[:, 1]))]]
+
+    blink_samples = [int(t * sfreq) for t in (5.0, 15.0, 25.0)]
+    proxy_idx = raw.ch_names.index(proxy)
+    for sample in blink_samples:
+        raw._data[proxy_idx, sample:sample + 50] += 300e-6
+
+    mask, report = _find_blink_mask(raw, picks)
+
+    assert report["source"] == "frontal_proxy"
+    assert report["channel"] == proxy
+    assert report["applied"] is True
+    assert report["n_blinks"] >= 3
+    # Both paths are recorded: the EOG attempt failed, the proxy succeeded.
+    assert any(a["source"] == "eog" and a["error"] for a in report["attempts"])
+    assert any(a["source"] == "frontal_proxy" and a["error"] is None
+               for a in report["attempts"])
+
+    half_width = int(BLINK_MASK_HALF_WIDTH_S * sfreq)
+    for sample in blink_samples:
+        window = mask[sample - half_width:sample + half_width]
+        assert window.mean() > 0.5, (
+            f"injected blink at data sample {sample} is not masked "
+            f"(coverage {window.mean():.2f})")
+
+    # The detector report records the same proxy path: the mask is actually
+    # used for the kurtosis criterion, not silently dropped.
+    _, det_report = detect_bad_channels(raw, exempt=("Cz",))
+    assert det_report["blink_mask"]["source"] == "frontal_proxy"
+    assert det_report["blink_mask"]["applied"] is True
+
+
+def test_blink_channel_selected_on_bandpassed_variance():
+    """NEW-2: the blink channel is ranked on 1-10 Hz band-passed variance.
+
+    Raw-variance ranking picks a drift-dominated EOG channel (the highest raw
+    variance is DC drift), and ``find_eog_events`` then finds almost no blinks
+    on real pilot recordings. The band-passed ranking must pick the
+    blink-carrying channel instead, and the mask must cover the injected
+    blinks.
+    """
+    from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
+        BLINK_BANDPASS_HZ,
+        BLINK_MASK_HALF_WIDTH_S,
+        _find_blink_mask,
+    )
+
+    sfreq = 250.0
+    duration = 60.0
+    n_times = int(duration * sfreq)
+    t = np.arange(n_times) / sfreq
+    rng = np.random.RandomState(23)
+    ch_names = [f"E{i}" for i in range(1, 129)] + ["Cz"]
+    data = rng.randn(len(ch_names), n_times) * 5e-6
+    blink = np.exp(-0.5 * (((t % 3.0) - 1.0) / 0.05) ** 2)
+    # E8: drifting, blink-free EOG (raw variance dominated by the drift).
+    data[ch_names.index("E8")] += 1e-3 * np.sin(2 * np.pi * 0.05 * t)
+    # E9: blink-carrying EOG.
+    data[ch_names.index("E9")] += 300e-6 * blink
+    raw = mne.io.RawArray(
+        data, mne.create_info(ch_names, sfreq, "eeg")
+    )
+    raw.set_montage(mne.channels.make_standard_montage("GSN-HydroCel-129"),
+                    match_case=False, on_missing="ignore")
+    raw.set_channel_types({"E8": "eog", "E9": "eog"})
+
+    eog_picks = mne.pick_types(raw.info, eog=True, exclude="bads")
+    raw_var = np.var(raw.get_data(picks=eog_picks), axis=1)
+    band_var = np.var(
+        mne.filter.filter_data(raw.get_data(picks=eog_picks), sfreq,
+                               *BLINK_BANDPASS_HZ, verbose=False),
+        axis=1,
+    )
+    # The pre-fix trap: raw variance picks the drift channel (E8), the
+    # band-passed variance picks the blink channel (E9).
+    assert raw_var.argmax() == 0, raw_var
+    assert band_var.argmax() == 1, band_var
+
+    picks = [p for p in mne.pick_types(raw.info, eeg=True, exclude="bads")
+             if raw.ch_names[p] != "Cz"]
+    mask, report = _find_blink_mask(raw, picks)
+
+    assert report["channel"] == "E9", report["selection"]
+    assert report["source"] == "eog"
+    assert report["applied"] is True
+    assert report["selection"]["band_hz"] == list(BLINK_BANDPASS_HZ)
+    assert report["selection"]["ranking"][0]["channel"] == "E9"
+    assert report["n_blinks"] >= 15, report  # 20 blinks injected
+
+    # The mask covers the injected blinks.
+    half_width = int(BLINK_MASK_HALF_WIDTH_S * sfreq)
+    blink_samples = [int((1.0 + 3.0 * k) * sfreq) for k in range(20)]
+    for sample in blink_samples:
+        assert mask[sample - half_width:sample + half_width].mean() > 0.5, sample
+
+    # Non-vacuity: the drift channel yields a flood of spurious events (their
+    # +/-200 ms windows cover the whole recording -> the documented
+    # full-signal fallback), not the injected blinks.
+    events_drift = mne.preprocessing.find_eog_events(
+        raw, ch_name="E8", verbose=False)
+    assert events_drift.shape[0] > 50, events_drift.shape
+
+
+def test_blink_mask_records_implausible_blink_rate(monkeypatch):
+    """NEW-2: a blink rate below the floor is recorded, never silent.
+
+    The mask is still applied (the note is provenance, not a fallback); the
+    floor is monkeypatched so the check is deterministic.
+    """
+    from eegcpm.modules.preprocessing.steps import bad_channels_pinned as bcp
+    from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
+        _find_blink_mask,
+    )
+
+    monkeypatch.setattr(bcp, "MIN_BLINK_RATE_PER_MINUTE", 100.0)
+
+    sfreq = 250.0
+    duration = 30.0
+    n_times = int(duration * sfreq)
+    t = np.arange(n_times) / sfreq
+    rng = np.random.RandomState(24)
+    ch_names = [f"E{i}" for i in range(1, 129)] + ["Cz"]
+    data = rng.randn(len(ch_names), n_times) * 5e-6
+    blink = np.exp(-0.5 * (((t % 10.0) - 5.0) / 0.05) ** 2)
+    data[ch_names.index("E8")] += 300e-6 * blink
+    raw = mne.io.RawArray(data, mne.create_info(ch_names, sfreq, "eeg"))
+    raw.set_montage(mne.channels.make_standard_montage("GSN-HydroCel-129"),
+                    match_case=False, on_missing="ignore")
+    raw.set_channel_types({"E8": "eog"})
+
+    picks = [p for p in mne.pick_types(raw.info, eeg=True, exclude="bads")
+             if raw.ch_names[p] != "Cz"]
+    mask, report = _find_blink_mask(raw, picks)
+
+    assert report["n_blinks"] >= 1
+    assert report["applied"] is True
+    assert report["blinks_per_minute"] is not None
+    assert report["plausibility_reason"] is not None
+    assert report["plausibility_reason"].startswith("low_blink_rate:")
+    assert report["reason"] is None  # the mask was applied
+
+
+def test_nanovolt_channel_is_near_flat():
+    """NEW-9(a): a 1 nV electrode is flagged ``flat`` and listed in near_flat.
+
+    1 nV of noise has variance 1e-18 V**2 — far above the absolute
+    ``FLAT_VARIANCE_FLOOR`` (1e-20) but ~1e-6 of a typical EEG channel, which
+    is exactly the blind spot the relative floor closes.
+    """
+    from eegcpm.modules.preprocessing.steps.bad_channels_pinned import (
+        FLAT_VARIANCE_FLOOR,
+    )
+
+    raw = _egi_like_raw(seed=10)
+    idx = raw.ch_names.index("E30")
+    rng = np.random.RandomState(11)
+    raw._data[idx] = rng.randn(raw.n_times) * 1e-9
+    assert np.var(raw._data[idx]) > FLAT_VARIANCE_FLOOR
+
+    bads, report = detect_bad_channels(raw, exempt=("Cz",))
+
+    assert "E30" in bads
+    assert "flat" in report["reasons"]["E30"]
+    assert "E30" in report["near_flat"]
+    assert "E30" not in report["flat"]  # above the absolute floor
+    # near-flat channels stay in the statistics (the ratio is robust).
+    assert report["z_scores"]["E30"]["var"] is not None
+
+
+def _blink_dominated_raw(seed=21, n_channels=129, duration=60.0, sfreq=250.0,
+                         frontal=("E22", "E23"), blink_amp=32e-6,
+                         eog_amp=300e-6):
+    """Frontal EEG channels dominated by narrow blinks, plus an EOG channel.
+
+    The blink is 10 ms wide and 3.2x the 10 uV background std: its kurtosis
+    contribution is large while its variance contribution stays below the
+    upper-tail variance threshold, so the fixture isolates the *kurtosis*
+    criterion the blink mask modifies.
+    """
+    ch_names = [f"E{i}" for i in range(1, n_channels)] + ["Cz"]
+    rng = np.random.RandomState(seed)
+    n_times = int(duration * sfreq)
+    t = np.arange(n_times) / sfreq
+    data = rng.randn(len(ch_names), n_times) * 10e-6
+    blink = np.exp(-0.5 * (((t % 5.0) - 2.5) / 0.01) ** 2)
+    data[ch_names.index("E8")] += eog_amp * blink
+    for ch in frontal:
+        data[ch_names.index(ch)] += blink_amp * blink
+    raw = mne.io.RawArray(data, mne.create_info(ch_names, sfreq, "eeg"))
+    raw.set_montage(mne.channels.make_standard_montage("GSN-HydroCel-129"),
+                    match_case=False, on_missing="ignore")
+    raw.set_channel_types({"E8": "eog"})
+    return raw, list(frontal)
+
+
+def test_blink_dominated_frontal_channels_masked_vs_full_signal(monkeypatch):
+    """NEW-9(b): the blink mask removes the blink kurtosis signature.
+
+    With the mask (blink-free samples) the frontal blink channels are not
+    flagged; on the full signal they are flagged by kurtosis. The no-mask run
+    monkeypatches ``_find_blink_mask`` to the documented
+    ``applied: False`` fallback report (the full-signal path), so the two
+    regimes are compared without relying on a detection failure.
+    """
+    from eegcpm.modules.preprocessing.steps import bad_channels_pinned as bcp
+
+    raw, frontal = _blink_dominated_raw()
+
+    bads, report = detect_bad_channels(raw, exempt=("Cz",))
+    assert report["blink_mask"]["applied"] is True
+    for ch in frontal:
+        assert ch not in bads, (ch, report["reasons"].get(ch))
+        assert "kurtosis" not in report["reasons"].get(ch, [])
+
+    def _no_mask(raw_, eligible_picks):
+        return np.zeros(raw_.n_times, dtype=bool), {
+            "applied": False,
+            "source": None,
+            "channel": None,
+            "n_blinks": 0,
+            "blinks_per_minute": None,
+            "masked_fraction": 0.0,
+            "half_width_s": bcp.BLINK_MASK_HALF_WIDTH_S,
+            "plausibility_reason": None,
+            "reason": "test_forced_full_signal",
+        }
+
+    monkeypatch.setattr(bcp, "_find_blink_mask", _no_mask)
+    bads_full, report_full = detect_bad_channels(raw, exempt=("Cz",))
+    for ch in frontal:
+        assert ch in bads_full, (ch, report_full["reasons"])
+        assert "kurtosis" in report_full["reasons"][ch]
+        assert report_full["z_scores"][ch]["kurtosis"] > bcp.THRESHOLD_SD
+
+
+def test_sub_gaussian_sinusoid_not_flagged_by_kurtosis_upper_tail():
+    """NEW-9(c): a large sinusoid (Pearson kurtosis ~1.5) is not kurtosis-bad.
+
+    Its kurtosis z-score is strongly negative (sub-Gaussian); the upper-tail
+    rule must not flag it. The channel may legitimately be flagged by the
+    variance criterion (a 50 uV sinusoid is 50x the background std), which is
+    a different, in-band measure — the assertion is about the kurtosis tail.
+    """
+    raw = _egi_like_raw(seed=12)
+    idx = raw.ch_names.index("E40")
+    t = np.arange(raw.n_times) / raw.info["sfreq"]
+    raw._data[idx] = 50e-6 * np.sin(2 * np.pi * 7.0 * t)
+
+    bads, report = detect_bad_channels(raw, exempt=("Cz",))
+
+    z_kurt = report["z_scores"]["E40"]["kurtosis"]
+    assert z_kurt < -THRESHOLD_SD, z_kurt  # strongly sub-Gaussian
+    assert "kurtosis" not in report["reasons"].get("E40", [])
+    # The old two-sided rule would have flagged |z| > 3; the upper tail does
+    # not. (The variance criterion is expected to flag the channel.)
+    assert "variance" in report["reasons"].get("E40", [])
 
 
 def test_robust_z_relative_epsilon_degeneracy():

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import mne
 from ..data.bids_utils import BIDSFile, find_subject_runs, read_raw_eeg
 from ..core.config import load_preprocessing_spec
+from ..core.config_hash import resolved_config_hash
 from ..core.paths import clear_run_outputs, fail_run_outputs, find_preprocessed_raw
 from ..modules.preprocessing import PreprocessingPipeline
 from ..modules.qc.preprocessed_qc import PreprocessedQC
@@ -268,6 +269,10 @@ class RunProcessor:
 
             # Create modular pipeline
             pipeline = PreprocessingPipeline(spec.pipeline_steps(), output_dir=output_dir)
+            # P1-F7: the workflow row carries the resolved-config hash of the
+            # pipeline that actually ran (same value as the JSON sidecar).
+            if self.state_manager:
+                workflow.config_hash = resolved_config_hash(pipeline)
             preproc_result = pipeline.process(
                 raw,
                 subject_id=subject_id,
@@ -324,7 +329,12 @@ class RunProcessor:
                     # Zapline
                     elif step_name == 'zapline' and step_meta.get('applied'):
                         detected_freq = step_meta.get('detected_freq')
-                        n_components = step_meta.get('n_components_removed', 0)
+                        # B6: `n_components_removed` is now the per-frequency dict
+                        # from pyzaplineplus analytics; the scalar total is the
+                        # readable value for the log line.
+                        n_components = step_meta.get(
+                            'n_components_removed_total',
+                            step_meta.get('n_components_removed', 0))
                         line_reduction = step_meta.get('line_reduction_db', 0)
                         if detected_freq is not None:
                             logs.append(f"✓ Zapline: {detected_freq:.1f} Hz, {n_components} comp, {line_reduction:.1f} dB")

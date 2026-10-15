@@ -105,3 +105,15 @@ class ChannelRolesStep(ProcessingStep):
             ),
         }
         return raw, step_meta
+
+    def get_config(self) -> Dict[str, Any]:
+        """Get configuration (all constructor parameters, P1-F7)."""
+        config = super().get_config()
+        config.update({
+            "net_type": self.net_type,
+            "scalp_channels_count": self.scalp_channels_count,
+            "eog_channels": list(self.eog_channels),
+            "neck_face_channels": list(self.neck_face_channels),
+            "reference_channel": self.reference_channel,
+        })
+        return config

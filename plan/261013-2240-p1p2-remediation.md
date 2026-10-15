@@ -97,6 +97,7 @@
 | Bad channels | Robust (median/MAD) NaN-safe z-scores; exempt via explicit `exempt=(ref,)`; zero-variance non-exempt = bad; >11 → `RecordingExcluded`; no truncation, no channel dropping. |
 | Source labels | Spheres around CONN MNI centres on `inv['src']` via `mne.vertex_to_mni`; radius 10 mm lateral, 15 mm midline (|x| ≤ 5 mm → `BiHemiLabel`); `min_vertices=3` else raise; Cerebellar network excluded and logged. |
 | Source output | `pick_ori='normal'`, `mode='mean_flip'`, `loose=0.2`, `depth=0.8`; default `mode='evoked'`; evoked λ² = 1/snr² (snr 3), trial λ² = 1/snr_trial² (snr_trial 1). |
+| Source output caveats (B6, §12.4) | `mean_flip` kept; documented in `modules/source/__init__.py`: uniform-patch attenuation (injected ROI dominant in 11/30 ROIs vs 22/30 under `pca_flip`; mean absolute source energy still ranks the true ROIs first) and the midline polarity convention (near-tied flip axes, `MPFC` lh −0.70 / rh +0.71, one inverted ROI) — cross-ROI midline sign comparisons need an explicit convention; lateral ROIs are stable. |
 | Covariance | `method='shrunk', rank=None, keep_sample_mean=True, tmin=None, tmax=0.0` on baseline-corrected epochs. |
 | BEM | 3-layer `fsaverage-5120-5120-5120-bem-sol.fif` only; missing → `FileNotFoundError`. No single-shell fallback. |
 
@@ -867,6 +868,12 @@ new `tests/unit/test_hbn_chain_e2e.py`, `tests/unit/test_source.py`, `.github/wo
 14. **B5-N5 (audit owner assignment)**: the `source-reconstruct` CLI must exit non-zero when sessions
     failed, and an explicitly requested task config that is missing/unreadable must fail (exit 1)
     instead of warning and falling back to per-event processing (`cli/source_reconstruct.py:172`).
+15. **B6-K9 (legacy offenders, recorded 2026-10-16)**: `modules/preprocessing/bad_channels.py:633,645`
+    still uses `except Exception: print(...)` followed by silent channel drops (`drop_channels` when
+    the montage cannot be set / interpolation fails) in the legacy `BadChannelDetectionStep` path
+    (legacy/scripts only — the canonical chain uses `steps/bad_channels_pinned.py`). Fix with the
+    task-4 protocol (re-raise, or narrow + record the drop in metadata) so no path drops channels
+    silently; extend `test_no_silent_continue.py` if the AST gate does not already cover it.
 
 **Validation:** full standard command (only the 2 baseline connectivity failures may remain);
 `.venv/bin/python -m pytest tests/unit/test_no_silent_continue.py -q --no-cov -p no:cacheprovider -rA` shows files scanned > 50.

@@ -136,3 +136,49 @@ def test_json_encoder_non_finite_floats_become_strings():
     assert out["plus"] == "inf"
     assert out["nan"] == "nan"
     json.dumps(out, allow_nan=False)  # must not raise
+
+
+def test_save_state_round_trips_numpy_scalar_metadata(tmp_path):
+    """B3-K5: ``save_state`` must not crash on numpy metadata.
+
+    The old ``json.dumps(state.metadata)`` bypassed the numpy-aware encoder:
+    a numpy scalar raised ``TypeError`` (crashing the save) and a non-finite
+    float wrote ``-Infinity`` (non-strict JSON). Exposure is live since the
+    preprocessing sidecar records ``resolved_config``/``library_versions``.
+    """
+    import json
+    import sqlite3
+    import numpy as np
+
+    db_path = tmp_path / "state.db"
+    mgr = WorkflowStateManager(db_path)
+    state = _state(stage="preprocessing")
+    state.metadata = {
+        "n_detected": np.int64(7),
+        "fraction": np.float64(0.25),
+        "flag": np.bool_(True),
+        "per_channel": np.array([1.5, 2.5]),
+        "tol": float("-inf"),
+        "nothing": None,
+        "resolved_config": {"spec_deviations": [], "steps": []},
+    }
+    mgr.save_state(state)
+
+    with sqlite3.connect(db_path) as conn:
+        raw = conn.execute(
+            "SELECT metadata FROM workflows WHERE subject_id = 'sub-1'"
+        ).fetchone()[0]
+    assert "Infinity" not in raw and "NaN" not in raw
+    stored = json.loads(raw)
+    assert stored["n_detected"] == 7
+    assert stored["fraction"] == 0.25
+    assert stored["flag"] is True
+    assert stored["per_channel"] == [1.5, 2.5]
+    assert stored["tol"] == "-inf"
+    assert stored["nothing"] is None
+
+    # The loaded state round-trips the same values.
+    loaded = mgr.load_state("sub-1", "RestingState", "hbn")
+    assert loaded is not None
+    assert loaded.metadata["n_detected"] == 7
+    assert loaded.metadata["tol"] == "-inf"

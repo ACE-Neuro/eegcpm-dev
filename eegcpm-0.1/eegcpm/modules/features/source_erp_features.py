@@ -315,6 +315,10 @@ class SourceERPFeatureModule(BaseModule):
                 "source_config_hash": (
                     provenance.get("config_hash") if provenance else None
                 ),
+                # B5-N3: config hash + resolved condition -> event-code mapping.
+                "source_run_identity_hash": (
+                    provenance.get("run_identity_hash") if provenance else None
+                ),
                 "source_epochs_sha256": (
                     provenance.get("epochs_sha256") if provenance else None
                 ),

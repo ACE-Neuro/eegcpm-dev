@@ -399,6 +399,47 @@ class TestPreprocessedQCEdgeCases:
             bad = [m for m in result.metrics if m.name == "Bad Segments"]
             assert len(bad) == 1 and bad[0].value == 0
 
+    def test_zapline_component_metric_uses_scalar_total(self):
+        """B6-K6: `n_components_removed` is a per-frequency dict (B6 change).
+
+        The QC note and the "Zapline Components" metric must read the scalar
+        `n_components_removed_total`; embedding the dict would render a
+        meaningless value in the report.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ch_names = ["Fp1", "Fp2", "F3", "Fz", "F4", "C3", "Cz", "C4"]
+            info = mne.create_info(ch_names, 256.0, "eeg")
+            np.random.seed(42)
+            raw = mne.io.RawArray(
+                np.random.randn(len(ch_names), 256 * 30) * 15e-6, info
+            )
+            raw.set_montage(
+                mne.channels.make_standard_montage("standard_1020"),
+                on_missing="warn",
+            )
+
+            qc = PreprocessedQC(Path(tmpdir))
+            result = qc.compute(
+                raw, "sub-001",
+                preprocessing_metadata={
+                    "zapline": {
+                        "applied": True,
+                        "detected_freq": 60.0,
+                        "n_components_removed": {"60.0": 3, "120.0": 1},
+                        "n_components_removed_by_chunk": {
+                            "60.0": [3], "120.0": [1],
+                        },
+                        "n_components_removed_total": 4,
+                        "line_reduction_db": 12.0,
+                    },
+                },
+            )
+
+            comp = next(m for m in result.metrics if m.name == "Zapline Components")
+            assert comp.value == 4
+            assert not any(isinstance(m.value, dict) for m in result.metrics)
+            assert any("removed 4 component(s)" in note for note in result.notes)
+
     def test_ica_few_components(self):
         """Test with ICA having very few components."""
         with tempfile.TemporaryDirectory() as tmpdir:

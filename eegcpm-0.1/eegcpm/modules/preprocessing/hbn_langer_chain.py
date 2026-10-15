@@ -7,23 +7,37 @@ plan-v1.md are SUPERSEDED; this is the only canonical list.
 Steps (in order):
   1. channel_roles (Cz eeg-typed; reference channel reported via metadata;
      neck/face dropped)
-  2. zapline (BEFORE low-pass; per METH-019)
-  3. filter (0.1-45 Hz FIR)
+  2. zapline (BEFORE low-pass; per METH-019; EEG picks only — the filter
+     below band-passes the EOG channels, which is what the EOG regressors
+     need, B6 rev2 NEW-1)
+  3. filter (0.1-45 Hz FIR over the EEG **and EOG** picks, not stim/misc —
+     NEW-1: filtering only the EEG left DC drift and 60 Hz line noise in the
+     EOG regressors, and ``eog_regression`` then re-injected both into the
+     cleaned EEG after zapline/low-pass)
   4. bad_channel_detection (post-filter order; documented deviation
      from Langer per S19a; ≤11/109 budget RECALIBRATED in pilot-50;
      P1-F5 robust median/MAD stats, explicit exemption, exclusion above
-     the budget)
+     the budget; B4-D2 blink-aware log-kurtosis + relative near-flat floor)
   5. interpolate (spherical_spline; max 11/109)
-  6. eog_regression (9 EOG channels)
-  7. robust_pca (IALM, lam=0.003162 per S20b)
-  8. asr (eegprep; cutoff_sd=20; window_criterion=0.25 = REJECTION
+  6. eog_regression (9 EOG channels; regressors band-passed by step 3)
+  7. asr (eegprep; cutoff_sd=20; window_criterion=0.25 = REJECTION
      FRACTION not window length, per ENG-010; fixed first-60-s
      calibration; full-length repair with BAD_asr_window marks and
      burden metadata — never cuts samples, keeps no state in the MNE
      ``info`` 'temp' field)
-  9. block_rejection (max_rejected_fraction=0.20, S12 reconciled)
-  10. reference (average over 109 scalp; Cz INCLUDED via eeg typing;
-      post-ref Cz variance > 0; RECOVERED column)
+  8. block_rejection (max_rejected_fraction=0.20, S12 reconciled)
+  9. reference (average over 109 scalp; Cz INCLUDED via eeg typing;
+     post-ref Cz variance > 0 enforced by the step; RECOVERED column)
+
+**Spec deviation (P1-F2, Checkpoint A decision (a), 2026-10-15):**
+``RobustPCAStep`` is NOT part of this chain. The pinned IALM solve
+(lam=0.003162) absorbs most of the injected ERP into the sparse component
+it discards (synthetic retention 2-28% in the audit probe; ~0.19-0.67 in
+``tests/unit/test_robust_pca_erp.py``), so it must not run on ERP data.
+The step class stays importable for standalone use (it was never registered).
+The deviation is recorded in ``PreprocessingPipeline.get_config()
+['spec_deviations']`` (see ``HBN_LANGER_SPEC_DEVIATIONS``) and in the
+resolved-config hash.
 
 Cz is EXEMPT from bad-channel detection and budget (reference channel
 passed explicitly via ``exempt=`` from the channel_roles metadata).
@@ -31,7 +45,7 @@ passed explicitly via ``exempt=`` from the channel_roles metadata).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -41,14 +55,15 @@ from .steps.channel_roles import ChannelRolesStep
 from .steps.interpolate import InterpolateBadChannelsStep
 from .steps.reference import ReferenceStep
 from .steps.asr import append_bad_annotations
-from .steps.robust_pca import (
-    CANONICAL_LAMBDA,
-    CANONICAL_LAMBDA_RULE,
-    CANONICAL_MU,
-    CANONICAL_MU_RULE,
-    RobustPCAStep,
-)
 from .steps.zapline import ZaplineStep
+
+
+#: Explicit, machine-readable spec deviations of the canonical chain. They
+#: are part of ``PreprocessingPipeline.get_config()`` and therefore of the
+#: golden resolved-config hash (plan §B6, Checkpoint A).
+HBN_LANGER_SPEC_DEVIATIONS: List[str] = [
+    "P1-F2: robust_pca removed (destroys ERP; synthetic retention 2-28%)",
+]
 
 
 def build_hbn_langer_chain() -> List[Any]:
@@ -57,21 +72,28 @@ def build_hbn_langer_chain() -> List[Any]:
     Returns the ordered list of ProcessingStep instances. The
     config-hash of the chain is determined by this function; any
     change here triggers a new golden-config-hash.
+
+    9 steps — ``RobustPCAStep`` is deliberately absent (P1-F2 spec
+    deviation, see the module docstring and ``HBN_LANGER_SPEC_DEVIATIONS``).
     """
     return [
         ChannelRolesStep(),
         ZaplineStep(fline=60.0, nremove=None, nfft=8192),
-        # Filter is 0.1-45 Hz FIR (per A-RT24; NOT 40 Hz from code.md).
-        # We use the standard filter step with these parameters.
+        # Filter is 0.1-45 Hz FIR (per A-RT24; NOT 40 Hz from code.md) over
+        # the EEG **and EOG** picks (B6 rev2 NEW-1). Filtering only the EEG
+        # left the EOG regressors with DC drift and 60 Hz line noise, which
+        # `eog_regression` then added back into the cleaned EEG (real-data
+        # probe: >50 Hz power x33, 59-61 Hz x~14,000). Stim/misc channels
+        # are not filtered (no downstream regressor reads them).
         _FilterStepWrapper(l_freq=0.1, h_freq=45.0,
-                           method="fir", fir_design="firwin"),
+                           method="fir", fir_design="firwin",
+                           picks=("eeg", "eog")),
         # Bad-channel detection: post-filter order (S19a deviation from
         # Langer; RECALIBRATED ≤11/109 budget; Cz EXEMPT via the
         # channel_roles metadata, P1-F5).
         _BadChannelDetectorWrapper(threshold_sd=3.0, exclude_cz=True),
         InterpolateBadChannelsStep(max_bad_percent=11/109*100),
         EOGRegressionStep(),
-        RobustPCAStep(),
         # ASR via eegprep; cutoff_sd=20; window_criterion=0.25 is
         # the REJECTION FRACTION, NOT a window length (per ENG-010).
         # retain_burst_masks=True so the ASR-burden covariate is
@@ -84,9 +106,11 @@ def build_hbn_langer_chain() -> List[Any]:
         _BlockRejectionStepWrapper(max_rejected_fraction=0.20,
                                        window_seconds=2.0),
         # Average reference: picks:eeg INCLUDES Cz (eeg-typed by
-        # channel_roles). Post-ref Cz variance>0; RECOVERED
-        # column downstream.
-        ReferenceStep(type="average", projection=False, exclude_bads=True),
+        # channel_roles). The step asserts post-ref Cz variance > 0
+        # (P1-F7: the check is implemented, not a YAML no-op);
+        # RECOVERED column downstream.
+        ReferenceStep(type="average", projection=False,
+                      check_reference_channel_variance="Cz"),
     ]
 
 
@@ -98,32 +122,53 @@ from .steps.base import ProcessingStep as _PS
 
 class _FilterStepWrapper(_PS):
     name = "filter"
-    version = "1.0"
+    version = "2.0"  # 2.0: EEG + EOG picks (B6 rev2 NEW-1)
 
     def __init__(self, l_freq: float, h_freq: float,
                  method: str = "fir", fir_design: str = "firwin",
+                 picks: Sequence[str] = ("eeg", "eog"),
                  enabled: bool = True):
         super().__init__(enabled=enabled)
         self.l_freq = l_freq
         self.h_freq = h_freq
         self.method = method
         self.fir_design = fir_design
+        # NEW-1: the filter band-passes the EOG channels together with the
+        # EEG, so the EOG regressors used by `eog_regression` (step 6) carry
+        # no DC drift and no line noise. This is part of the resolved config
+        # (and therefore of the golden hash).
+        self.picks = list(picks)
 
     def process(self, raw, metadata):
         raw.filter(l_freq=self.l_freq, h_freq=self.h_freq,
                    method=self.method, fir_design=self.fir_design,
-                   phase="zero", verbose=False)
+                   picks=self.picks, phase="zero", verbose=False)
         return raw, {
             "applied": True,
             "l_freq": self.l_freq,
             "h_freq": self.h_freq,
             "method": self.method,
+            "picks": list(self.picks),
         }
+
+    def get_config(self) -> Dict[str, Any]:
+        """Get configuration (all constructor parameters, P1-F7)."""
+        config = super().get_config()
+        config.update({
+            "l_freq": self.l_freq,
+            "h_freq": self.h_freq,
+            "method": self.method,
+            "fir_design": self.fir_design,
+            "picks": list(self.picks),
+        })
+        return config
 
 
 class _BadChannelDetectorWrapper(_PS):
     name = "bad_channel_detection"
-    version = "2.0"  # R-004: pinned variance/kurtosis/spectrum >3-SD
+    version = "3.0"  # R-004 pinned detector; 3.0: B4-D2 blink-aware detector
+    # + B6 rev2 (log-Pearson kurtosis, band-passed blink channel, algorithm
+    # constants in get_config -> golden hash, NEW-3/NEW-4)
 
     def __init__(self, threshold_sd: float = 3.0,
                  exclude_cz: bool = True, enabled: bool = True):
@@ -157,10 +202,45 @@ class _BadChannelDetectorWrapper(_PS):
             "max_bad_channels": MAX_BAD_CHANNELS,
         }
 
+    def get_config(self) -> Dict[str, Any]:
+        """Get configuration (all constructor parameters, P1-F7).
+
+        NEW-4 (B6 rev2): the detector's module-level algorithm constants are
+        returned under ``algorithm`` so the resolved-config hash (and the
+        golden hash) covers them — the detector's numerics live in
+        ``steps/bad_channels_pinned.py``, not in the constructor, so hashing
+        the constructor parameters alone proved nothing about the algorithm.
+        The values are read from the module at call time, so a change to any
+        of them changes the hash (see the sensitivity test in
+        ``test_config_hash.py``).
+        """
+        from eegcpm.modules.preprocessing.steps import bad_channels_pinned as bcp
+
+        config = super().get_config()
+        config.update({
+            "threshold_sd": self.threshold_sd,
+            "exclude_cz": self.exclude_cz,
+            "algorithm": {
+                "max_bad_channels": int(bcp.MAX_BAD_CHANNELS),
+                "tails": dict(bcp.TAILS),
+                "hf_band_hz": list(bcp.HF_BAND_HZ),
+                "flat_variance_floor": bcp.FLAT_VARIANCE_FLOOR,
+                "near_flat_variance_ratio": bcp.NEAR_FLAT_VARIANCE_RATIO,
+                "degeneracy_rel_eps": bcp.DEGENERACY_REL_EPS,
+                "blink_mask_half_width_s": bcp.BLINK_MASK_HALF_WIDTH_S,
+                "blink_max_masked_fraction": bcp.BLINK_MAX_MASKED_FRACTION,
+                "min_blink_free_fraction": bcp.MIN_BLINK_FREE_FRACTION,
+                "blink_band_hz": list(bcp.BLINK_BANDPASS_HZ),
+                "min_blink_rate_per_minute": bcp.MIN_BLINK_RATE_PER_MINUTE,
+            },
+        })
+        return config
+
 
 class _ASRStepWrapper(_PS):
     name = "asr"
-    version = "2.0"
+    version = "2.1"  # 2.1: B6 rev2 NEW-4 (method/train_duration/
+    # ref_maxbadchannels exposed in get_config -> golden hash)
 
     def __init__(self, cutoff: float = 20.0,
                  window_criterion: float = 0.25,
@@ -180,11 +260,15 @@ class _ASRStepWrapper(_PS):
             )
         self.calibration_window = calibration_window
         self.retain_burst_masks = retain_burst_masks
+        # NEW-4 (B6 rev2): the delegated ASRStep constants are pinned here so
+        # `get_config()` (and the golden resolved hash) covers them.
+        self.method = "eegprep"
+        self.train_duration = 60.0
 
     def check_dependencies(self) -> None:
         """Delegate the backend preflight to the underlying ASRStep."""
         from .steps.asr import ASRStep
-        ASRStep(method="eegprep").check_dependencies()
+        ASRStep(method=self.method).check_dependencies()
 
     def validate_inputs(self, raw) -> bool:
         """Delegate the fixed-first-60 s minimum-length check (B3-K1).
@@ -195,9 +279,9 @@ class _ASRStepWrapper(_PS):
         """
         from .steps.asr import ASRStep
         return ASRStep(
-            method="eegprep",
+            method=self.method,
             calibration="fixed_first_60s",
-            train_duration=60.0,
+            train_duration=self.train_duration,
         ).validate_inputs(raw)
 
     def process(self, raw, metadata):
@@ -210,14 +294,39 @@ class _ASRStepWrapper(_PS):
         from .steps.asr import ASRStep
         step = ASRStep(
             cutoff=self.cutoff,
-            method="eegprep",
+            method=self.method,
             window_criterion=self.window_criterion,
             calibration="fixed_first_60s",
-            train_duration=60.0,
+            train_duration=self.train_duration,
         )
         out_raw, step_meta = step.process(raw, metadata)
         return out_raw, {**step_meta,
                          "retain_burst_masks": self.retain_burst_masks}
+
+    def get_config(self) -> Dict[str, Any]:
+        """Get configuration (all constructor parameters, P1-F7).
+
+        NEW-4 (B6 rev2, re-audit fix): the wrapper delegates to
+        ``ASRStep(calibration='fixed_first_60s')``, so the resolved config must
+        describe the **fixed** path truthfully: the calibration reference is the
+        first ``train_duration`` seconds of the data (passed as an ndarray to
+        ``clean_asr(ref_maxbadchannels=...)``) and ``ref_tolerances`` is not
+        passed at all (eegprep default). Reporting the data-driven constants
+        here claimed a calibration the canonical chain never runs.
+        """
+        config = super().get_config()
+        config.update({
+            "cutoff": self.cutoff,
+            "window_criterion": self.window_criterion,
+            "calibration_window": self.calibration_window,
+            "retain_burst_masks": self.retain_burst_masks,
+            "method": self.method,
+            "train_duration": self.train_duration,
+            "calibration_reference": "first_train_duration_s_of_data",
+            "ref_maxbadchannels": "calibration_array",
+            "ref_tolerances": "eegprep_default",
+        })
+        return config
 
 
 class _BlockRejectionStepWrapper(_PS):
@@ -313,3 +422,12 @@ class _BlockRejectionStepWrapper(_PS):
             "n_blocks_total": n_blocks,
             "rejected_fraction": fraction,
         }
+
+    def get_config(self) -> Dict[str, Any]:
+        """Get configuration (all constructor parameters, P1-F7)."""
+        config = super().get_config()
+        config.update({
+            "max_rejected_fraction": self.max_rejected_fraction,
+            "window_seconds": self.window_seconds,
+        })
+        return config

@@ -121,12 +121,12 @@ def test_ialm_pipeline_lambda_matches_pinned_canonical():
 # --- chain tests ---
 
 def test_build_hbn_langer_chain_order():
-    """The canonical chain has the 10 ordered steps."""
+    """The canonical chain has the 9 ordered steps (P1-F2: robust_pca removed)."""
     chain = build_hbn_langer_chain()
     step_names = [s.name for s in chain]
     assert step_names == [
         "channel_roles", "zapline", "filter", "bad_channel_detection",
-        "interpolate", "eog_regression", "robust_pca", "asr",
+        "interpolate", "eog_regression", "asr",
         "block_rejection", "reference",
     ]
 

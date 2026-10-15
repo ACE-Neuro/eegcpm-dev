@@ -21,12 +21,18 @@ from .steps.base import RecordingExcluded
 
 
 def _resolve_named_chain(name: str):
-    """Resolve a named canonical chain to prebuilt step instances."""
+    """Resolve a named canonical chain to prebuilt step instances.
+
+    Returns ``(steps, spec_deviations)``; the deviations are part of the
+    resolved config (and therefore of its hash) so a documented deviation
+    can never be silently dropped.
+    """
     if name == "hbn_langer":
         from eegcpm.modules.preprocessing.hbn_langer_chain import (
+            HBN_LANGER_SPEC_DEVIATIONS,
             build_hbn_langer_chain,
         )
-        return build_hbn_langer_chain()
+        return build_hbn_langer_chain(), list(HBN_LANGER_SPEC_DEVIATIONS)
     raise ValueError(
         f"Unknown named chain {name!r}. Available: ['hbn_langer']"
     )
@@ -97,7 +103,9 @@ class PreprocessingPipeline:
             dependency preflight, see check_dependencies).
         """
         if isinstance(steps, str):
-            steps = _resolve_named_chain(steps)
+            steps, self.spec_deviations = _resolve_named_chain(steps)
+        else:
+            self.spec_deviations: List[str] = []
         if not steps:
             raise ValueError("Preprocessing pipeline has no steps")
         self.step_configs = steps
@@ -461,6 +469,12 @@ class PreprocessingPipeline:
 
         path = self.output_dir / f"{self._output_stem(subject_id, **kwargs)}_preprocessing{suffix}.json"
 
+        # P1-F7 provenance: the resolved configuration (every step's full
+        # parameters + spec deviations), its hash and the library versions
+        # the run executed with. Recorded for every outcome so a failed run
+        # is attributable to the exact pipeline that produced it.
+        from eegcpm.core.config_hash import library_versions, resolved_config_hash
+
         payload: Dict[str, Any] = dict(metadata)
         payload.update({
             'subject_id': subject_id,
@@ -471,6 +485,9 @@ class PreprocessingPipeline:
             'warnings': list(warnings),
             'excluded': metadata.get('excluded'),
             'degraded': bool(metadata.get('degraded', False)),
+            'resolved_config': self.get_config(),
+            'config_hash': resolved_config_hash(self),
+            'library_versions': library_versions(),
         })
 
         # Per-step metadata can contain numpy scalars / arrays and MNE
@@ -547,9 +564,13 @@ class PreprocessingPipeline:
         Returns
         -------
         config : dict
-            Configuration that can reproduce this pipeline
+            Configuration that can reproduce this pipeline: the ordered
+            step list with each step's full ``get_config()`` (all
+            constructor parameters plus name/version/enabled/required),
+            and ``spec_deviations`` when the pipeline is a named chain
+            with recorded deviations (P1-F7).
         """
-        return {
+        config: Dict[str, Any] = {
             'steps': [
                 {
                     'name': step.name,
@@ -558,6 +579,9 @@ class PreprocessingPipeline:
                 for step in self.steps
             ]
         }
+        if self.spec_deviations:
+            config['spec_deviations'] = list(self.spec_deviations)
+        return config
 
     def __repr__(self) -> str:
         """String representation."""

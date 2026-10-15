@@ -132,10 +132,11 @@ class InterpolateBadChannelsStep(ProcessingStep):
         return raw, step_metadata
 
     def get_config(self) -> Dict[str, Any]:
-        """Get configuration."""
+        """Get configuration (all constructor parameters)."""
         config = super().get_config()
         config.update({
             'mode': self.mode,
             'max_bad_percent': self.max_bad_percent,
+            'reset_bads': self.reset_bads,
         })
         return config

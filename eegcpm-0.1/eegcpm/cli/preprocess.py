@@ -11,6 +11,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 
 from ..workflow.state import WorkflowStateManager, WorkflowState, ProcessingStatus, StepRecord
 from ..core.config import load_preprocessing_spec
+from ..core.config_hash import resolved_config_hash
 from ..core.paths import EEGCPMPaths, clear_run_outputs, fail_run_outputs
 from ..modules.preprocessing import PreprocessingPipeline
 from ..modules.qc.preprocessed_qc import PreprocessedQC
@@ -293,6 +294,10 @@ def preprocess_command(args):
                         # else).
                         module = PreprocessingPipeline(
                             spec.pipeline_steps(), run_output)
+                        # P1-F7: record the resolved-config hash on the
+                        # workflow row before any save_state call, so the
+                        # DB identifies the exact pipeline that ran.
+                        workflow.config_hash = resolved_config_hash(module)
                         result = module.process(
                             raw,
                             subject_id=subject_id,

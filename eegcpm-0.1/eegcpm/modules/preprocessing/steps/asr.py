@@ -47,6 +47,15 @@ import numpy as np
 from .base import ProcessingStep
 
 
+# Data-driven calibration constants (``ASRStep(calibration='data_driven')``),
+# passed to ``eegprep.clean_asr`` (probed 2026-10-14, eegprep 0.4.0). Named so
+# the hbn_langer ASR wrapper can expose them in ``get_config()`` (B6 rev2
+# NEW-4) — the resolved-config hash must cover the ASR constants, not only the
+# wrapper's constructor arguments.
+DATA_DRIVEN_REF_MAXBADCHANNELS: float = 0.075
+DATA_DRIVEN_REF_TOLERANCES: Tuple[float, float] = (-np.inf, 5.5)
+
+
 def _true_runs(mask: np.ndarray) -> list:
     """Sample runs of a boolean mask as ``[(start_sample, n_samples), ...]``."""
     mask = np.asarray(mask, dtype=bool).ravel()
@@ -394,8 +403,8 @@ class ASRStep(ProcessingStep):
             # Data-driven calibration: eegprep selects clean data internally.
             # The number of calibration samples it ends up with is not
             # returned, so it is reported as None rather than invented.
-            asr_kwargs["ref_maxbadchannels"] = 0.075
-            asr_kwargs["ref_tolerances"] = (-np.inf, 5.5)
+            asr_kwargs["ref_maxbadchannels"] = DATA_DRIVEN_REF_MAXBADCHANNELS
+            asr_kwargs["ref_tolerances"] = DATA_DRIVEN_REF_TOLERANCES
         if self.window_length is not None:
             asr_kwargs["window_len"] = self.window_length
 

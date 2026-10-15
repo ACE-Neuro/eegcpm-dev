@@ -28,7 +28,8 @@ COMPONENTS = {
 CONFIG_HASH = "c" * 64
 
 
-def _write_provenance(npz_path, *, config_hash=CONFIG_HASH, artifacts="auto", raw=None):
+def _write_provenance(npz_path, *, config_hash=CONFIG_HASH, artifacts="auto", raw=None,
+                      run_identity_hash=None):
     """Write the source-stage provenance sidecar for an archive (B5 task 8).
 
     ``artifacts`` is ``'auto'`` (hash the archive), a mapping to write verbatim
@@ -36,6 +37,8 @@ def _write_provenance(npz_path, *, config_hash=CONFIG_HASH, artifacts="auto", ra
     block entirely.
     """
     payload = {"config_hash": config_hash, "epochs_sha256": "e" * 64}
+    if run_identity_hash is not None:
+        payload["run_identity_hash"] = run_identity_hash
     if artifacts == "auto":
         payload["artifacts"] = {npz_path.name: sha256_file(npz_path)}
     elif artifacts:
@@ -150,13 +153,15 @@ def test_npzfile_input_works(tmp_path):
 
 def test_path_input_works(tmp_path):
     npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
-    _write_provenance(npz_path)
+    _write_provenance(npz_path, run_identity_hash="i" * 64)
     result = _process(tmp_path, data=npz_path)
     assert result.success, result.errors
     assert "condA_ROI_0_N1_peak_latency" in result.outputs["features"].columns
     # the consumed run's identity is carried into the feature metadata
     assert result.metadata["source_config_hash"] == CONFIG_HASH
     assert result.metadata["source_epochs_sha256"] == "e" * 64
+    # B5-N3: the run identity (config hash + condition mapping) travels too.
+    assert result.metadata["source_run_identity_hash"] == "i" * 64
 
 
 def test_mapping_input_needs_no_provenance(tmp_path):
@@ -363,8 +368,8 @@ def test_features_cli_refuses_mixed_source_configs(tmp_path):
     npz_dir.mkdir()
     a = _save_npz(npz_dir / "sub-01_roi_tc.npz")
     b = _save_npz(npz_dir / "sub-02_roi_tc.npz")
-    _write_provenance(a, config_hash="a" * 64)
-    _write_provenance(b, config_hash="b" * 64)
+    _write_provenance(a, config_hash="a" * 64, run_identity_hash="1" * 64)
+    _write_provenance(b, config_hash="b" * 64, run_identity_hash="2" * 64)
     config_path = tmp_path / "features.yaml"
     config_path.write_text(yaml.safe_dump(_config()))
 
@@ -389,4 +394,18 @@ def test_features_cli_refuses_mixed_source_configs(tmp_path):
     args.allow_mixed_source_configs = True
     result = features_command(args)
     assert sorted(result["source_config_hashes"]) == ["a" * 64, "b" * 64]
-    assert (tmp_path / "features_out" / "source_erp_resting_ec.parquet").exists()
+    assert sorted(result["source_run_identity_hashes"]) == ["1" * 64, "2" * 64]
+    parquet = tmp_path / "features_out" / "source_erp_resting_ec.parquet"
+    assert parquet.exists()
+
+    # B6 task 19: the golden-hash provenance sits next to the parquet.
+    sidecar = tmp_path / "features_out" / "source_erp_resting_ec.provenance.json"
+    payload = json.loads(sidecar.read_text())
+    assert payload["feature_type"] == "source_erp"
+    assert payload["condition"] == "resting_ec"
+    assert payload["source_config_hashes"] == ["a" * 64, "b" * 64]
+    assert payload["source_run_identity_hashes"] == ["1" * 64, "2" * 64]
+    assert payload["parquet"] == parquet.name
+    assert payload["parquet_sha256"] == sha256_file(parquet)
+    assert payload["library_versions"]["mne"]
+    assert payload["n_rows"] == int(result["n_rows"])

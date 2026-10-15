@@ -7,18 +7,37 @@ parity-run test asserts that each stage's recorded `config_hash`
 (in the STATE_SCHEMA) equals the corresponding GOLDEN_HASHES entry
 on BOTH local and HPC.
 
+P1-F7 (B6): the *preprocessing* stage is no longer pinned to the raw
+YAML bytes — the YAML only selects the code-defined ``hbn_langer``
+chain, so pinning bytes proved nothing about the code that actually
+ran. It is pinned to the **resolved** config instead:
+``resolved_config_hash(PreprocessingPipeline('hbn_langer'))`` hashes
+every step's full constructor parameters plus the library versions,
+and the literal value lives in ``GOLDEN_RESOLVED_HASHES`` (computed
+once in the pinned venv). ``load_golden_hashes()`` keeps returning all
+5 ``GOLDEN_CONFIG_NAMES`` stage keys for parity-harness compatibility:
+the ``'preprocessing'`` key maps to the resolved hash, the other 4
+stages keep their content-hash behaviour (P4 scope).
+
 This module exposes:
   - GOLDEN_CONFIG_PATHS: the 5 paths the parity run names explicitly
-  - GOLDEN_HASHES: SHA-256 of each, computed at config-load time
+  - GOLDEN_RESOLVED_HASHES: literal resolved-config hash per named chain
+  - GOLDEN_RESOLVED_LIBRARY_VERSIONS: the library versions the literal hash
+    was computed with (diagnostic for the literal-hash test)
+  - GOLDEN_CONFIG_LIBRARIES: the libraries the resolved hash covers
   - hash_config(path) -> str: SHA-256 of the file contents
+  - library_versions() -> dict: installed versions ('not-installed' fallback)
+  - resolved_config_hash(pipeline) -> str: hash of the resolved config
+  - load_golden_hashes() -> dict: the 5 pinned stage hashes
   - check_golden_config_hashes(local_dir, hpc_dir) -> None
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 # The 5 golden configs (per S10; mirrored in §3.s). These are the
@@ -26,9 +45,71 @@ from typing import Dict, List, Optional
 GOLDEN_CONFIG_PATHS: Dict[str, str] = {
     "preprocessing": "examples/configs/preprocessing/hbn_langer.yaml",
     "drowsiness":    "examples/configs/features/drowsiness_metrics.yaml",
-    "specparam":     "examples/configs/features/specparam_resting_ec.yaml",
+    "specparam":      "examples/configs/features/specparam_resting_ec.yaml",
     "connectivity":  "examples/configs/features/connectivity_resting_ec.yaml",
     "prediction":    "examples/configs/prediction/cpm_d_factor.yaml",
+}
+
+
+#: Libraries whose installed versions are part of the resolved-config hash
+#: (P1-F7: the same parameters on a different MNE build are not the same
+#: pipeline). ``'not-installed'`` is recorded for absent packages instead of
+#: failing, so the hash can be computed in a minimal environment too.
+GOLDEN_CONFIG_LIBRARIES: List[str] = [
+    "eegcpm",
+    "mne",
+    "numpy",
+    "scipy",
+    "eegprep",
+    "pyzaplineplus",
+    "eeglabio",
+    "autoreject",
+    "mne-icalabel",
+]
+
+
+#: Literal resolved-config hashes, computed once in the pinned venv
+#: (mne 1.13.2, eegprep 0.4.0, pyzaplineplus 0.1.0, eeglabio 0.1.4,
+#: autoreject 0.5.1, mne-icalabel 0.10.0, numpy 2.5.4, scipy 1.18.1).
+#: Re-pin after any dependency bump or chain change — the golden-hash test
+#: fails loudly instead of letting the parity run drift. The re-pin command
+#: (one line, run from ``eegcpm-0.1``; prints the new hash to paste below):
+#:
+#:   .venv/bin/python -c "from eegcpm.core.config_hash import resolved_config_hash; from eegcpm.modules.preprocessing.pipeline_builder import PreprocessingPipeline; print(resolved_config_hash(PreprocessingPipeline('hbn_langer')))"
+#:
+#: If the hash changed, ``GOLDEN_RESOLVED_LIBRARY_VERSIONS`` below must be
+#: updated too (the literal-hash test prints the diff when they disagree).
+#:
+#: Computed 2026-10-16 (B6) after Checkpoint A decision (a)
+#: (``RobustPCAStep`` removed from ``build_hbn_langer_chain()``; 9 steps) and
+#: after the P1-F7 ``get_config`` completion, the post-reference Cz check and
+#: the B4-D2 detector changes. Re-pinned 2026-10-16 (B6 rev2) after NEW-1
+#: (EEG+EOG filter picks), NEW-2 (band-passed blink channel), NEW-3
+#: (log-Pearson kurtosis) and NEW-4 (detector/ASR constants in
+#: ``get_config``); re-pinned again after the B6 scoped re-audit fix (the ASR
+#: wrapper now reports the fixed-first-60 s path it actually runs instead of
+#: the data-driven constants); previous values were
+#: ``f3a40cd6ab825513b840ffed333f1de0d425c51f584023caa8b685e28613f378`` and
+#: ``731756264f5c1c79783acba79dee1913b491bd5e02801c3b54105f254edef975``.
+GOLDEN_RESOLVED_HASHES: Dict[str, str] = {
+    "hbn_langer": "72c394e7801d894edf7b39dc26e543e401b2d023f67b445b83d8a5460719b3dd",
+}
+
+
+#: The installed library versions the golden resolved hash was computed with
+#: (the ``library_versions()`` payload). Not hashed directly — it exists so a
+#: failing literal-hash test can print the exact version diff (NEW-5, B6
+#: rev2) instead of only "hash mismatch".
+GOLDEN_RESOLVED_LIBRARY_VERSIONS: Dict[str, str] = {
+    "eegcpm": "0.1.0",
+    "mne": "1.13.2",
+    "numpy": "2.5.4",
+    "scipy": "1.18.1",
+    "eegprep": "0.4.0",
+    "pyzaplineplus": "0.1.0",
+    "eeglabio": "0.1.4",
+    "autoreject": "0.5.1",
+    "mne-icalabel": "0.10.0",
 }
 
 
@@ -37,16 +118,61 @@ def hash_config(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def library_versions() -> Dict[str, str]:
+    """Installed versions of the pipeline libraries (P1-F7).
+
+    Uses ``importlib.metadata.version``; a package that is not installed is
+    reported as ``'not-installed'`` (never raises) so the resolved hash is
+    computable in any environment and changes when a dependency is added.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    versions: Dict[str, str] = {}
+    for package in GOLDEN_CONFIG_LIBRARIES:
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = "not-installed"
+    return versions
+
+
+def resolved_config_hash(pipeline: Any) -> str:
+    """SHA-256 of a pipeline's **resolved** configuration (P1-F7).
+
+    ``pipeline`` is anything exposing ``get_config()`` (e.g.
+    ``PreprocessingPipeline``): the hash covers the resolved step
+    parameters — not the raw YAML bytes, which can differ while resolving
+    to the same pipeline — plus the installed library versions, so a
+    dependency bump is visible in the recorded hash.
+    """
+    payload = {
+        "pipeline": pipeline.get_config(),
+        "libraries": library_versions(),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def load_golden_hashes(
     root: Optional[Path] = None,
 ) -> Dict[str, str]:
-    """Compute the SHA-256 of each golden config relative to `root`
-    (defaults to the repo root)."""
+    """The pinned hash of each golden stage (all 5 ``GOLDEN_CONFIG_NAMES``).
+
+    The ``'preprocessing'`` stage is the **resolved-config** hash of the
+    ``hbn_langer`` chain (``GOLDEN_RESOLVED_HASHES``); the other four stages
+    keep the SHA-256 of their config file contents. ``root`` only affects
+    the file-content stages (the resolved hash is environment-independent
+    given the pinned libraries).
+    """
     root = Path(root) if root is not None else _repo_root()
-    return {
-        stage: hash_config(root / rel)
-        for stage, rel in GOLDEN_CONFIG_PATHS.items()
-    }
+    hashes: Dict[str, str] = {}
+    for stage, rel in GOLDEN_CONFIG_PATHS.items():
+        if stage == "preprocessing":
+            hashes[stage] = GOLDEN_RESOLVED_HASHES["hbn_langer"]
+        else:
+            hashes[stage] = hash_config(root / rel)
+    return hashes
 
 
 def _repo_root() -> Path:

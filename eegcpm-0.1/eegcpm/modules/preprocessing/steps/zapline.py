@@ -189,35 +189,54 @@ class ZaplineStep(ProcessingStep):
         # Transpose for pyzaplineplus: (n_times, n_channels)
         data_T = data.T
 
+        # P1-F9: a fixed line frequency is passed as `noisefreqs=[fline]`
+        # (pyzaplineplus searches for further harmonics itself); an empty
+        # list enables auto-detection (17-99 Hz search).
+        if self.fline is not None:
+            noisefreqs_passed = [float(self.fline)]
+        else:
+            noisefreqs_passed = [float(f) for f in self.noisefreqs]
+
         # Apply Zapline-Plus
         # zapline_plus expects (n_times, n_channels)
         # Returns: (cleaned_data, zapline_config, analytics, plots)
-        result = zapline_plus(
+        cleaned_data, zap_config, analytics, _ = zapline_plus(
             data_T,
             sampling_rate=sfreq,
-            noisefreqs=self.noisefreqs,
+            noisefreqs=noisefreqs_passed,
             noiseCompDetectSigma=self.noiseCompDetectSigma,
             fixedNremove=self.fixedNremove,
             plotResults=False,  # Disable plotting
         )
-        cleaned_data = result[0]
-        info_dict = result[1] if len(result) > 1 else {}
 
         # Transpose back: (n_channels, n_times)
-        cleaned_data = cleaned_data.T
+        cleaned_data = np.asarray(cleaned_data).T
 
-        # Update raw data in-place
-        raw._data[picks, :] = cleaned_data
+        # --- metadata from the real pyzaplineplus outputs (P1-F9) ---
+        # The detected frequencies are the ones the library actually used
+        # (probed 2026-10-16: `zap_config['noisefreqs']` is a list of floats,
+        # numpy scalars for auto-detected entries). A missing key raises
+        # KeyError instead of inventing a default.
+        detected_freqs = [float(f) for f in zap_config['noisefreqs']]
+        detected_freq = detected_freqs[0] if detected_freqs else None
 
-        # Extract info from pyzaplineplus output
-        n_components_removed = info_dict.get('n_removed_components', 1) if info_dict else 1
+        # Removed-component counts live in `analytics`, keyed per detected
+        # noise frequency as `noise_freq_<freq>`; `n_remove_final` is an
+        # array with one entry per chunk (probed 2026-10-16). A missing key
+        # raises KeyError — the old code read a non-existent
+        # `n_removed_components` and always reported 1.
+        n_components_removed: Dict[str, int] = {}
+        n_components_by_chunk: Dict[str, List[int]] = {}
+        for freq in detected_freqs:
+            entry = analytics[f"noise_freq_{freq}"]
+            per_chunk = [int(v) for v in np.atleast_1d(entry["n_remove_final"])]
+            n_components_by_chunk[f"{freq}"] = per_chunk
+            n_components_removed[f"{freq}"] = int(sum(per_chunk))
+        n_components_total = int(sum(n_components_removed.values()))
 
-        # Get detected frequencies
-        detected_freqs = info_dict.get('noisefreqs', []) if info_dict else []
-        detected_freq = detected_freqs[0] if len(detected_freqs) > 0 else self.fline
-
-        # Check if auto-detection was used
-        auto_detected = info_dict.get('automaticFreqDetection', False) if info_dict else False
+        # Whether auto-detection was used (`automaticFreqDetection` is set
+        # by the library only on the auto-detection path).
+        auto_detected = bool(zap_config.get('automaticFreqDetection', False))
 
         # Calculate noise reduction
         noise_power_before = np.var(data)
@@ -241,17 +260,20 @@ class ZaplineStep(ProcessingStep):
             print(f"  ✓ Detected line frequency: {detected_freq} Hz")
         if len(detected_freqs) > 1:
             print(f"  ✓ Additional frequencies: {[f'{f:.1f}' for f in detected_freqs[1:]]}")
-        print(f"  Components removed: {n_components_removed}")
+        print(f"  Components removed: {n_components_total}")
         print(f"  Overall noise reduction: {noise_reduction_db:.1f} dB")
         print(f"  Line noise ({detected_freq} Hz) reduction: {line_reduction_db:.1f} dB")
 
         # Build metadata
         step_metadata = {
             'fline': self.fline,
-            'detected_freq': float(detected_freq) if detected_freq is not None else None,
-            'detected_freqs': [float(f) for f in detected_freqs],
+            'noisefreqs_passed': noisefreqs_passed,
+            'detected_freq': detected_freq,
+            'detected_freqs': detected_freqs,
             'auto_detected': auto_detected,
             'n_components_removed': n_components_removed,
+            'n_components_removed_by_chunk': n_components_by_chunk,
+            'n_components_removed_total': n_components_total,
             'n_channels_processed': len(picks),
             'duration_seconds': duration,
             'noise_reduction_db': float(noise_reduction_db),
@@ -259,6 +281,12 @@ class ZaplineStep(ProcessingStep):
             'adaptive': self.adaptive,
             'applied': True,
         }
+
+        # Update raw data in-place only after every metadata read that can
+        # raise (B6-K7): a KeyError in the pyzaplineplus outputs
+        # (`zap_config['noisefreqs']`, `analytics['noise_freq_<f>']`) must
+        # leave `raw` unmutated.
+        raw._data[picks, :] = cleaned_data
 
         return raw, step_metadata
 
@@ -315,15 +343,18 @@ class ZaplineStep(ProcessingStep):
         return True
 
     def get_config(self) -> Dict[str, Any]:
-        """Get step configuration."""
+        """Get configuration (all constructor parameters, P1-F7)."""
         config = super().get_config()
         config.update({
             'fline': self.fline,
             'nremove': self.nremove,
             'nfft': self.nfft,
+            'nkeep': self.nkeep,
             'adaptive': self.adaptive,
-            'noisefreqs': self.noisefreqs,
+            'noisefreqs': list(self.noisefreqs),
             'noiseCompDetectSigma': self.noiseCompDetectSigma,
             'fixedNremove': self.fixedNremove,
+            'picks': self.picks,
+            'verbose': self.verbose,
         })
         return config

@@ -39,7 +39,7 @@ def _load_features(features_dir: Path) -> pd.DataFrame:
 
 def _source_erp_frames(
     args, config: Dict[str, Any], output_dir: Path
-) -> Tuple[List[pd.DataFrame], List[str]]:
+) -> Tuple[List[pd.DataFrame], List[str], List[str], List[str]]:
     """Extract source-ERP features from the source stage's ROI archives (P2-F6).
 
     Two input modes:
@@ -49,7 +49,8 @@ def _source_erp_frames(
     2. ``--preprocessing/--task/--source`` (or the config's ``depends_on``):
        resolved through ``EEGCPMPaths.get_source_dir(...) / f"{subject}_roi_tc.npz"``.
 
-    Returns ``(frames, missing, source_config_hashes)``. ``missing`` lists every
+    Returns ``(frames, missing, source_config_hashes, source_run_identity_hashes)``.
+    ``missing`` lists every
     **expected but absent** input (requested subject without a directory,
     requested session without a directory, or a subject/session without the
     evoked archive); each entry is reported on stderr and counted in the CLI
@@ -61,6 +62,8 @@ def _source_erp_frames(
     behind the consumed archives. More than one distinct hash means the table
     would mix different inverse/config settings; the call raises unless
     ``--allow-mixed-source-configs`` is set (audit B5-N1).
+    ``source_run_identity_hashes`` holds the distinct ``run_identity_hash``
+    values (config hash + resolved condition -> event-code mapping, B5-N3).
     """
     from types import SimpleNamespace
 
@@ -160,6 +163,7 @@ def _source_erp_frames(
 
     frames: List[pd.DataFrame] = []
     hashes: List[str] = []
+    run_identities: List[str] = []
     for npz_path in npz_files:
         if npz_path.parent.name.startswith("ses-"):
             subject_id = npz_path.parent.parent.name.replace("sub-", "")
@@ -177,6 +181,9 @@ def _source_erp_frames(
         source_hash = result.metadata.get("source_config_hash")
         if source_hash:
             hashes.append(str(source_hash))
+        run_identity = result.metadata.get("source_run_identity_hash")
+        if run_identity:
+            run_identities.append(str(run_identity))
         print(f"[features] source_erp: {npz_path.name} -> {result.outputs['n_features']} features")
 
     # B5-N1: one feature table must come from one source config. Mixed runs
@@ -196,7 +203,7 @@ def _source_erp_frames(
             + ", ".join(distinct_hashes),
             file=sys.stderr,
         )
-    return frames, missing, distinct_hashes
+    return frames, missing, distinct_hashes, sorted(set(run_identities))
 
 
 def features_command(args):
@@ -258,8 +265,10 @@ def features_command(args):
     frames = []
     missing: List[str] = []
     source_hashes: List[str] = []
+    run_identities: List[str] = []
     if feature_type == "source_erp":
-        frames, missing, source_hashes = _source_erp_frames(args, config, output_dir)
+        frames, missing, source_hashes, run_identities = _source_erp_frames(
+            args, config, output_dir)
     else:
         if input_dir is None or not input_dir.is_dir():
             raise FileNotFoundError(f"--input-dir {input_dir} not found")
@@ -325,6 +334,20 @@ def features_command(args):
 
     out_path = output_dir / f"{feature_type}_{condition}.parquet"
     out_df.to_parquet(out_path, index=False)
+    # Golden-hash provenance next to the feature table (B5-N3): the source
+    # config hash(es) and run identity hash(es) behind this table, plus the
+    # parquet hash and library versions. Written for every feature type so
+    # a table can always be attributed to the runs that produced it.
+    _write_features_provenance(
+        output_dir=output_dir,
+        feature_type=feature_type,
+        condition=condition,
+        out_path=out_path,
+        n_rows=int(out_df.shape[0]),
+        n_cols=int(out_df.shape[1]),
+        source_config_hashes=source_hashes,
+        source_run_identity_hashes=run_identities,
+    )
     if missing:
         # B5 task 9: expected-but-absent inputs are reported, not silently skipped.
         print(
@@ -339,7 +362,49 @@ def features_command(args):
     return {"output": str(out_path), "n_rows": int(out_df.shape[0]),
             "n_cols": int(out_df.shape[1]),
             "n_missing": len(missing), "missing": list(missing),
-            "source_config_hashes": list(source_hashes)}
+            "source_config_hashes": list(source_hashes),
+            "source_run_identity_hashes": list(run_identities)}
+
+
+def _write_features_provenance(
+    *,
+    output_dir: Path,
+    feature_type: str,
+    condition: str,
+    out_path: Path,
+    n_rows: int,
+    n_cols: int,
+    source_config_hashes: List[str],
+    source_run_identity_hashes: List[str],
+) -> Path:
+    """Write ``{feature_type}_{condition}.provenance.json`` (B5-N3, B6 task 19).
+
+    The feature table is only attributable if the source-run identity travels
+    with it: the source ``config_hash``(es) say which inverse/config produced
+    the ROI archives, and the ``run_identity_hash``(es) additionally pin the
+    resolved condition -> event-code mapping. The library versions and the
+    parquet's own sha256 make the record self-contained.
+    """
+    from datetime import datetime, timezone
+
+    from eegcpm.core.config_hash import library_versions
+    from eegcpm.core.provenance import atomic_write_json, sha256_file
+
+    path = output_dir / f"{feature_type}_{condition}.provenance.json"
+    atomic_write_json(path, {
+        "stage": "features",
+        "feature_type": feature_type,
+        "condition": condition,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+        "parquet": out_path.name,
+        "parquet_sha256": sha256_file(out_path),
+        "source_config_hashes": sorted(set(source_config_hashes)),
+        "source_run_identity_hashes": sorted(set(source_run_identity_hashes)),
+        "library_versions": library_versions(),
+    })
+    return path
 
 
 def add_features_parser(subparsers):

@@ -68,6 +68,17 @@ class BadChannelDetector:
 
     VALID_METHODS = ['variance', 'correlation', 'ransac', 'deviation', 'prep']
 
+    #: Montage-neighbour radius (head-frame metres) for the correlation
+    #: criterion: a channel is compared with the channels within this
+    #: distance instead of with the whole montage (P1-F18).
+    NEIGHBOUR_RADIUS_M: float = 0.05
+    #: Minimum number of neighbours per channel; if the radius finds fewer,
+    #: the closest channels are used instead.
+    MIN_NEIGHBOURS: int = 3
+    #: A channel whose variance is at/below this floor (V**2) is flat and
+    #: bad outright (it has no meaningful correlation structure).
+    FLAT_VARIANCE_FLOOR: float = 1e-20
+
     def __init__(
         self,
         methods: List[str] = ['variance', 'correlation'],
@@ -188,25 +199,87 @@ class BadChannelDetector:
 
         return bad_channels, scores
 
+    def _neighbour_indices(
+        self,
+        raw: mne.io.BaseRaw,
+        picks: np.ndarray,
+    ) -> List[np.ndarray]:
+        """Montage neighbours per pick (indices into ``picks``).
+
+        Neighbours are the channels within ``NEIGHBOUR_RADIUS_M`` in the
+        head frame; when fewer than ``MIN_NEIGHBOURS`` fall inside the
+        radius the closest channels are used; when the montage carries no
+        usable positions every other channel is a neighbour (documented
+        fallback — the criterion still works, just less spatially specific).
+        """
+        n = len(picks)
+        positions = np.array(
+            [raw.info['chs'][p]['loc'][:3] for p in picks], dtype=float
+        )
+        if not np.isfinite(positions).all() or not np.any(positions):
+            return [np.array([j for j in range(n) if j != i], dtype=int)
+                    for i in range(n)]
+
+        distances = np.linalg.norm(
+            positions[:, None, :] - positions[None, :, :], axis=2
+        )
+        neighbours: List[np.ndarray] = []
+        for i in range(n):
+            near = np.where(
+                (distances[i] <= self.NEIGHBOUR_RADIUS_M)
+                & (np.arange(n) != i)
+            )[0]
+            if near.size < self.MIN_NEIGHBOURS:
+                order = [j for j in np.argsort(distances[i]) if j != i]
+                near = np.asarray(order[: self.MIN_NEIGHBOURS], dtype=int)
+            neighbours.append(near)
+        return neighbours
+
     def _detect_by_correlation(
         self,
         raw: mne.io.BaseRaw,
         picks: np.ndarray
     ) -> Tuple[Set[str], dict]:
-        """Detect channels poorly correlated with neighbors."""
+        """Detect channels poorly correlated with their montage neighbours.
+
+        P1-F18: the comparison is against **montage neighbours** (within
+        ``NEIGHBOUR_RADIUS_M``) and uses ``np.nanmedian``, so a flat channel
+        (whose correlation row is NaN) neither disables the criterion for
+        every other channel nor stays unflagged: flat channels are bad
+        outright, and every other channel's score stays finite.
+        """
+        n = len(picks)
+        if n < 2:
+            return set(), {}
+
         data = raw.get_data(picks=picks)
 
-        # Compute correlation matrix
+        # Flat channels are bad outright and excluded from the comparison.
+        variance = np.var(data, axis=1)
+        ptp = np.ptp(data, axis=1)
+        flat = (variance <= self.FLAT_VARIANCE_FLOOR) | (ptp == 0.0)
+
         corr_matrix = np.corrcoef(data)
+        neighbours = self._neighbour_indices(raw, picks)
 
-        # For each channel, compute median correlation with others
-        median_corrs = np.median(corr_matrix, axis=1)
+        median_corrs = np.full(n, np.nan)
+        for i in range(n):
+            if flat[i]:
+                continue
+            values = corr_matrix[i, neighbours[i]]
+            if values.size:
+                median_corrs[i] = float(np.nanmedian(values))
 
-        # Find channels with low correlation
-        bad_indices = np.where(median_corrs < self.correlation_threshold)[0]
+        bad_channels = set()
+        for i in range(n):
+            if flat[i]:
+                bad_channels.add(raw.ch_names[picks[i]])
+                continue
+            score = median_corrs[i]
+            if not np.isfinite(score) or score < self.correlation_threshold:
+                bad_channels.add(raw.ch_names[picks[i]])
 
-        bad_channels = {raw.ch_names[picks[i]] for i in bad_indices}
-        scores = {raw.ch_names[picks[i]]: median_corrs[i] for i in range(len(picks))}
+        scores = {raw.ch_names[picks[i]]: median_corrs[i] for i in range(n)}
 
         return bad_channels, scores
 
@@ -316,8 +389,15 @@ class BadChannelDetector:
             return bad_channels, scores
 
         except Exception as e:
-            print(f"Warning: RANSAC detection failed: {e}")
-            return set(), {}
+            # B3-K9: never degrade detection silently. The old handler
+            # printed a warning and returned zero bad channels, so a
+            # failing RANSAC path looked like a clean recording. The step
+            # must fail instead.
+            raise RuntimeError(
+                f"RANSAC bad-channel detection failed "
+                f"({type(e).__name__}: {e}); refusing to report zero bad "
+                "channels"
+            ) from e
 
     def _detect_by_deviation(
         self,
@@ -428,8 +508,14 @@ class BadChannelDetector:
             return bad_channels, scores
 
         except Exception as e:
-            print(f"Warning: PREP detection failed: {e}")
-            return set(), {}
+            # B3-K9: never degrade detection silently (mirrors the RANSAC
+            # path): a failing PREP run must fail the step, not report
+            # zero bad channels.
+            raise RuntimeError(
+                f"PREP bad-channel detection failed "
+                f"({type(e).__name__}: {e}); refusing to report zero bad "
+                "channels"
+            ) from e
 
     def get_config(self) -> dict:
         """Get detector configuration as dictionary."""

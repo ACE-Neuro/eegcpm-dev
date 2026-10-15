@@ -16,7 +16,7 @@ The IALM algorithm is deterministic given the inputs and lambda
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import mne
 import numpy as np
@@ -42,10 +42,16 @@ def ialm_decompose(
     mu: Optional[float] = None,
     tolerance: float = 1e-7,
     max_iter: int = 200,
-) -> Tuple[np.ndarray, np.ndarray]:
+    return_info: bool = False,
+) -> Union[Tuple[np.ndarray, np.ndarray],
+           Tuple[np.ndarray, np.ndarray, Dict[str, Any]]]:
     """Inexact Augmented Lagrange Multipliers (IALM) for Robust PCA.
 
     Returns (L, S) such that M ≈ L + S, L is low-rank, S is sparse.
+    With ``return_info=True`` a third element
+    ``{'n_iter': int, 'converged': bool}`` is appended (P1-F2
+    instrumentation: how many iterations the solve used and whether it
+    hit the tolerance instead of the iteration cap).
 
     Reference: Lin et al. 2011, "The Augmented Lagrange Multiplier
     Method for Exact Recovery of Corrupted Low-Rank Matrices".
@@ -63,6 +69,8 @@ def ialm_decompose(
         Convergence tolerance.
     max_iter : int
         Maximum number of iterations.
+    return_info : bool
+        Also return ``{'n_iter', 'converged'}``.
     """
     if lam is None:
         lam = CANONICAL_LAMBDA
@@ -80,7 +88,11 @@ def ialm_decompose(
     Y = np.zeros_like(M)
     rho = 1.5  # update factor
 
+    n_iter = 0
+    converged = False
+
     for iteration in range(max_iter):
+        n_iter = iteration + 1
         # L update: (M - S + Y/mu) via SVD with shrinkage
         E = M - S + Y / mu
         # SVD: E = U S V^T; shrink S by 1/mu
@@ -95,17 +107,34 @@ def ialm_decompose(
         # Residual
         residual = M - L - S
         if np.linalg.norm(residual, "fro") < tolerance * np.linalg.norm(M, "fro"):
+            converged = True
             break
 
         # Update Y
         Y = Y + mu * residual
         mu = min(mu * rho, mu * 1e7)
 
+    if return_info:
+        return L, S, {"n_iter": int(n_iter), "converged": bool(converged)}
     return L, S
 
 
 class RobustPCAStep(ProcessingStep):
-    """Robust PCA via IALM. Returns the low-rank component as cleaned data."""
+    """Robust PCA via IALM. Returns the low-rank component as cleaned data.
+
+    B6-K8: when IALM hits ``max_iter`` without reaching the tolerance, the
+    step reports ``applied: False`` with ``reason='ialm_not_converged'`` — the
+    executor then fails a required run instead of silently saving a
+    non-converged decomposition.
+
+    B6 rev2 NEW-10: the low-rank component is written back **only when the
+    solve converged**. A non-converged ``L`` is a partial solution whose
+    residual is unbounded in principle; leaving the input data untouched keeps
+    the step's failure mode honest (a caller that ignores ``applied`` cannot
+    silently process a half-solved decomposition). The ERP-retention fixtures
+    in ``tests/unit/test_robust_pca_erp.py`` converge (``n_iter`` 31/27), so
+    the documented xfail regime is unaffected.
+    """
 
     name = "robust_pca"
     version = "1.0"
@@ -139,14 +168,28 @@ class RobustPCAStep(ProcessingStep):
     ) -> Tuple[mne.io.BaseRaw, Dict[str, Any]]:
         picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
         M = raw.get_data(picks=picks)
-        L, _S = ialm_decompose(
+        L, S, solve_info = ialm_decompose(
             M, lam=self.lam, mu=self.mu,
             tolerance=self.tolerance, max_iter=self.max_iter,
+            return_info=True,
         )
-        # Write back low-rank component
-        raw._data[picks] = L
-        return raw, {
-            "applied": True,
+        # B6-K8: hitting `max_iter` without reaching the tolerance is a
+        # failed solve, not a successful step with a metadata footnote.
+        applied = bool(solve_info["converged"])
+        # B6 rev2 NEW-10: write back the low-rank component only on
+        # convergence; a non-converged L is a partial solution and must not
+        # reach a caller that ignores `applied`.
+        if applied:
+            raw._data[picks] = L
+        # P1-F2 instrumentation: how much of M the sparse component
+        # absorbed (fraction of non-zero entries and of the Frobenius
+        # energy). A dense S with substantial energy is the signature of
+        # an ERP being removed together with the artifacts — the reason
+        # this step is not part of the ERP chain (Checkpoint A, decision
+        # (a): removed from build_hbn_langer_chain()).
+        m_energy = float(np.linalg.norm(M, "fro") ** 2)
+        step_metadata: Dict[str, Any] = {
+            "applied": applied,
             "method": self.method,
             "lam": self.lam,
             "lam_rule": self.lam_rule,
@@ -154,4 +197,29 @@ class RobustPCAStep(ProcessingStep):
             "mu_rule": self.mu_rule,
             "tolerance": self.tolerance,
             "max_iter": self.max_iter,
+            "nnz_S_frac": float(np.count_nonzero(S) / S.size),
+            "energy_S_frac": (
+                float(np.linalg.norm(S, "fro") ** 2) / m_energy
+                if m_energy > 0 else 0.0
+            ),
+            "n_iter": solve_info["n_iter"],
+            "converged": solve_info["converged"],
         }
+        if not applied:
+            step_metadata["reason"] = "ialm_not_converged"
+        return raw, step_metadata
+
+    def get_config(self) -> Dict[str, Any]:
+        """Get configuration (all constructor parameters)."""
+        config = super().get_config()
+        config.update({
+            "method": self.method,
+            "lam": self.lam,
+            "lam_rule": self.lam_rule,
+            "mu": self.mu,
+            "mu_rule": self.mu_rule,
+            "tolerance": self.tolerance,
+            "max_iter": self.max_iter,
+            "rank_cap": self.rank_cap,
+        })
+        return config

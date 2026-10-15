@@ -500,6 +500,70 @@ def test_block_rejection_appends_with_offsets(with_meas_date):
         "existing event samples moved when BAD_BLOCK was appended")
 
 
+@pytest.mark.parametrize("with_meas_date", [True, False],
+                         ids=["meas_date", "meas_date_none"])
+def test_artifact_annotation_step_keeps_event_samples(with_meas_date):
+    """B3-K9: the four artifact append sites must not shift the timeline.
+
+    With ``meas_date=None`` and ``first_samp=1000`` the uncorrected
+    ``set_annotations(raw.annotations + annot)`` recipe moved every existing
+    annotation by ``first_time`` (4 s here) per append site. The step now
+    routes through ``append_bad_annotations``; the stim event samples must be
+    identical and the new ``BAD_amplitude`` marks must land on the artifact.
+    """
+    from eegcpm.modules.preprocessing.steps.artifacts import (
+        ArtifactAnnotationStep,
+    )
+
+    rng = np.random.default_rng(3)
+    sfreq = 250.0
+    duration = 30.0
+    n_times = int(duration * sfreq)
+    data = rng.standard_normal((len(CH_NAMES), n_times)) * 10e-6
+    info = mne.create_info(CH_NAMES, sfreq, "eeg")
+    raw = mne.io.RawArray(data, info, first_samp=1000, verbose=False)
+    if with_meas_date:
+        raw.set_meas_date(MEAS_DATE)
+
+    # 1 s of +/-1 mV on every channel (ptp 2 mV >> 500 uV threshold)
+    t = np.arange(n_times) / sfreq
+    artifact_sel = (t >= 10.0) & (t < 11.0)
+    raw._data[:, artifact_sel] += 1e-3 * np.sign(rng.standard_normal(
+        (len(CH_NAMES), int(artifact_sel.sum()))))
+
+    onsets = np.arange(0.0, duration, 2.0)
+    raw.set_annotations(mne.Annotations(
+        onsets, np.zeros(len(onsets)), ["stim"] * len(onsets)))
+
+    keys_before = _annotation_keys(raw.annotations)
+    events_before, _ = mne.events_from_annotations(raw)
+
+    out, meta = ArtifactAnnotationStep().process(raw, {})
+
+    assert meta["applied"] is True
+    assert meta["n_annotations_added"] >= 1
+    assert meta["annotation_counts"].get("BAD_amplitude", 0) >= 1
+
+    keys_after = _annotation_keys(out.annotations)
+    _assert_survived(keys_before, keys_after)
+
+    events_after, _ = mne.events_from_annotations(out)
+    assert np.array_equal(events_before, events_after), (
+        "existing event samples moved when artifact annotations were appended")
+
+    amplitude_keys = [key for key in keys_after if key[2] == "BAD_amplitude"]
+    assert amplitude_keys
+    # Data-relative frame: onset - first_time is seconds from the first
+    # sample in both meas_date branches; the 100 ms sliding window starts at
+    # or just before the artifact.
+    first_onset = min(key[0] for key in amplitude_keys)
+    assert 9.8 <= (first_onset - out.first_time) <= 10.1
+    # ... and no other stim annotation moved.
+    stim_after = sorted(key[0] - out.first_time
+                        for key in keys_after if key[2] == "stim")
+    assert stim_after == pytest.approx(sorted(onsets), abs=1e-9)
+
+
 def test_append_bad_annotations_refuses_to_drop_timeline():
     """B3-K6: a desynced ``orig_time`` (private-state mutation that MNE's
     public API never produces) must fail loudly instead of silently dropping
@@ -549,3 +613,36 @@ def test_clean_windows_receives_repaired_data(monkeypatch):
     picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
     post = raw.get_data(picks=picks)
     np.testing.assert_allclose(seen["data"] * 1e-6, post, rtol=1e-9, atol=1e-12)
+
+
+def test_asr_wrapper_config_matches_fixed_path_kwargs(monkeypatch):
+    """NEW-4 re-audit: the wrapper's get_config must describe the fixed-first-60 s
+    path it actually runs (ndarray calibration reference; ref_tolerances not
+    passed) — not the data-driven constants."""
+    import eegprep
+
+    from eegcpm.modules.preprocessing.hbn_langer_chain import _ASRStepWrapper
+
+    calls = {}
+    real = eegprep.clean_asr
+
+    def spy(EEG, *args, **kwargs):
+        calls.update(kwargs)
+        return real(EEG, *args, **kwargs)
+
+    monkeypatch.setattr(eegprep, "clean_asr", spy)
+
+    raw = _make_raw()
+    wrapper = _ASRStepWrapper()
+    out, meta = wrapper.process(raw, {})
+
+    assert calls["cutoff"] == 20.0
+    ref = calls["ref_maxbadchannels"]
+    assert isinstance(ref, np.ndarray) and ref.ndim == 2
+    assert ref.shape[1] == int(60.0 * SFREQ)
+    assert "ref_tolerances" not in calls
+
+    cfg = wrapper.get_config()
+    assert cfg["calibration_reference"] == "first_train_duration_s_of_data"
+    assert cfg["ref_maxbadchannels"] == "calibration_array"
+    assert cfg["ref_tolerances"] == "eegprep_default"

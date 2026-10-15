@@ -241,7 +241,15 @@ class ICLabelStep(ProcessingStep):
             current_exclude.update(components_to_reject)
             ica.exclude = sorted(list(current_exclude))
 
-            # Apply ICA with updated exclusions
+            # Apply ICA with updated exclusions.
+            #
+            # F19 (comment only): this can re-apply the exclusions an
+            # earlier ICAStep already applied. ICA application is an
+            # idempotent linear projection (applying the same unmixing/
+            # mixing pair twice removes the component once), and the
+            # audit refuted the double-application concern — the exclusion
+            # set here is the union, so no component is removed twice
+            # "harder". Kept as is; not part of any golden chain.
             raw_clean = ica.apply(raw.copy(), verbose=False)
         else:
             raw_clean = raw

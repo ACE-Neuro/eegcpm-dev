@@ -363,13 +363,27 @@ class ICAStep(ProcessingStep):
         return raw_clean, step_metadata
 
     def _resolve_n_components(self, raw: mne.io.BaseRaw) -> Union[int, float]:
-        """Resolve n_components from string or return as-is."""
+        """Resolve n_components from string or return as-is.
+
+        ``'rank-1'``: one fewer component than the data rank (never more —
+        requesting more than rank-1 makes the decomposition rank-deficient).
+        The old ``max(5, rank - 1)`` could ask for 5 components from a
+        rank-4 recording; the clamp is now ``min(max(5, r - 1), r - 1)``
+        (P1-F20) and ``r - 1 < 1`` raises instead of silently fitting an
+        impossible decomposition.
+        """
         if self.n_components == 'rank-1':
             # Compute data rank and use rank - 1
             rank_dict = mne.compute_rank(raw, rank='info')
             eeg_picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
             data_rank = rank_dict.get('eeg', len(eeg_picks))
-            return max(5, data_rank - 1)  # At least 5 components
+            n_components = min(max(5, data_rank - 1), data_rank - 1)
+            if n_components < 1:
+                raise ValueError(
+                    "ICA n_components='rank-1' needs a data rank >= 2 "
+                    f"(got eeg rank {data_rank}); cannot fit any component"
+                )
+            return n_components
         else:
             return self.n_components
 

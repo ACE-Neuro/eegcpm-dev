@@ -1,4 +1,30 @@
-"""Source reconstruction module."""
+"""Source reconstruction module.
+
+ROI time courses are extracted with ``mode='mean_flip'`` (P2-F4). Two
+documented caveats (user decision 2026-10-15, plan §12 item 4 — keep
+``mean_flip``, do not switch to ``pca_flip``):
+
+1. **Attenuation under uniform patches.** In a uniform-patch simulation
+   (same dSPM / loose-0.2 pipeline, 40 epochs) the injected ROI was dominant
+   in **11/30** ROIs under ``mean_flip`` vs **22/30** under ``pca_flip``: the
+   signed mean of the surface normals within a label cancels part of the
+   source amplitude. Mean absolute source energy still ranks the true ROIs
+   first — the loss is cancellation during extraction, not the inverse — but
+   single-ROI ERP *amplitudes* are attenuated and must not be compared
+   against sensor-level amplitudes.
+2. **Midline polarity convention.** Midline ROIs (``BiHemiLabel``, |x| ≤ 5 mm)
+   have near-tied flip axes (|mean(dot)| 0.008–0.21; e.g. ``MPFC`` lh −0.70 /
+   rh +0.71), so the *sign* of a midline time course follows the
+   ``mean_flip`` polarity convention rather than anatomy, and one ROI
+   (``Language.IFG_R``) comes out polarity-inverted. Cross-ROI sign
+   comparisons on midline labels are therefore not meaningful without an
+   explicit polarity convention; lateral ROIs are stable.
+
+The extraction itself is anatomically mapped (CONN MNI centres -> source-space
+vertices), uniquely named, and **signed** (``pick_ori='normal'``) so N1/P2
+polarity survives. See the class docstring for the hardening/provenance
+behaviour.
+"""
 
 import glob
 import hashlib
@@ -34,6 +60,7 @@ from eegcpm.core.provenance import (
     sha256_file,
     sha256_json,
     stale_output_patterns,
+    to_jsonable,
 )
 from eegcpm.pipeline.base import ModuleResult, EpochsModule
 from eegcpm.modules.source.labels import build_conn_labels
@@ -104,10 +131,15 @@ class SourceReconstructionModule(EpochsModule):
     description = "Source localization and ROI extraction"
 
     #: Class-level ``(src, forward)`` cache (P2-F13) keyed by
-    #: ``sha256(ch_names + rounded loc[:3]) | spacing | BEM | mne version | subjects_dir``.
+    #: ``sha256(ch_names + rounded loc[:3]) | spacing | BEM | mne version | subjects_dir
+    #: | BEM/trans mtime_ns:size``.
     #: Building the fsaverage forward costs ~10 s; a batch of subjects on the same
     #: montage reuses one forward. ``subjects_dir`` is part of the key (beyond the
-    #: plan's list) so two different fsaverage copies can never share a forward.
+    #: plan's list) so two different fsaverage copies can never share a forward, and
+    #: the BEM/trans mtime+size (B5-A4) invalidates the entry when the template
+    #: files are replaced in place. A benign consequence of the class-level cache is
+    #: a possible double build under GIL-free concurrency (two threads miss the same
+    #: key and both build) — wasteful, never incorrect.
     _FORWARD_CACHE: Dict[str, Tuple[mne.SourceSpaces, mne.Forward]] = {}
 
     def __init__(self, config: Dict[str, Any], output_dir: Path, task_config: Optional[Dict[str, Any]] = None):
@@ -432,6 +464,10 @@ class SourceReconstructionModule(EpochsModule):
                 "cov_rank": dict(cov_rank),
                 "montage_check": montage_check,
                 "config_hash": self.config_hash(),
+                "run_identity_hash": self.run_identity_hash(selection),
+                "resolved_event_codes": to_jsonable(
+                    selection["resolved_event_codes"]
+                ),
                 "qc_metrics": {m.name: m.value for m in qc_metrics} if qc_metrics else {},
             }
             metadata.update(self._selection_metadata(selection))
@@ -537,9 +573,18 @@ class SourceReconstructionModule(EpochsModule):
         skipped: Dict[str, Dict[str, Any]] = {}
         selected: Dict[str, mne.BaseEpochs] = {}
         warnings: List[str] = []
+        # Resolved condition -> event-code mapping (B5-N3): the task-config
+        # codes as given *and* the epoch event values they matched. Recorded
+        # in the provenance and hashed into the run identity, so a run is
+        # attributable to the exact condition mapping that produced it.
+        resolved_event_codes: Dict[str, Dict[str, Any]] = {}
 
         for name in requested:
             event_values = self._match_event_codes(epochs, task_conditions[name])
+            resolved_event_codes[name] = {
+                "codes": [str(code) for code in task_conditions[name]],
+                "matched_event_values": [int(value) for value in event_values],
+            }
             mask = (
                 np.isin(epochs.events[:, 2], event_values)
                 if event_values
@@ -587,6 +632,7 @@ class SourceReconstructionModule(EpochsModule):
             "conditions_missing": missing,
             "conditions_skipped": skipped,
             "nave": nave,
+            "resolved_event_codes": resolved_event_codes,
             "warnings": warnings,
         }
 
@@ -598,6 +644,7 @@ class SourceReconstructionModule(EpochsModule):
             "conditions_missing": list(selection["conditions_missing"]),
             "conditions_skipped": dict(selection["conditions_skipped"]),
             "nave": dict(selection["nave"]),
+            "resolved_event_codes": dict(selection["resolved_event_codes"]),
             "nave_confound_warning": bool(
                 self.method in {"dSPM", "sLORETA", "eLORETA"}
                 and self.equalize_trials is None
@@ -671,6 +718,25 @@ class SourceReconstructionModule(EpochsModule):
         always yields the same hash and any parameter change is visible.
         """
         return sha256_json(self.cfg.model_dump(mode="json"))
+
+    def run_identity_hash(self, selection: Dict[str, Any]) -> str:
+        """sha256 of the run identity: config hash + resolved condition mapping.
+
+        B5-N3: ``config_hash`` alone does not identify a run — two runs with the
+        same ``SourceConfig`` can select different conditions (a task config
+        whose codes were translated differently, or epochs with different
+        ``event_id`` values). The identity combines the resolved
+        ``{condition: codes, matched_event_values}`` mapping with the config
+        hash, so the features consumer can tell whether two source archives
+        were produced by the same *run identity*, not merely the same config.
+        """
+        payload = {
+            "config_hash": self.config_hash(),
+            "resolved_event_codes": to_jsonable(
+                selection["resolved_event_codes"]
+            ),
+        }
+        return sha256_json(payload)
 
     # ------------------------------------------------------------------
     # Montage pre-flight (P2-F13, B5 task 4)
@@ -876,8 +942,9 @@ class SourceReconstructionModule(EpochsModule):
         channel/epoch counts, both lambda2 values and the resolved
         ``method_params``, per-condition ``nave``, the full label block including
         ``excluded_reasons``, the per-ROI flip summary, montage distances, the
-        condition bookkeeping (B4), the epoch file path + streamed sha256 and the
-        resolved ``config_hash``.
+        condition bookkeeping (B4), the resolved condition -> event-code
+        mapping + ``run_identity_hash`` (B5-N3), the epoch file path + streamed
+        sha256 and the resolved ``config_hash``.
         """
         epochs_path = Path(epochs_path) if epochs_path is not None else None
         selection_meta = self._selection_metadata(selection)
@@ -923,6 +990,12 @@ class SourceReconstructionModule(EpochsModule):
             "conditions_produced": selection_meta["conditions_produced"],
             "conditions_missing": selection_meta["conditions_missing"],
             "conditions_skipped": selection_meta["conditions_skipped"],
+            # B5-N3: the resolved condition -> event-code mapping and the
+            # identity hash combining it with the config hash.
+            "resolved_event_codes": to_jsonable(
+                selection_meta["resolved_event_codes"]
+            ),
+            "run_identity_hash": self.run_identity_hash(selection),
             "labels": {
                 "roi_names": list(label_info["roi_names"]),
                 "roi_coords_mni": np.asarray(
@@ -1304,16 +1377,44 @@ class SourceReconstructionModule(EpochsModule):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _template_asset_key(subjects_dir: Union[str, Path]) -> str:
+        """``mtime_ns:size`` of the template BEM/trans files (B5-A4).
+
+        The cache key used to cover the BEM/trans *filenames* only: replacing
+        the file contents (a different fsaverage BEM built in place, a
+        re-downloaded template) kept handing out the stale forward. Including
+        ``st_mtime_ns`` and ``st_size`` makes the key content-sensitive
+        without hashing multi-hundred-MB files.
+        """
+        subjects_dir = Path(subjects_dir)
+        parts: List[str] = []
+        for path in (
+            subjects_dir / "fsaverage" / "bem" / BEM_FILENAME,
+            SourceReconstructionModule._trans_path(subjects_dir),
+        ):
+            try:
+                stat = path.stat()
+                parts.append(f"{path.name}:{stat.st_mtime_ns}:{stat.st_size}")
+            except OSError:
+                # Missing assets are reported by the explicit loaders below
+                # (FileNotFoundError with a clear message); the key just
+                # records that they were absent.
+                parts.append(f"{path.name}:missing")
+        return "|".join(parts)
+
+    @staticmethod
     def _forward_cache_key(
         info: mne.Info, spacing: str, subjects_dir: Union[str, Path]
     ) -> str:
         """Cache key for ``(src, forward)`` (P2-F13).
 
         ``sha256(ch_names + rounded loc[:3] bytes) + spacing + BEM filename + mne
-        version`` (plan §B5 task 3) plus the resolved ``subjects_dir``: two
+        version`` (plan §B5 task 3) plus the resolved ``subjects_dir`` (two
         different fsaverage copies with the same BEM filename must never share a
-        forward. Rounding the positions to 1e-6 m keeps the key stable against
-        float noise in the montage round-trip.
+        forward) and the BEM/trans ``mtime_ns:size`` (B5-A4: replacing the file
+        contents in place must invalidate the cache). Rounding the positions to
+        1e-6 m keeps the key stable against float noise in the montage
+        round-trip.
         """
         digest = hashlib.sha256()
         digest.update("\x00".join(info["ch_names"]).encode("utf-8"))
@@ -1328,6 +1429,7 @@ class SourceReconstructionModule(EpochsModule):
                 BEM_FILENAME,
                 mne.__version__,
                 str(Path(subjects_dir)),
+                SourceReconstructionModule._template_asset_key(subjects_dir),
             )
         )
 

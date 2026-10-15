@@ -84,7 +84,7 @@ def test_named_chain_accepted():
     pipeline = PreprocessingPipeline(spec.pipeline_steps())
     assert [s.name for s in pipeline.steps] == [
         "channel_roles", "zapline", "filter", "bad_channel_detection",
-        "interpolate", "eog_regression", "robust_pca", "asr",
+        "interpolate", "eog_regression", "asr",
         "block_rejection", "reference",
     ]
 
