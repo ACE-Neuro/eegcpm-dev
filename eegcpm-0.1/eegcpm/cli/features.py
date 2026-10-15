@@ -7,8 +7,9 @@ Wires the spec-required guards:
 """
 
 import logging
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,7 +37,9 @@ def _load_features(features_dir: Path) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def _source_erp_frames(args, config: Dict[str, Any], output_dir: Path) -> List[pd.DataFrame]:
+def _source_erp_frames(
+    args, config: Dict[str, Any], output_dir: Path
+) -> Tuple[List[pd.DataFrame], List[str]]:
     """Extract source-ERP features from the source stage's ROI archives (P2-F6).
 
     Two input modes:
@@ -45,6 +48,19 @@ def _source_erp_frames(args, config: Dict[str, Any], output_dir: Path) -> List[p
        ``*_roi_tc_trials.npz`` is skipped) under the directory.
     2. ``--preprocessing/--task/--source`` (or the config's ``depends_on``):
        resolved through ``EEGCPMPaths.get_source_dir(...) / f"{subject}_roi_tc.npz"``.
+
+    Returns ``(frames, missing, source_config_hashes)``. ``missing`` lists every
+    **expected but absent** input (requested subject without a directory,
+    requested session without a directory, or a subject/session without the
+    evoked archive); each entry is reported on stderr and counted in the CLI
+    summary instead of being skipped silently (B5 task 9). When nothing at all
+    is found the call raises ``FileNotFoundError`` rather than producing an
+    empty feature table.
+
+    ``source_config_hashes`` holds the distinct source-run ``config_hash`` values
+    behind the consumed archives. More than one distinct hash means the table
+    would mix different inverse/config settings; the call raises unless
+    ``--allow-mixed-source-configs`` is set (audit B5-N1).
     """
     from types import SimpleNamespace
 
@@ -56,6 +72,7 @@ def _source_erp_frames(args, config: Dict[str, Any], output_dir: Path) -> List[p
     task = getattr(args, "task", None) or depends_on.get("task")
 
     npz_files: List[Path] = []
+    missing: List[str] = []
     input_dir = getattr(args, "input_dir", None)
     if input_dir:
         input_dir = Path(input_dir)
@@ -78,21 +95,45 @@ def _source_erp_frames(args, config: Dict[str, Any], output_dir: Path) -> List[p
         source_root = paths.get_source_root(preprocessing, task, source_variant)
         if not source_root.exists():
             raise FileNotFoundError(f"Source directory not found: {source_root}")
+
         subjects = getattr(args, "subjects", None)
         sessions = getattr(args, "sessions", None)
-        for subject_dir in sorted(source_root.glob("sub-*")):
-            subject_id = subject_dir.name.replace("sub-", "")
-            if subjects and subject_id not in subjects:
+        available_subjects = {
+            path.name.replace("sub-", ""): path
+            for path in sorted(source_root.glob("sub-*"))
+        }
+        subject_ids = list(subjects) if subjects else sorted(available_subjects)
+        if not subject_ids:
+            raise FileNotFoundError(f"no subjects found under {source_root}")
+
+        for subject_id in subject_ids:
+            subject_dir = available_subjects.get(subject_id)
+            if subject_dir is None:
+                missing.append(
+                    f"sub-{subject_id}: no directory under {source_root}"
+                )
                 continue
             session_dirs = sorted(subject_dir.glob("ses-*")) or [subject_dir]
+            present_sessions: Dict[str, Path] = {}
             for session_dir in session_dirs:
                 session_id = (
                     session_dir.name.replace("ses-", "")
                     if session_dir.name.startswith("ses-")
                     else "01"
                 )
-                if sessions and session_id not in sessions:
-                    continue
+                present_sessions[session_id] = session_dir
+            if sessions:
+                for session_id in sessions:
+                    if session_id not in present_sessions:
+                        missing.append(
+                            f"sub-{subject_id}/ses-{session_id}: no session directory"
+                        )
+                session_ids = list(sessions)
+            else:
+                session_ids = sorted(present_sessions)
+            for session_id in session_ids:
+                if session_id not in present_sessions:
+                    continue  # already reported above
                 npz_path = (
                     paths.get_source_dir(
                         preprocessing, task, source_variant, subject_id, session_id
@@ -101,15 +142,24 @@ def _source_erp_frames(args, config: Dict[str, Any], output_dir: Path) -> List[p
                 )
                 if npz_path.is_file():
                     npz_files.append(npz_path)
+                else:
+                    missing.append(
+                        f"sub-{subject_id}/ses-{session_id}: no {npz_path.name}"
+                    )
+
+        for entry in missing:
+            print(f"[features] source_erp: missing expected input — {entry}", file=sys.stderr)
 
     if not npz_files:
         raise FileNotFoundError(
             "no *_roi_tc.npz files found for source_erp "
             f"(input_dir={input_dir}, preprocessing={preprocessing}, "
-            f"task={task}, source={source_variant})"
+            f"task={task}, source={source_variant}); missing: "
+            + ("; ".join(missing) if missing else "no inputs discovered")
         )
 
     frames: List[pd.DataFrame] = []
+    hashes: List[str] = []
     for npz_path in npz_files:
         if npz_path.parent.name.startswith("ses-"):
             subject_id = npz_path.parent.parent.name.replace("sub-", "")
@@ -124,8 +174,29 @@ def _source_erp_frames(args, config: Dict[str, Any], output_dir: Path) -> List[p
         if not result.success:
             raise RuntimeError(f"source_erp failed for {npz_path.name}: {result.errors}")
         frames.append(result.outputs["features"])
+        source_hash = result.metadata.get("source_config_hash")
+        if source_hash:
+            hashes.append(str(source_hash))
         print(f"[features] source_erp: {npz_path.name} -> {result.outputs['n_features']} features")
-    return frames
+
+    # B5-N1: one feature table must come from one source config. Mixed runs
+    # (different inverse settings etc.) are refused unless explicitly allowed.
+    distinct_hashes = sorted(set(hashes))
+    if len(distinct_hashes) > 1:
+        if not getattr(args, "allow_mixed_source_configs", False):
+            raise RuntimeError(
+                "source_erp: inputs were produced by different source configs "
+                f"({len(distinct_hashes)} distinct config hashes); refusing to build "
+                "one feature table from mixed runs — re-run the source stage with a "
+                "single config, or pass --allow-mixed-source-configs to override: "
+                + ", ".join(distinct_hashes)
+            )
+        print(
+            "[features] source_erp: WARNING — mixing source configs: "
+            + ", ".join(distinct_hashes),
+            file=sys.stderr,
+        )
+    return frames, missing, distinct_hashes
 
 
 def features_command(args):
@@ -185,8 +256,10 @@ def features_command(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     frames = []
+    missing: List[str] = []
+    source_hashes: List[str] = []
     if feature_type == "source_erp":
-        frames = _source_erp_frames(args, config, output_dir)
+        frames, missing, source_hashes = _source_erp_frames(args, config, output_dir)
     else:
         if input_dir is None or not input_dir.is_dir():
             raise FileNotFoundError(f"--input-dir {input_dir} not found")
@@ -252,10 +325,21 @@ def features_command(args):
 
     out_path = output_dir / f"{feature_type}_{condition}.parquet"
     out_df.to_parquet(out_path, index=False)
+    if missing:
+        # B5 task 9: expected-but-absent inputs are reported, not silently skipped.
+        print(
+            f"[features] WARNING: {len(missing)} expected input(s) missing; "
+            f"{feature_type} covers {len(frames)} recording(s) only"
+        )
     print(f"[features] {feature_type}/{condition}: "
           f"{len(frames)} recordings -> {out_df.shape} -> {out_path}")
+    if source_hashes:
+        print("[features] source_erp source config hash(es): "
+              + ", ".join(source_hashes))
     return {"output": str(out_path), "n_rows": int(out_df.shape[0]),
-            "n_cols": int(out_df.shape[1])}
+            "n_cols": int(out_df.shape[1]),
+            "n_missing": len(missing), "missing": list(missing),
+            "source_config_hashes": list(source_hashes)}
 
 
 def add_features_parser(subparsers):
@@ -286,6 +370,12 @@ def add_features_parser(subparsers):
     parser.add_argument(
         "--output-dir", type=Path, required=True,
         help="Output directory for feature parquet files"
+    )
+    parser.add_argument(
+        "--allow-mixed-source-configs", action="store_true", default=False,
+        help="source_erp: allow combining archives produced by different source "
+             "configs into one feature table (default: refuse — a mixed table "
+             "blends different inverse/config settings)"
     )
     parser.add_argument(
         "--condition", type=str, default="resting_ec",

@@ -7,6 +7,7 @@ columns are per condition x ROI x component x metric; nothing is written when
 nothing matched; 3-D (trial) arrays raise.
 """
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,6 +15,7 @@ import pandas as pd
 import pytest
 import yaml
 
+from eegcpm.core.provenance import provenance_path_for_archive, sha256_file
 from eegcpm.modules.features.source_erp_features import SourceERPFeatureModule
 
 SFREQ = 250.0
@@ -23,6 +25,26 @@ COMPONENTS = {
     "N1": {"search_window": [0.05, 0.15], "polarity": "negative"},
     "N0": {"search_window": [-0.2, 0.0], "polarity": "negative"},
 }
+CONFIG_HASH = "c" * 64
+
+
+def _write_provenance(npz_path, *, config_hash=CONFIG_HASH, artifacts="auto", raw=None):
+    """Write the source-stage provenance sidecar for an archive (B5 task 8).
+
+    ``artifacts`` is ``'auto'`` (hash the archive), a mapping to write verbatim
+    (e.g. a deliberately wrong hash), or a falsy value to omit the ``artifacts``
+    block entirely.
+    """
+    payload = {"config_hash": config_hash, "epochs_sha256": "e" * 64}
+    if artifacts == "auto":
+        payload["artifacts"] = {npz_path.name: sha256_file(npz_path)}
+    elif artifacts:
+        payload["artifacts"] = dict(artifacts)
+    provenance_path = provenance_path_for_archive(npz_path)
+    provenance_path.write_text(
+        raw if raw is not None else json.dumps(payload)
+    )
+    return provenance_path
 
 
 def _synthetic_data(seed: int = 0, n_rois: int = 3) -> dict:
@@ -118,6 +140,7 @@ def test_metadata_sfreq_derived_from_times(tmp_path):
 
 def test_npzfile_input_works(tmp_path):
     npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
+    _write_provenance(npz_path)
     with np.load(npz_path) as npz:
         module = SourceERPFeatureModule(_config(), tmp_path)
         result = module.process(npz, subject=SimpleNamespace(id="sub-01", session="01"))
@@ -127,19 +150,74 @@ def test_npzfile_input_works(tmp_path):
 
 def test_path_input_works(tmp_path):
     npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
+    _write_provenance(npz_path)
     result = _process(tmp_path, data=npz_path)
     assert result.success, result.errors
     assert "condA_ROI_0_N1_peak_latency" in result.outputs["features"].columns
+    # the consumed run's identity is carried into the feature metadata
+    assert result.metadata["source_config_hash"] == CONFIG_HASH
+    assert result.metadata["source_epochs_sha256"] == "e" * 64
+
+
+def test_mapping_input_needs_no_provenance(tmp_path):
+    """In-memory mappings have no sidecar; the caller owns their freshness."""
+    result = _process(tmp_path)  # dict input
+    assert result.success, result.errors
+    assert result.metadata["source_config_hash"] is None
 
 
 def test_validate_input_accepts_path_and_npzfile(tmp_path):
     npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
     module = SourceERPFeatureModule(_config(), tmp_path)
     assert module.validate_input(_synthetic_data()) is True
+    # A path without provenance is not a valid input (B5 task 8) ...
+    assert module.validate_input(npz_path) is False
+    with np.load(npz_path) as npz:
+        assert module.validate_input(npz) is False
+    _write_provenance(npz_path)
     assert module.validate_input(npz_path) is True
     with np.load(npz_path) as npz:
         assert module.validate_input(npz) is True
     assert module.validate_input("not an archive") is False
+
+
+# --- provenance requirement (B5 task 8) ------------------------------------
+
+
+def test_path_without_provenance_rejected(tmp_path):
+    """A stale/partial archive must not be consumed silently."""
+    npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
+    module = SourceERPFeatureModule(_config(), tmp_path)
+    with pytest.raises(ValueError, match="provenance"):
+        module.process(npz_path, subject=SimpleNamespace(id="sub-01", session="01"))
+    assert not (tmp_path / "features.csv").exists()
+
+
+def test_provenance_without_config_hash_rejected(tmp_path):
+    npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
+    _write_provenance(npz_path, config_hash="")
+    module = SourceERPFeatureModule(_config(), tmp_path)
+    with pytest.raises(ValueError, match="config_hash"):
+        module.process(npz_path, subject=SimpleNamespace(id="sub-01", session="01"))
+    assert not (tmp_path / "features.csv").exists()
+
+
+def test_provenance_hash_mismatch_rejected(tmp_path):
+    """A recorded sha256 that does not match the file means a partial write."""
+    npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
+    _write_provenance(npz_path, artifacts={"sub-01_roi_tc.npz": "0" * 64})
+    module = SourceERPFeatureModule(_config(), tmp_path)
+    with pytest.raises(ValueError, match="sha256"):
+        module.process(npz_path, subject=SimpleNamespace(id="sub-01", session="01"))
+    assert not (tmp_path / "features.csv").exists()
+
+
+def test_unreadable_provenance_rejected(tmp_path):
+    npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
+    _write_provenance(npz_path, raw="{not json")
+    module = SourceERPFeatureModule(_config(), tmp_path)
+    with pytest.raises(ValueError, match="unreadable provenance"):
+        module.process(npz_path, subject=SimpleNamespace(id="sub-01", session="01"))
 
 
 # --- loud failures (nothing written) ---------------------------------------
@@ -184,7 +262,8 @@ def test_features_cli_source_erp_from_input_dir(tmp_path):
 
     npz_dir = tmp_path / "source"
     npz_dir.mkdir()
-    _save_npz(npz_dir / "sub-01_roi_tc.npz")
+    npz_path = _save_npz(npz_dir / "sub-01_roi_tc.npz")
+    _write_provenance(npz_path)
     config_path = tmp_path / "features.yaml"
     config_path.write_text(yaml.safe_dump(_config()))
 
@@ -208,3 +287,106 @@ def test_features_cli_source_erp_from_input_dir(tmp_path):
     df = pd.read_parquet(out_path)
     assert "condA_ROI_0_N1_peak_latency" in df.columns
     assert result["n_rows"] == 1
+    assert result["n_missing"] == 0
+
+
+def test_features_cli_rejects_archive_without_provenance(tmp_path):
+    """The CLI must not silently consume an unattributable archive (B5 task 8)."""
+    from eegcpm.cli.features import features_command
+
+    npz_dir = tmp_path / "source"
+    npz_dir.mkdir()
+    _save_npz(npz_dir / "sub-01_roi_tc.npz")  # no provenance sidecar
+    config_path = tmp_path / "features.yaml"
+    config_path.write_text(yaml.safe_dump(_config()))
+
+    args = SimpleNamespace(
+        config=config_path,
+        project=tmp_path,
+        feature_type="source_erp",
+        input_dir=npz_dir,
+        output_dir=tmp_path / "features_out",
+        condition="resting_ec",
+        sfreq=500.0,
+        source=None,
+        preprocessing=None,
+        task=None,
+        subjects=None,
+        sessions=None,
+    )
+    with pytest.raises(ValueError, match="provenance"):
+        features_command(args)
+    assert not (tmp_path / "features_out" / "source_erp_resting_ec.parquet").exists()
+
+
+# --- B5 rev1 (audit conditions N1/N2/A1) ------------------------------------
+
+def test_provenance_without_artifacts_map_rejected(tmp_path):
+    """B5-N2: the artifacts map is mandatory — omitting it must not skip the
+    hash check."""
+    from eegcpm.core.provenance import verify_archive_provenance
+
+    npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
+    _write_provenance(npz_path, artifacts=False)
+    with pytest.raises(ValueError, match="artifacts"):
+        verify_archive_provenance(npz_path)
+
+
+def test_archive_not_listed_in_artifacts_rejected(tmp_path):
+    """B5-N2: an archive absent from the artifacts map is rejected."""
+    from eegcpm.core.provenance import verify_archive_provenance
+
+    npz_path = _save_npz(tmp_path / "sub-01_roi_tc.npz")
+    _write_provenance(npz_path, artifacts={"other.npz": "0" * 64})
+    with pytest.raises(ValueError, match="not listed"):
+        verify_archive_provenance(npz_path)
+
+
+def test_trials_archive_pairs_with_subject_provenance(tmp_path):
+    """B5-A1: a trials archive verifies against ``{subject}_provenance.json``
+    (the file the source stage actually writes), not a never-written
+    ``*_trials_provenance.json``."""
+    from eegcpm.core.provenance import verify_archive_provenance
+
+    trials = _save_npz(tmp_path / "sub-01_roi_tc_trials.npz")
+    _write_provenance(trials)
+    assert (tmp_path / "sub-01_provenance.json").exists()
+    assert verify_archive_provenance(trials)["config_hash"] == CONFIG_HASH
+
+
+def test_features_cli_refuses_mixed_source_configs(tmp_path):
+    """B5-N1: a feature table mixing archives from different source configs is
+    refused by default; the explicit override allows it and reports the hashes."""
+    from eegcpm.cli.features import features_command
+
+    npz_dir = tmp_path / "source"
+    npz_dir.mkdir()
+    a = _save_npz(npz_dir / "sub-01_roi_tc.npz")
+    b = _save_npz(npz_dir / "sub-02_roi_tc.npz")
+    _write_provenance(a, config_hash="a" * 64)
+    _write_provenance(b, config_hash="b" * 64)
+    config_path = tmp_path / "features.yaml"
+    config_path.write_text(yaml.safe_dump(_config()))
+
+    args = SimpleNamespace(
+        config=config_path,
+        project=tmp_path,
+        feature_type="source_erp",
+        input_dir=npz_dir,
+        output_dir=tmp_path / "features_out",
+        condition="resting_ec",
+        sfreq=500.0,
+        source=None,
+        preprocessing=None,
+        task=None,
+        subjects=None,
+        sessions=None,
+    )
+    with pytest.raises(RuntimeError, match="different source configs"):
+        features_command(args)
+    assert not (tmp_path / "features_out" / "source_erp_resting_ec.parquet").exists()
+
+    args.allow_mixed_source_configs = True
+    result = features_command(args)
+    assert sorted(result["source_config_hashes"]) == ["a" * 64, "b" * 64]
+    assert (tmp_path / "features_out" / "source_erp_resting_ec.parquet").exists()

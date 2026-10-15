@@ -194,7 +194,10 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | 2026-10-15 | P2 | Qwen3.8-Max B3 final audit (user-approved Opus stand-in) | `approve` — new findings: **K6** `append_bad_annotations` lacked an append-only self-check; **K7** mask-on-repaired-data semantics undocumented + suite could not detect a regression to pre-repair `clean_windows`; **K8** `montage_restored` phantom key; **K10** tautological `n_samples_before`; **K11** stale counts; **K9** (pre-existing, default-reachable) four uncorrected `artifacts.py` append sites corrupt the timeline when `meas_date=None` + `first_samp≠0`; K3–K5 arbitrated | **rev2 applied + confirmed; B3 verified 2026-10-15** |
 | 2026-10-15 | P1/P2 | Opus 5.5 B4 final audit (Pass B) | `revise` — decisive: the new detector's raw-scale two-sided variance/HF rule flags 11–97 channels on real HBN pilot recordings (8/10 would be excluded); minors K1–K6 (condition matching, duplicates, degeneracy float-rounding, equalize test honesty, `mode='both'` partial writes, `--input-dir`) | rev1 fixes applied 2026-10-15 — awaiting re-audit |
 | 2026-10-15 | P1 | User decision (B4 rev1) | Bad-channel detector variance/HF statistics move to **log-scale robust z with upper-tail detection** (option a); kurtosis stays two-sided on the raw scale; degeneracy becomes a relative-epsilon test | applied in B4 rev1 (pilot5 validation recorded) |
-| 2026-10-15 | P1 | Opus B4 re-audit — **open ⛔ decision (B4-D2)** | Detector calibration on real HBN remains over-budget: **5/12 non-corrupt pilot recordings within budget**; over-flagging driven by kurtosis (frontal blink clusters — detector runs before EOG regression) + variance in movie tasks; plus a near-flat lower-tail blind spot (upper-tail-only rule passes a ~1 nV SD channel above the absolute 1e-20 V² floor). Options: (i) kurtosis after EOG regression / exclude blink segments; (ii) log-scale or upper-tail kurtosis; (iii) relative near-flat floor (`var < 1e-3 × median` or log-variance z < −K) as `flat`; (iv) recalibrate the budget on pilot-50. **Blocks any real-data chain run (B6 tier-2 / B8 Checkpoint B); owner B6 tier-2.** | open |
+| 2026-10-15 | P1 | Opus B4 re-audit — **B4-D2 (resolved)** | Detector calibration on real HBN remains over-budget: **5/12 non-corrupt pilot recordings within budget**; over-flagging driven by kurtosis (frontal blink clusters — detector runs before EOG regression) + variance in movie tasks; plus a near-flat lower-tail blind spot. **Resolved 2026-10-15 (user): blink-aware design at B6 tier-2** — kurtosis on blink-free samples (EOG when present, else synthetic frontal proxy via `find_eog_events`; optional ICLabel cross-check), log-scale/upper-tail kurtosis, relative near-flat floor; no chain reordering; validate on pilot5 × 3 tasks + the other dataset | resolved (implement in B6) |
+| 2026-10-15 | P1 | **RPCA decision (resolved)** | Option (a): **remove `RobustPCAStep` from the ERP chain** (9 steps), recorded as a spec deviation; golden hash pinned after removal in B6 | resolved (implement in B6) |
+| 2026-10-15 | P2 | **`mean_flip` decision (resolved)** | Option (a): keep `mean_flip`; document the uniform-patch attenuation (11/30 vs 22/30) and the midline polarity convention; P2 condition 4 sign-off after the docs land | resolved (docs at B6 tier-2) |
+| 2026-10-15 | P0/B8 | **Real data (resolved)** | Checkpoint B will use a pilot5 subject (`~/proj/adhd-hbn/data_raw/hbn-eeg/pilot5`) **and** the user's other dataset ("one EP one attention"; path TBD) | resolved |
 
 ## Remediation batches — `plan/261013-2240-p1p2-remediation.md`
 
@@ -203,8 +206,8 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | **B1** | Executor fail-fast + exclusion + dependency preflight + one preprocessing schema + status persistence (P1-F1, F4, F6, F9 blanket-except only, F17 ImportError only) | `[x]` **verified 2026-10-14** — Opus rev2 approval, no conditions left (residuals → B3/B6) |
 | B2 | Source-ERP core: anatomical labels, unique names, geometry, signed output + dipole ground truth | `[x]` **verified 2026-10-14** — Opus conditions met (F2/N1/N2/N3 + CF-1 fixed, K3-confirmed) |
 | B3 | Timeline integrity: ASR without cutting, sidecar instead of `info['temp']`, ASR wrapper metadata | `[x]` **verified 2026-10-15** — final audit by Qwen3.8-Max (user-approved Opus 5.5 stand-in): `approve`; rev2 confirmed (`confirm-with-notes`) |
-| B4 | Source usability + config wiring + P1 bad-channel detector | `[x]` **verified 2026-10-15 (code scope)** — Opus final audit `revise` → rev1 applied (log-scale detector + config bounds + condition guards + test honesty) → scoped re-audit `approve`; **⛔ B4-D2 open real-data calibration decision (kurtosis/near-flat/EOG-order) gates any real-data chain run (B6 tier-2 / B8)** |
-| B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[ ]` not started |
+| B4 | Source usability + config wiring + P1 bad-channel detector | `[x]` **verified 2026-10-15 (code scope)** — Opus final audit `revise` → rev1 applied (log-scale detector + config bounds + condition guards + test honesty) → scoped re-audit `approve`; B4-D2 **resolved 2026-10-15**: blink-aware detector design at B6 tier-2 (decisions log / plan §12.5) |
+| B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev1 applied (N1/N2/A1/A2/A3/A6/A7/N6) → scoped re-audit `approve`, no conditions left (residuals → B6/B7/B8) |
 | B6 | ⛔ Checkpoint A (RPCA) + instrumentation + golden resolved-config hash + P1 tier-2 debt | `[ ]` not started |
 | B7 | QC truthfulness, test-suite honesty, CI job | `[ ]` not started |
 | B8 | End-to-end verification prep; ⛔ Checkpoint B (real EGI-129 subject) | `[ ]` not started |
@@ -450,6 +453,110 @@ was the detector's raw-scale two-sided variance/HF rule flagging 11–97 channel
   `cli/features.py` + parser, `steps/channel_roles.py`, `steps/bad_channels_pinned.py`,
   `steps/interpolate.py`, `_BadChannelDetectorWrapper`, the new/updated tests.
 
+B5 evidence (2026-10-15, working tree on `remediation/p1p2`, not committed) — **P2-F10/F11/F12/F13 +
+the B4-accepted items (K1/K5 widened/N4/N5)**, plan §B5 tasks 1–9:
+- **Task 1/5 ranks + provenance**: `process()` computes `data_rank = mne.compute_rank(epochs, rank=None)`
+  and `cov_rank = mne.compute_rank(noise_cov, info=epochs.info)` (both in `ModuleResult.metadata` and the
+  provenance JSON). Every run with `output.save_stc or output.save_roi_tc` writes
+  `{subject}_source_config.yaml` (`cfg.model_dump(mode='json')`), `{subject}-cov.fif`,
+  `{subject}-inv.fif` and `{subject}_provenance.json` next to the data artifacts (with both flags off,
+  nothing is written — the B4 contract is kept). Provenance keys: `stage/module/module_version/
+  created_utc/subject_id/eegcpm/mne/numpy/scipy/method/parcellation/mode/spacing/subjects_dir/bem/trans/
+  n_sources/n_channels/n_epochs/sfreq/cov_method/cov_rank/data_rank/loose/depth/pick_ori/
+  label_extraction_mode/lambda2_evoked/lambda2_trial/method_params/nave/nave_confound_warning/
+  conditions_requested/conditions_produced/conditions_missing/conditions_skipped/labels{roi_names,
+  roi_coords_mni,roi_radius_mm,roi_vertex_counts,roi_hemi,excluded_rois,excluded_reasons}/
+  roi_flip_summary{mean_dot,lh_mean_dot,rh_mean_dot,n_vertices}/montage_check{median_mm,max_mm,
+  n_electrodes,status,warnings}/epochs_path/epochs_sha256/config_hash/config/artifacts{filename→sha256}`;
+  `config_hash = sha256(json.dumps(cfg.model_dump(mode='json'), sort_keys=True))` (tested sensitive to
+  `inverse.snr`); `epochs_path` is passed by the CLI and hashed in streamed 1 MiB chunks. Test
+  `test_provenance_and_reloadable_artifacts` asserts every key, `mne.read_cov` /
+  `mne.minimum_norm.read_inverse_operator` reload both FIFs, the per-ROI flip summary matches the vertex
+  counts, and `verify_archive_provenance` accepts the archive it produced.
+- **Task 2 inversion**: `lambda2_trial = 1/snr_trial**2` passed positionally to `apply_inverse_epochs`
+  (spy test wraps the original with **`snr_trial=2.0`** → captures 0.25, `pick_ori='normal'`,
+  `return_generator=True`, `method_params=None`; asserting the default 1.0 would not catch the missing
+  kwarg — B4-N5); `_resolve_method_params(method, loose, user)` returns `{'force_equal': True, **user}`
+  for eLORETA with `0 < loose < 1` (unit-tested incl. user override + not-mutated + loose 0/1 → no flag)
+  and `method_params` reaches both `apply_inverse` and `apply_inverse_epochs`; eLORETA smoke run
+  (fsaverage, slow) succeeds and records `method_params == {'force_equal': True}`.
+- **Task 3 forward**: single-shell `make_bem_model(conductivity=(0.3,))` branch + dead `bem_path`
+  reassignment deleted; `_load_bem(subjects_dir)` → `FileNotFoundError` on a missing
+  `fsaverage-5120-5120-5120-bem-sol.fif` (tested); class-level `_FORWARD_CACHE` keyed by
+  `sha256(ch_names + rounded loc[:3] bytes)|spacing|BEM|mne.__version__|subjects_dir` (the resolved
+  subjects_dir is an added component beyond the plan's list: two fsaverage copies must not share a
+  forward) — cache hit/`oct5` miss tested; the forward is built with `trans=<subjects_dir>/fsaverage/bem/
+  fsaverage-trans.fif` instead of the literal `trans='fsaverage'`, because mne 1.13.2 resolves the string
+  to its **bundled** `mne/data/fsaverage/fsaverage-trans.fif` (probed numerically identical to the cached
+  copy here, but not guaranteed to be the file the pre-flight validated) — documented deviation.
+- **Task 4 pre-flight**: `_preflight_montage(info, subjects_dir)` checks (a) finite non-zero EEG
+  `loc[:3]` ("montage"), (b) LPA/Nasion/RPA `FIFFV_POINT_CARDINAL` + every dig point in
+  `FIFFV_COORD_HEAD` ("fiducials"/"head frame"), (c) `read_trans` head→MRI + `cKDTree` over
+  `fsaverage-head.fif`: warn median > 10 mm, fail max > 25 mm (probed GSN-129 7.25/18.74 mm; +40 mm shift
+  13.4/31.0 mm); runs inside the template-forward path, i.e. before the forward is computed (kept there so
+  the unmarked `test_process_with_mock_forward` and the covariance-guard tests never need fsaverage);
+  with a caller-supplied forward the alignment check is recorded as `status: not_run` (an individual head
+  model has no fsaverage trans) — documented deviation. mne 1.13.2 `set_montage` **fabricates** cardinal
+  points from `ch_pos` (probed), so the no-fiducial test strips them via `info._unlock()`.
+- **Task 6 CLI**: every glob sorted (subjects/sessions/task configs/epoch files); `_select_epoch_file`
+  raises on 0 (`FileNotFoundError`) or >1 (`ValueError`) `*_epo.fif` and the session is counted failed
+  **with the reason**; `module.process(..., epochs_path=epoch_file)`; the task-config scan's
+  `except Exception: continue` now prints the file and `SystemExit(1)`.
+- **Task 7 condition matching**: `_match_event_codes` (name keys → their values; `int`/numeric-string codes
+  → matching `event_id` values, mirroring `EventSorter.sort_by_condition`) + `np.isin(epochs.events[:, 2],
+  values)`; tests pin the hierarchical over-selection fix (probed: `epochs[['a']]` with
+  `event_id={'a':1,'a/b':2}` selects 3 epochs, the value match 1), both numeric dialects, the unchanged
+  name dialect and the still-loud "no matching events" (now including the codes).
+- **Task 8 atomic/stale-safe writes**: new `eegcpm/core/provenance.py` (temp + `os.replace`; mne suffix
+  constraints for `-cov.fif`/`-inv.fif`, `.npz` kept on the npz temp name, temp leftovers removed on
+  failure; `sha256_file`/`sha256_json`/`to_jsonable`/`package_version`; `provenance_path_for_archive` =
+  the single `*_roi_tc.npz` ↔ `*_provenance.json` naming rule; `load/verify_archive_provenance`).
+  `_write_source_artifacts` deletes this subject's own previous outputs first (patterns from
+  `stale_output_patterns`), writes every artifact atomically and the provenance last, and removes
+  everything this run wrote if any write fails (tested by monkeypatching the provenance writer →
+  `success=False`, output dir empty). The consumer requires provenance for on-disk archives (path or
+  `NpzFile` via `fid.name` — numpy 2.5 dropped `NpzFile.filename`), rejects missing/unreadable/
+  `config_hash`-less provenance and a recorded sha256 mismatch, keeps in-memory `Mapping` input
+  sidecar-free, and reports `source_config_hash`/`source_epochs_sha256`/`source_epochs_path` in metadata.
+- **Task 9 features CLI**: discovery builds the expected subject × session set, prints one stderr line per
+  expected-but-absent input, raises `FileNotFoundError` when nothing is found, and returns
+  `n_missing`/`missing` in the summary (tested: one present + two absent sessions → `n_rows=1`,
+  `n_missing=2`; a requested absent subject → raise, no parquet).
+- **Validation**: B5 command `pytest tests/unit/test_source*.py` → **143 passed / 2 skipped** (79 s);
+  full standard suite → **3 failed / 667 passed / 2 skipped** (failures exactly the baseline: 2
+  `mne_connectivity` P4 + 1 `robust_pca` B6); plan greps clean
+  (`grep -n "conductivity=(0.3,)\|make_bem_model" eegcpm/modules/source/__init__.py` → nothing; every
+  `pick_ori` is `'normal'`; no direct `np.savez`); manual CLI smoke on a synthetic GSN-129 project
+  (`source-reconstruct` then `features --feature-type source_erp`) → 8 artifacts with no temp leftovers,
+  provenance with `epochs_path`/sha256 + `montage_check: ok` + `artifacts`, features table 1 row × 63 cols
+  and `sub-99` reported missing.
+- **Observations for the auditor**: (i) the output stem uses the *stripped* subject id
+  (`01_roi_tc.npz` inside `sub-01/ses-01/`), which is what the source CLI has always written (it passes
+  `subject_id` without the `sub-` prefix) and what the features CLI + `ui/pages/11_connectivity.py`
+  look for — renaming it would touch the documented P4/UI debt; (ii) `montage_check` is `null`-valued
+  (`status: not_run`) only when the caller supplies a forward; (iii) provenance is written whenever
+  `save_stc`/`save_roi_tc` is on, so `test_save_roi_tc_and_stc_disabled_writes_nothing` (nothing at all
+  written) still holds.
+- Re-audit scope: `core/provenance.py`, `modules/source/__init__.py` (ranks/inverse/forward/pre-flight/
+  provenance/atomic writes/condition matching), `cli/source_reconstruct.py`,
+  `modules/features/source_erp_features.py`, `cli/features.py`, `tests/unit/test_source_hardening.py`,
+  `tests/unit/test_source_erp_features.py`.
+
+**B5 rev1 (2026-10-16, Opus final-audit conditions):** **N1** — the features CLI enforces one source
+`config_hash` per table (mixed configs raise; `--allow-mixed-source-configs` warns + reports the
+hashes; hash(es) printed and returned). **N2** — `verify_archive_provenance` requires the archive in
+the `artifacts` map with a matching sha256 (missing map/unlisted archive rejected). **A1** — trials
+archives pair with `{subject}_provenance.json`. **A2** — provenance records `forward_source`
+(`template`/`caller`); `bem`/`trans`/`spacing` are `None` for caller-supplied forwards. **A3** —
+pre-flight docstring documents the fabricated-fiducial limitation (distance check is the real guard).
+**A7** — cache-key test now varies electrode positions. **N6** — `compute_covariance` uses the
+`COV_METHOD` constant. **A6 sign-off (user-approved default):** stale-output deletion stays in the
+write phase (pre-write failures keep the previous good set) with the N1 consumer check as the guard;
+moving deletion to `process()` start remains available if full "latest-config-only" is wanted.
+Assignments: N3 + A4 → plan B6 tasks 19–20; A5 + N4 + N5 → plan B7 tasks 12–14. Tests added:
+mixed-config refusal/override, mandatory-artifacts rejection (missing + unlisted), trials-provenance
+pairing, caller-forward provenance, montage cache key. Scoped re-audit pending.
+
 ## Next actions (queue)
 
 - [x] Batch 0 — environment, skill, AGENTS.md, audit brief (done 2026-10-13)
@@ -468,10 +575,11 @@ was the detector's raw-scale two-sided variance/HF rule flagging 11–97 channel
 - [ ] Implementation batches B1…B8 (DeepSeek V4.1 Flash `#max`): per batch → builder-validator →
       K3 pre-audit → Opus 5.5 final audit on milestone batches (B1, B2, B4, B6, B7) and whenever
       K3 flags a blocker. → **B1 verified 2026-10-14; B2 verified 2026-10-14; B3 verified 2026-10-15
-      (Qwen3.8-Max stand-in audit + rev2 confirmation). B4 implemented 2026-10-15; Opus 5.5 final
-      audit → `revise`; rev1 fixes applied 2026-10-15 (log-scale detector + real-data validation,
-      config bounds, condition-name guards, test honesty, accepted items assigned) — awaiting
-      re-audit. Next after B4 re-audit: B5** (source hardening + provenance).
+      (Qwen3.8-Max stand-in audit + rev2 confirmation). B4 verified 2026-10-15 (code scope). B5
+      implemented 2026-10-15 + rev1 fixes 2026-10-16 (N1/N2/A1/A2/A3/A7/N6; A6 sign-off) — **verified
+      2026-10-16 (scoped Opus re-audit `approve`)**. **Checkpoint A resolved (remove RPCA, plan §12.1).**
+      Next: **B6** — remove RPCA (chain → 9 steps), blink-aware detector design (plan §12.5), golden
+      resolved-config hash (tasks 4–8, 19–20), tier-2 debt (tasks 9–18).
 - [ ] **Final-audit model note:** Opus 5.5 was intermittently unavailable for B3; per user decision
       the B3 final audit ran on Qwen3.8-Max. B4/B6/B7 milestone audits: try Opus 5.5 first, fall back
       to Qwen3.8-Max (or Kimi K3) only with a recorded note.

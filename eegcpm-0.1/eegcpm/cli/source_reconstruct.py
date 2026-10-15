@@ -14,6 +14,25 @@ from eegcpm.modules.source import SourceReconstructionModule
 from eegcpm.data.event_mapping import get_event_mapping_for_run, translate_event_codes
 
 
+def _select_epoch_file(session_dir: Path) -> Path:
+    """Return the single ``*_epo.fif`` of a session directory (B5 task 6).
+
+    Raises ``FileNotFoundError`` when the session has no epoch file and
+    ``ValueError`` when it has more than one: silently taking the first of several
+    epoch files would reconstruct a different dataset than requested (and mixing
+    ``_epo.fif``/``_epo_trials.fif`` would go unnoticed).
+    """
+    epoch_files = sorted(session_dir.glob("*_epo.fif"))
+    if not epoch_files:
+        raise FileNotFoundError(f"no *_epo.fif file in {session_dir}")
+    if len(epoch_files) > 1:
+        raise ValueError(
+            f"{len(epoch_files)} *_epo.fif files in {session_dir}: "
+            f"{[path.name for path in epoch_files]}; exactly one is required"
+        )
+    return epoch_files[0]
+
+
 def source_reconstruct_command(args):
     """
     Run source reconstruction on epoched data.
@@ -90,17 +109,28 @@ def source_reconstruct_command(args):
             matching_configs = []
 
             if task_configs_dir.exists():
-                for config_file in task_configs_dir.glob("*.yaml"):
+                for config_file in sorted(task_configs_dir.glob("*.yaml")):
                     try:
                         import yaml
                         with open(config_file) as f:
                             cfg = yaml.safe_load(f)
+                        if not isinstance(cfg, dict):
+                            raise ValueError(
+                                "task config is not a YAML mapping "
+                                f"({type(cfg).__name__})"
+                            )
+                    except Exception as exc:
+                        # B5 task 6: an unreadable task config must not be skipped
+                        # silently — it may be the config that matches this task.
+                        print(
+                            f"❌ Unreadable task config {config_file}: {exc}",
+                            file=sys.stderr,
+                        )
+                        raise SystemExit(1)
 
-                        # Check if task_name field matches
-                        if cfg.get('task_name') == task:
-                            matching_configs.append(config_file)
-                    except Exception:
-                        continue
+                    # Check if task_name field matches
+                    if cfg.get('task_name') == task:
+                        matching_configs.append(config_file)
 
             if matching_configs:
                 # Try exact filename match first
@@ -153,8 +183,8 @@ def source_reconstruct_command(args):
     if not epochs_dir.exists():
         raise FileNotFoundError(f"Epochs directory not found: {epochs_dir}")
 
-    # Find subjects to process
-    subject_dirs = list(epochs_dir.glob("sub-*"))
+    # Find subjects to process (sorted: deterministic order, B5 task 6)
+    subject_dirs = sorted(epochs_dir.glob("sub-*"))
     if not subject_dirs:
         raise FileNotFoundError(f"No subjects found in: {epochs_dir}")
 
@@ -175,8 +205,8 @@ def source_reconstruct_command(args):
     for subject_dir in subject_dirs:
         subject_id = subject_dir.name.replace("sub-", "")
 
-        # Find sessions
-        session_dirs = list(subject_dir.glob("ses-*"))
+        # Find sessions (sorted: deterministic order, B5 task 6)
+        session_dirs = sorted(subject_dir.glob("ses-*"))
         if not session_dirs:
             # No session subdirectory, look for epoch files directly
             session_dirs = [subject_dir]
@@ -193,13 +223,16 @@ def source_reconstruct_command(args):
 
             print(f"\n🔄 Processing: sub-{subject_id}, ses-{session_id}")
 
-            # Find epoch file
-            epoch_files = list(session_dir.glob("*_epo.fif"))
-            if not epoch_files:
-                print(f"   ⚠️  No epoch file found, skipping")
+            # Exactly one epoch file per session (B5 task 6): 0 or >1 counts the
+            # session as failed with the reason, never a silent pick/skip.
+            try:
+                epoch_file = _select_epoch_file(session_dir)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"   ❌ {exc}")
+                n_failed += 1
+                failed_subjects.append(f"{subject_id}/ses-{session_id}: {exc}")
                 continue
 
-            epoch_file = epoch_files[0]
             print(f"   📂 Loading epochs: {epoch_file.name}")
 
             try:
@@ -260,7 +293,9 @@ def source_reconstruct_command(args):
                     output_dir=output_dir,
                     task_config=task_config_translated
                 )
-                result = module.process(epochs, subject=subject)
+                result = module.process(
+                    epochs, subject=subject, epochs_path=epoch_file
+                )
 
                 if result.success:
                     print(f"   ✅ Success!")

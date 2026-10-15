@@ -23,17 +23,27 @@ Accepted inputs: a ``Mapping``, an ``np.lib.npyio.NpzFile`` or a path to such an
 metadata deny-list, so new condition names are picked up automatically. Single-trial
 (3-D) arrays raise: use the evoked ``*_roi_tc.npz`` (the trial archive is
 ``*_roi_tc_trials.npz``).
+
+Provenance requirement (B5 task 8): an archive read **from disk** must have the
+provenance sidecar written by the source stage next to it
+(``{subject}_provenance.json``, ``eegcpm.core.provenance``); a missing/invalid
+provenance — or a recorded sha256 that does not match the file — is rejected
+loudly instead of silently consuming a stale or partially written archive. The
+run's ``config_hash`` and ``epochs_sha256`` are reported in the result metadata.
+In-memory ``Mapping`` input has no sidecar and is accepted as-is (the caller owns
+the freshness of data it holds directly).
 """
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from eegcpm.core.provenance import verify_archive_provenance
 from eegcpm.pipeline.base import BaseModule, ModuleResult
 
 
@@ -67,34 +77,51 @@ class SourceERPFeatureModule(BaseModule):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _as_mapping(data: Any) -> Dict[str, Any]:
+    def _as_mapping(data: Any) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         """Coerce a Mapping / ``NpzFile`` / path into a plain dict (P2-F6).
 
-        Loading eagerly means callers may close the file and every downstream
-        branch sees the same plain-dict contract.
+        Returns ``(mapping, provenance)``. Loading eagerly means callers may close
+        the file and every downstream branch sees the same plain-dict contract.
+
+        Archives read from disk must carry the source stage's provenance sidecar
+        (B5 task 8): :func:`verify_archive_provenance` raises ``ValueError`` when it
+        is missing, unusable, or does not match the archive on disk. In-memory
+        mappings cannot have a sidecar and are accepted as-is.
         """
         if isinstance(data, np.lib.npyio.NpzFile):
-            return {key: data[key] for key in data.files}
+            mapping = {key: data[key] for key in data.files}
+            # numpy >= 2.5 no longer exposes ``NpzFile.filename``; the path lives on
+            # the underlying zipfile handle (``fid.name``). A buffer-backed archive
+            # has no path and therefore no sidecar (like an in-memory mapping).
+            filename = getattr(data, "filename", None)
+            if not isinstance(filename, (str, Path)):
+                candidate = getattr(getattr(data, "fid", None), "name", None)
+                filename = candidate if isinstance(candidate, (str, Path)) else None
+            provenance = (
+                verify_archive_provenance(Path(filename)) if filename else None
+            )
+            return mapping, provenance
         if isinstance(data, Mapping):
-            return dict(data)
+            return dict(data), None
         if isinstance(data, (str, Path)):
             path = Path(data)
             if not path.is_file():
                 raise FileNotFoundError(f"ROI time-course file not found: {path}")
+            provenance = verify_archive_provenance(path)
             with np.load(path, allow_pickle=False) as npz:
-                return {key: npz[key] for key in npz.files}
+                return {key: npz[key] for key in npz.files}, provenance
         raise TypeError(
             "input must be a Mapping, an np.lib.npyio.NpzFile or a path to an .npz "
             f"file; got {type(data).__name__}"
         )
 
     def validate_input(self, data: Any) -> bool:
-        """Validate input is a source ROI time-course archive."""
+        """Validate input is a source ROI time-course archive (with provenance)."""
         try:
-            data = self._as_mapping(data)
+            mapping, _provenance = self._as_mapping(data)
         except (TypeError, ValueError, OSError):
             return False
-        return "roi_names" in data
+        return "roi_names" in mapping
 
     @staticmethod
     def _condition_names(data: Mapping[str, Any]) -> List[str]:
@@ -133,7 +160,7 @@ class SourceERPFeatureModule(BaseModule):
         """
         start_time = time.time()
 
-        data = self._as_mapping(roi_data)
+        data, provenance = self._as_mapping(roi_data)
         if "roi_names" not in data:
             raise ValueError(
                 "input must contain 'roi_names' (the source ROI time-course archive "
@@ -283,6 +310,17 @@ class SourceERPFeatureModule(BaseModule):
                 "n_rois": len(roi_names),
                 "n_features": len(feature_columns),
                 "sfreq": sfreq,
+                # Provenance of the consumed archive (B5 task 8): the run identity
+                # is carried into the feature metadata instead of being discarded.
+                "source_config_hash": (
+                    provenance.get("config_hash") if provenance else None
+                ),
+                "source_epochs_sha256": (
+                    provenance.get("epochs_sha256") if provenance else None
+                ),
+                "source_epochs_path": (
+                    provenance.get("epochs_path") if provenance else None
+                ),
             },
         )
 

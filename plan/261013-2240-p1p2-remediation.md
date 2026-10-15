@@ -772,6 +772,15 @@ Before any B6 code, the user records in `planning/VERIFICATION_TODO.md` (decisio
     float writes `-Infinity` (non-strict JSON). Exposure becomes live with this batch's
     `resolved_config`/`config_hash`/`library_versions`; route it through the encoder and add a
     numpy-scalar metadata round-trip test.
+19. **B5-N3 (audit owner assignment):** `modules/source/__init__.py:937` — `config_hash` covers only
+    `SourceConfig`; the resolved task-config condition→event-code mapping (after CLI translation) is
+    not hashed. Record the resolved `{condition: codes, matched_event_values}` in provenance and add a
+    `run_identity_hash` combining it with `config_hash` (also strengthens the B5-N1 consumer check).
+    Also from the B5 re-audit: save the source config hash(es) next to the features parquet as part of
+    this golden-hash provenance, and pin `forward_source == 'template'` in the template provenance test.
+20. **B5-A4 (audit owner assignment):** the forward cache key covers the BEM/trans **filename**, not
+    contents/mtime. Either add mtime/size to the key or document "template assets must not change
+    during a process"; note the benign GIL double-build.
 
 **Validation:** full standard command; `test_robust_pca.py` now passes; `test_config_hash.py` green.
 **Exit criteria:** C4 (decision recorded; if (b), real-data report attached), C5 complete.
@@ -849,6 +858,15 @@ new `tests/unit/test_hbn_chain_e2e.py`, `tests/unit/test_source.py`, `.github/wo
     runtime with a `FileNotFoundError` instead of an argparse error. Validate the per-feature-type argument
     combinations in the argparse layer (reject/require `--input-dir` per type) so the CLI exits 2 with a usage
     message instead of a traceback.
+12. **B5-A5 (audit owner assignment)**: hidden `.*.tmp*` leftovers after a SIGKILL are never cleaned;
+    add them to the stale patterns (scoped per subject) or document the single-writer assumption in the
+    `core/provenance.py` module docstring.
+13. **B5-N4 (audit owner assignment)**: condition names containing `/` become filename path separators
+    (`_save_stc_atomic("sub-01", "a/b", …)` → `FileNotFoundError`, failing the whole run with
+    `save_stc=True`); reject or sanitize `/` (and `\\`) in condition names before saving stcs.
+14. **B5-N5 (audit owner assignment)**: the `source-reconstruct` CLI must exit non-zero when sessions
+    failed, and an explicitly requested task config that is missing/unreadable must fail (exit 1)
+    instead of warning and falling back to per-event processing (`cli/source_reconstruct.py:172`).
 
 **Validation:** full standard command (only the 2 baseline connectivity failures may remain);
 `.venv/bin/python -m pytest tests/unit/test_no_silent_continue.py -q --no-cov -p no:cacheprovider -rA` shows files scanned > 50.
@@ -930,7 +948,10 @@ renaming hard-coded ROI names; REST API; user management; `_legacy` code (exclud
 
 ## 12. Unresolved questions (block or change the plan)
 
-1. **Checkpoint A (RPCA):** remove from the ERP chain (a) or validate on ≥5 real HBN recordings (b)? Blocks B6.
+1. **Checkpoint A (RPCA):** ✅ **RESOLVED 2026-10-15 (user): option (a) — remove `RobustPCAStep` from
+   the ERP chain** (chain becomes 9 steps), recorded as a spec deviation; the optional validation
+   script can be built later if re-litigating. Implement in B6 (remove from `build_hbn_langer_chain`,
+   update the chain docstring + `spec_deviations`, pin the golden hash after removal).
 2. **Checkpoint B:** which real EGI-129 subject/session (P0 open item), and where is the data? Blocks B8 step 3.
 3. OK to **delete** the three keyed-dialect YAMLs in `eegcpm-0.1/config/` (B1 task 9), or move them?
    Default if no answer: delete. **Resolved 2026-10-14: deleted** (recoverable from git).
@@ -942,8 +963,9 @@ renaming hard-coded ROI names; REST API; user management; `_legacy` code (exclud
    source energy still ranks the true ROIs first — the loss is cancellation during extraction,
    not the inverse. Options: (a) keep `mean_flip` and document attenuation + polarity convention,
    (b) switch to `pca_flip` (still signed), (c) redefine midline ROIs (split by hemisphere or use
-   surface patches instead of spheres). **User decision required before P2 condition 4 is
-   marked verified.**
+   surface patches instead of spheres). ✅ **RESOLVED 2026-10-15 (user): option (a) — keep
+   `mean_flip`** and document the attenuation + polarity-convention caveats; P2 condition 4 may be
+   signed off once that documentation lands (B6 tier-2 / source docstring + plan §0.5).
 5. **Bad-channel detector calibration on real data (B4-D2, Opus B4 re-audit 2026-10-15 — ⛔ blocks
    any real-data chain run; owner B6 tier-2):** with the user-chosen log-scale rule, only **5/12**
    non-corrupt pilot recordings stay within the 11-channel budget. Over-flagging comes from
@@ -951,5 +973,11 @@ renaming hard-coded ROI names; REST API; user management; `_legacy` code (exclud
    movie tasks; the upper-tail-only rule also misses near-flat channels above the absolute
    1e-20 V² floor. Options: (i) kurtosis after EOG regression / exclude blink segments;
    (ii) log-scale or upper-tail kurtosis; (iii) relative near-flat floor (`var < 1e-3 × median`
-   or log-variance z < −K) as `flat`; (iv) recalibrate the budget on pilot-50. Decide before
-   B6/B8 real-data runs.
+   or log-variance z < −K) as `flat`; (iv) recalibrate the budget on pilot-50. ✅ **RESOLVED
+   2026-10-15 (user): implement the blink-aware design at B6 tier-2** — (1) kurtosis computed on
+   **blink-free samples** (EOG channels when present; else a synthetic frontal proxy via
+   `find_eog_events(ch_name=<most anterior channel(s)>)`, optionally cross-checked with ICLabel
+   eye-blink components; mask ±200 ms around each blink); (2) log-scale / upper-tail kurtosis;
+   (3) relative near-flat floor; no chain reordering (detector stays step 4; EOG regression / ICA
+   keep handling ocular removal downstream). Validate on pilot5 × 3 tasks and the user's other
+   dataset; target: clean recordings within budget.
