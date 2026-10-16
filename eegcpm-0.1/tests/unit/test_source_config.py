@@ -48,6 +48,31 @@ def test_unknown_output_key_raises():
         SourceConfig.model_validate({"output": {"save_stc": True, "nope": 1}})
 
 
+def test_non_fsaverage_template_raises(tmp_path):
+    """F4: ``forward.template`` is fsaverage-only, not a silently-ignored string.
+
+    The source module's template forward/BEM/head->MRI transform and CONN
+    labels are all fsaverage-specific and the module never read the field, so
+    ``template: colin27`` used to be accepted and then silently ignored. It is
+    a ``Literal['fsaverage']`` now: any other value is rejected at validation
+    (schema and module-construction paths).
+    """
+    with pytest.raises(ValidationError):
+        SourceConfig.model_validate({"forward": {"template": "colin27"}})
+    with pytest.raises(ValidationError):
+        SourceReconstructionModule(
+            {"forward": {"template": "fsaverage-ECoG"}}, tmp_path
+        )
+    # The valid value (and the default) still validate and reach the config.
+    assert SourceConfig.model_validate({}).forward.template == "fsaverage"
+    assert (
+        SourceConfig.model_validate(
+            {"forward": {"template": "fsaverage"}}
+        ).forward.template
+        == "fsaverage"
+    )
+
+
 def test_module_construction_rejects_flat_keys(tmp_path):
     with pytest.raises(ValidationError):
         SourceReconstructionModule({"snr": 2.0}, tmp_path)

@@ -199,7 +199,7 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | 2026-10-15 | P2 | **`mean_flip` decision (resolved)** | Option (a): keep `mean_flip`; document the uniform-patch attenuation (11/30 vs 22/30) and the midline polarity convention; P2 condition 4 sign-off after the docs land | resolved (docs at B6 tier-2) |
 | 2026-10-15 | P0/B8 | **Real data (resolved)** | Checkpoint B will use a pilot5 subject (`~/proj/adhd-hbn/data_raw/hbn-eeg/pilot5`) **and** the user's other dataset ("one EP one attention"; path TBD) | resolved |
 | 2026-10-16 | P1 | B6 implementation notes (for the auditor) | **RPCA removed** from `build_hbn_langer_chain()` (9 steps) with the deviation in `get_config`/`spec_deviations`; the golden resolved hash is pinned (`f3a40cd6…` rev1 → `73175626…` rev2 → **re-pinned `72c394e7…` after the scoped-re-audit ASR fix**, which now reports the fixed-first-60 s path truthfully) and covers the 9 chain steps + spec deviations + 9 library versions + the detector/ASR algorithm constants; **`robust_pca` was never in `STEP_REGISTRY`**, so "keep the step class + registry" was implemented as "keep the class importable" (adding a registry entry would newly enable it in YAML step lists); **B4-D2 detector**: kurtosis upper-tail on blink-free samples + relative near-flat floor implemented as the ratio rule only — the decision's `log-variance z < −K` alternative is documented as unusable (the lowest channel of the healthy fixture, at 29 % of the median variance, has z = −54, i.e. it flags healthy channels); pilot5 × 3 at rev1: **6/12** (Rest 4/4, DM 1/4, FF 1/4) — **superseded by rev2: 8/12 (Rest 4/4, DM 2/4, FF 2/4)** after log-Pearson kurtosis + band-passed blink ranking + EEG+EOG filtering; the movie-task over-budget (4/8 movie recordings) is genuine artifact burden, not blinks (a vertical-EOG reference mask finds 10–40× more blinks yet changes pass/fail on zero recordings); **blink under-detection persists** (band-passed-variance ranking still picks infraorbital channels in 9/12; 2–6 blinks vs 17–88 for the vertical-EOG reference; plausibility floor 1/min fires once) — carried to B8 (vertical-EOG derivation, floor ≈5/min); follow-ups: pilot-50 budget recalibration. **B6 rev2 (2026-10-16, Opus final-audit conditions NEW-1…NEW-10): EOG band-passed by the chain filter (NEW-1), band-passed blink-channel ranking + rate plausibility (NEW-2), log-Pearson upper-tail kurtosis (NEW-3), algorithm constants in `get_config` (NEW-4), numpy/scipy pinned (NEW-5), pilot table re-run in true chain order incl. zapline (NEW-6), stale RPCA numbers fixed (NEW-7), xfail `raises=AssertionError` + normal instrumentation tests (NEW-8), behavioural detector tests (NEW-9), RPCA write-back only on convergence (NEW-10); scoped-re-audit fix: ASR wrapper `get_config` fixed-path truthfulness + hash re-pin** | implemented 2026-10-16 + rev1 K3 fixes + rev2 final-audit fixes + scoped-re-audit fix; awaiting desk-check/commit |
-| 2026-10-16 | P1/P2 | **B7 rev2 — Opus final audit (B7-N2 + majors)** | `revise` conditions applied on the uncommitted B7 tree: **(1) B7-N2 critical — ASR output blow-up guard** (`ASRStep` fails loudly with reason `asr_output_magnitude_blowup` when `max|post| > 1e3·max|pre|`; calibration-covariance condition number recorded; blow-ups can no longer be misattributed to block rejection) **+ e2e fidelity assertions** (`repaired_fraction < 0.85`, measured 0.762; ERP-retention median evoked↔template correlation ≥ 0.5, measured 0.88 on the anterior-injection fixture) **+ fix 7**: the ASR-excluded interpolated channels are **re-interpolated from the ASR-cleaned data** (they previously kept pre-ASR spline values; 1.02/1.09 relative-norm divergence) → `ASRStep` 2.0→2.1, wrapper 2.1→2.2, **golden hash re-pinned `ca91b7f2…` → `1ef8780d…`**; **(2) CI can go green**: the two P4 `mne_connectivity` tests deselected in the workflow + a step that fails on any fsaverage skip; **(3) blink gate timeline guard** (`timeline_mismatch` when sfreq/n_times/first_samp differ — a resampled post used to get a bogus pass/fail verdict); **(4) blink ratio bias**: pre and post ptp now measured on identically 1–15 Hz band-passed copies (100 µV 60 Hz in the pre recording was a false pass); **(5) crosstalk direction** corrected everywhere (rows are CTFs: `C[i, j]` is leakage **from ROI j into ROI i**; row = target, column = source); **(6) crosstalk artifact**: the saved primary `crosstalk` is now the **flip-aligned** numpy estimator (matches `mean_flip`), the library matrix is kept as `crosstalk_unflipped`, QC/provenance state which matrix the statistics use; **(8) e2e honesty** (contaminated-variant event check no longer compares a file with itself; `assert interpolated`); **(9) smaller gaps** (gate prints the scan count; line-noise failures are NaN + note instead of 0.0; `run_processor.load_processed_runs` records an unreadable FIF instead of defaulting to 128 channels and reads `bad_channel_detection`; crosstalk `{"computed": false}` carries a reason; role-exclusion accounting uses the before-EEG set) | **rev2 applied 2026-10-16; awaiting re-audit. ⛔ NEW OPEN USER DECISION (blocks B8): ASR high-pass design (plan §12.6)** |
+| 2026-10-16 | P1/P2 | **B7 rev2 — Opus final audit (B7-N2 + majors)** | `revise` conditions applied on the uncommitted B7 tree: **(1) B7-N2 critical — ASR output blow-up guard** (`ASRStep` fails loudly with reason `asr_output_magnitude_blowup` when `max|post| > 1e3·max|pre|`; calibration-covariance condition number recorded; blow-ups can no longer be misattributed to block rejection) **+ e2e fidelity assertions** (`repaired_fraction < 0.85`, measured 0.762; ERP-retention median evoked↔template correlation ≥ 0.5, measured 0.88 on the anterior-injection fixture) **+ fix 7**: the ASR-excluded interpolated channels are **re-interpolated from the ASR-cleaned data** (they previously kept pre-ASR spline values; 1.02/1.09 relative-norm divergence) → `ASRStep` 2.0→2.1, wrapper 2.1→2.2, **golden hash re-pinned `ca91b7f2…` → `1ef8780d…`**; **(2) CI can go green**: the two P4 `mne_connectivity` tests deselected in the workflow + a step that fails on any fsaverage skip; **(3) blink gate timeline guard** (`timeline_mismatch` when sfreq/n_times/first_samp differ — a resampled post used to get a bogus pass/fail verdict); **(4) blink ratio bias**: pre and post ptp now measured on identically 1–15 Hz band-passed copies (100 µV 60 Hz in the pre recording was a false pass); **(5) crosstalk direction** corrected everywhere (rows are CTFs: `C[i, j]` is leakage **from ROI j into ROI i**; row = target, column = source); **(6) crosstalk artifact**: the saved primary `crosstalk` is now the **flip-aligned** numpy estimator (matches `mean_flip`), the library matrix is kept as `crosstalk_unflipped`, QC/provenance state which matrix the statistics use; **(8) e2e honesty** (contaminated-variant event check no longer compares a file with itself; `assert interpolated`); **(9) smaller gaps** (gate prints the scan count; line-noise failures are NaN + note instead of 0.0; `run_processor.load_processed_runs` records an unreadable FIF instead of defaulting to 128 channels and reads `bad_channel_detection`; crosstalk `{"computed": false}` carries a reason; role-exclusion accounting uses the before-EEG set) | **rev2 applied 2026-10-16; awaiting re-audit. ⛔ NEW OPEN USER DECISION (blocks B8): ASR high-pass design (plan §12.6). Hash later re-pinned `1ef8780d…` → `b47de382…` by the F1–F7 fix round (see the B8 evidence)** |
 
 ## Remediation batches — `plan/261013-2240-p1p2-remediation.md`
 
@@ -211,8 +211,8 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | B4 | Source usability + config wiring + P1 bad-channel detector | `[x]` **verified 2026-10-15 (code scope)** — Opus final audit `revise` → rev1 applied (log-scale detector + config bounds + condition guards + test honesty) → scoped re-audit `approve`; B4-D2 **resolved 2026-10-15**: blink-aware detector design at B6 tier-2 (decisions log / plan §12.5) |
 | B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev1 applied (N1/N2/A1/A2/A3/A6/A7/N6) → scoped re-audit `approve`, no conditions left (residuals → B6/B7/B8) |
 | B6 | ⛔ Checkpoint A (RPCA) + instrumentation + golden resolved-config hash + P1 tier-2 debt | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev2 (NEW-1…NEW-10) + scoped-re-audit ASR-fix applied; desk-check + suites (2F connectivity-only / 729P) per the re-audit; hash `72c394e7…` |
-| B7 | QC truthfulness, test-suite honesty, CI job | `[~]` **implemented 2026-10-16 — rev2 applied, awaiting re-audit** (tasks 1–15 + the B6-carried EOG guard; **rev1 K3 fixes B7-A1…A5 applied**: gate widened to `cli`/`workflow`/`data` → 108 files / 0 offenders, no false "all steps ok", directed crosstalk count; **rev2 Opus final-audit fixes B7-N2 + majors**: ASR output blow-up guard + re-interpolation of ASR-excluded interpolated channels (golden hash re-pinned `1ef8780d…`), e2e fidelity assertions, CI deselection + fsaverage-skip gate, blink timeline/band-pass guards, crosstalk direction + flip-aligned primary matrix, test-honesty + smaller gaps — see below) |
-| B8 | End-to-end verification prep; ⛔ Checkpoint B (real EGI-129 subject) | `[ ]` not started |
+| B7 | QC truthfulness, test-suite honesty, CI job | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev2 (B7-N2 ASR guard + majors) + scoped re-audit: all conditions met (hash `1ef8780d…`; suite 2F connectivity-only / 853P / 0 skipped; chain e2e 18; fsaverage 43/0; gate 108 files / 0 offenders) — **hash later re-pinned to `b47de382…` by the final-verification-audit fix round (F1–F7), see the B8 evidence** |
+| B8 | End-to-end verification prep; ⛔ Checkpoint B (real EGI-129 subject) | `[~]` **task 1 verified 2026-10-16 (code scope)** — final-verification audit `revise` → fixes F1–F7 applied + scoped re-check `confirm-with-notes`; **P1 C1–C6 and P2 conditions 1–4 verified for code scope**; ⛔ Checkpoint B (real data) blocked by the ASR high-pass decision §12.6, the second-dataset path, and a green remote CI run (push-gated) |
 
 B1 evidence (2026-10-14, after rev1 + rev2): focused suite green (six files: executor semantics,
 schema, status persistence [15 tests], reachability, chain, output discovery → **93 passed**);
@@ -776,8 +776,14 @@ decision (a), P1-F2/F7/F9/F13–F22 + B3-K9/B3-K5/B5-N3/B5-A4 + B4-D2**, plan §
       `raises=AssertionError` + normal instrumentation tests (NEW-8), behavioural detector tests
       (NEW-9), RPCA write-back only on convergence (NEW-10) — scoped-re-audit ASR-fix +
       hash re-pin `72c394e7…` — **B6 verified 2026-10-16** (desk-check + suites 2F connectivity-only /
-      729P). Next: **B7** (QC truthfulness, test honesty, CI incl. tasks 12–15). B6 residuals to
-      watch: movie-task detector budget + the "other dataset" half of the B4-D2 validation.
+      729P). **B7 verified 2026-10-16** (final-audit rev2 + scoped re-audit all met; hash `1ef8780d…`).
+      Next: **B8** — task 1 (synthetic dipole source-ERP e2e + the Opus B7 amplitude-retention carry)
+      **implemented 2026-10-16, awaiting audit**; **final-verification-audit fix round F1–F7 applied
+      2026-10-16** (golden hash re-pinned `1ef8780d…` → `b47de382…`; green remote CI run requires
+      pushing — user-gated open item under B8/Checkpoint B); ⛔ Checkpoint B (real data) blocked by
+      the ASR high-pass decision (plan §12.6), the second dataset path **and the push-gated CI run**.
+      B6/B7 residuals to watch: movie-task detector budget + the "other dataset" half of the B4-D2
+      validation.
 - [ ] **Final-audit model note:** Opus 5.5 was intermittently unavailable for B3; per user decision
       the B3 final audit ran on Qwen3.8-Max. B4/B6/B7 milestone audits: try Opus 5.5 first, fall back
       to Qwen3.8-Max (or Kimi K3) only with a recorded note.
@@ -793,6 +799,13 @@ decision (a), P1-F2/F7/F9/F13–F22 + B3-K9/B3-K5/B5-N3/B5-A4 + B4-D2**, plan §
       as-is with the guard + documented distortion. B8 must not run the real-data chain until the
       user picks one (the choice changes what the real-data verification validates).
 - [ ] Real-subject end-to-end verification (Checkpoint B artifacts → `planning/audits/`)
+- [ ] **⛔ B8/Checkpoint B open item — green remote CI run (F1, user-gated):**
+      `.github/workflows/pipeline-verification.yml` is tracked with the F1–F7 round (it was
+      **untracked** through B7 — the B7 commit message claimed it but never added it), and the
+      exact workflow commands are green in a local dry run. A **green remote GitHub run requires
+      pushing** the branch (or opening a PR) — a user-gated action, not performed by the
+      implementer and not performable from this workspace. Until the user pushes, the remote CI
+      item stays open (local dry run ≠ remote green run).
 - [ ] **B8 checklist — EOG-regression HF guard on real data (B7-A5):** validate
       `MAX_HF_POWER_FRACTION=0.05` (`steps/eog_regression.py::_check_band_limited`) on the real
       Checkpoint B subject. If the guard false-fires (e.g. blink transients pushing the > 50 Hz
@@ -861,7 +874,8 @@ Plan §B7 tasks 1–15 + the B6-carried `EOGRegressionStep` guard. Files: `modul
   45 % Nyquist) must be ≤ 5 %, both recorded (`eog_hf_power_fraction`, `eog_lowpass_hz`,
   `eog_band_limited_check`), with the explicit recorded `allow_unfiltered_regressors` opt-out; the
   guard constants are in `get_config()`; **golden hash re-pinned to `ca91b7f2…`** (was `72c394e7…`;
-  superseded by the B7 rev2 re-pin to `1ef8780d…` — see the B7 rev2 section).
+  superseded by the B7 rev2 re-pin to `1ef8780d…`, itself re-pinned to `b47de382…` by the
+  F1–F7 round — see the B7 rev2 / B8 evidence sections).
 - **⛔ NEW CRITICAL FINDING B7-N1 (found by the task-6 fixture; fixed minimally, needs approval)**:
   spherical-spline interpolation makes an interpolated channel an **exact** linear combination of the
   others, so the ASR calibration covariance is exactly singular (probed on the EGI-129 fixture:
@@ -938,7 +952,9 @@ Kimi K3 pre-audit findings B7-A1…A5; B7 stays `[~]` (awaiting the Opus final a
 
 All 9 audit conditions applied. B7 stays `[~]` (awaiting the re-audit). **Golden resolved hash
 re-pinned `ca91b7f2…` → `1ef8780d87f228609e8c55c233426e51778b5e2a0a8648ba42318e3433b8d421`** (fix 7:
-`ASRStep` 2.0 → 2.1 + `_ASRStepWrapper` 2.1 → 2.2). Files: `steps/asr.py`,
+`ASRStep` 2.0 → 2.1 + `_ASRStepWrapper` 2.1 → 2.2); **that value was later re-pinned to
+`b47de382047676631d2d096b8553ba70b79734aaaebde6774ca00a08e83f1a52` by the final-verification-audit
+fix round F1–F7 (F2/F3 — see the B8 evidence section).** Files: `steps/asr.py`,
 `hbn_langer_chain.py`, `core/config_hash.py`, `modules/qc/{hbn_recording_qc,source_qc,raw_qc,
 preprocessed_qc}.py`, `modules/qc/__init__.py`, `modules/source/__init__.py`,
 `pipeline/run_processor.py`, `.github/workflows/pipeline-verification.yml`, tests
@@ -1044,3 +1060,92 @@ preprocessed_qc}.py`, `modules/qc/__init__.py`, `modules/source/__init__.py`,
   `modules/source/__init__.py` (direction, primary/unflipped matrices, provenance/npz/QC wiring),
   `modules/qc/{raw_qc.py,__init__.py}` + `pipeline/run_processor.py` + `preprocessed_qc.py`
   (smaller gaps), the updated tests, and the CI workflow (deselects + fsaverage-skip gate).
+
+### B8 evidence (task 1) — synthetic dipole source-ERP e2e + the B7 amplitude carry (2026-10-16)
+
+Plan §B8 task 1. **Checkpoint B** (real EGI-129 data, plan §B8 task 3) remains ⛔ blocked by the ASR
+high-pass decision (plan §12.6) and the second-dataset path — not attempted.
+
+- **New test** `tests/unit/test_e2e_synthetic_source_erp.py` (`fsaverage` + `chain_e2e` + `slow`,
+  **16 tests**): the B7 synthetic GSN-HydroCel-129 recording (`make_gsn129_recording`) carrying an ERP
+  generated from the **B2 dipole** — the plan waveform (N1 −1.0 at 0.100 s, P2 +0.6 at 0.200 s) on
+  every `SensoriMotor.Superior` label vertex × `mne.label_sign_flip`, projected with
+  `mne.apply_forward` (10 µV sensor peak) and injected at every 2-s `stim` onset — through the full
+  `hbn_langer` chain, plain-MNE epoching (`mne.Epochs(raw, events, tmin=-0.2, tmax=0.6,
+  baseline=(None, 0), reject_by_annotation=True)`; the P3 module is deliberately not used),
+  `SourceReconstructionModule` (evoked dSPM, oct6 fsaverage) and `SourceERPFeatureModule` (archive
+  read from disk → provenance sidecar check). One module-scoped fixture runs chain/source/features
+  once (**27 s** for the whole file).
+- **Measured**: chain all steps `ok` (`asr.repaired_fraction` 0.719; detector flags/interpolates
+  `E104`), `stim` samples unchanged, 74/74 epochs; target ROI N1 **−8.28 at 0.100 s** (within one
+  sample), `corr(tc, w) = 0.964` (shifted-template control far below), signed output, cerebellar
+  exclusion, ≥3 vertices/ROI; feature CSV columns
+  `1_SensoriMotor.Superior_{N1,P2}_peak_{latency,amplitude}` + `1_nave == 74` with values equal to
+  the npz; condition name pinned `'1'` (plain MNE infers `event_id={'1': 1}`; the P3 module would
+  have used `stim`).
+- **Amplitude retention (Opus B7 carry)**: per-channel projection gain `<evoked_c, w>/<w, w>`
+  normalised by the expected average-reference factor `arf_c = p_c − mean(p)` (scalar
+  `1 − mean(p)²/mean(p²) = 0.9952`; the balanced midline dipole pattern makes the correction small
+  here — 0.970 un-normalised → 0.966 normalised — vs 0.541 in the B7 binary-mask fixture). Measured
+  **retention 0.966** (aggregate 0.994), band **[0.7, 1.3]**; chain-input control **0.987**
+  (injection intact → the 3.4 % loss is the chain's) and shifted-template control < 0.2 × retention.
+- **Fixture sharing**: new `gsn129_dipole_setup` conftest fixture builds the oct6 forward **through**
+  `SourceReconstructionModule._get_template_forward` on the 109-channel EEG set the chain leaves
+  behind (class-level forward cache reused — the test asserts the same forward object; one ~10 s
+  build per session); `make_gsn129_recording` gained the additive, backwards-compatible
+  `erp_sensor_data` parameter. Two probe bugs caught before landing (pre-stim padding shifting the
+  injected ERP by 0.2 s; a mis-scaled `apply_forward` producing a 1e4 V injection that the ASR
+  covariance guard correctly rejected) — both guarded by tests now (input-gain control + the
+  `apply_forward` peak assertion).
+- **Validation**: new file **16 passed** (28 s); `pytest -m chain_e2e` → **34 passed** (18 B7 + 16
+  B8); full standard suite → **2 failed / 870 passed / 2 xfailed / 0 skipped** (failures exactly the
+  two `mne_connectivity` P4 baseline tests). Probes: `/tmp/opencode/b8_probe{1,2}.py`.
+
+### Final-verification-audit fixes F1–F7 (2026-10-16, same uncommitted tree)
+
+Fix round applied after the final deep audit of the P1/P2 acceptance conditions (briefing:
+`planning/audits/2026-10-16-final-verification-briefing.md`). **Golden resolved hash re-pinned
+`1ef8780d…` → `b47de382047676631d2d096b8553ba70b79734aaaebde6774ca00a08e83f1a52`** (F2/F3).
+
+- **F1 (major) — CI file never committed.** `.github/workflows/pipeline-verification.yml` was
+  **untracked** (the B7 commit message claimed it, but it was never added); the file is present and
+  complete and is added to version control with this round (the orchestrator commits). **A green
+  remote CI run requires pushing** — recorded as a user-gated open item under B8/Checkpoint B
+  (see the checklist above).
+- **F2 (major) — block-rejection threshold not hashed.** The 100 µV median-ptp threshold was a
+  local in `_BlockRejectionStepWrapper.process`. It is now the module constant
+  `BLOCK_REJECTION_PTP_THRESHOLD` in `hbn_langer_chain.py`, read at call time by `process` and
+  exposed via `get_config()` (`ptp_threshold_v`; wrapper version 1.1); recorded in the step
+  metadata too. Sensitivity test: changing the constant changes `resolved_config_hash`.
+- **F3 (major) — ASR window tolerances + blow-up factor not hashed.**
+  `ASR_OUTPUT_BLOWUP_FACTOR` and the canonical `window_tolerances=(-inf, 7.0)` (the
+  `clean_windows` z-thresholds that decide the `BAD_asr_window` marks) were missing from
+  `_ASRStepWrapper.get_config()`. `ASR_WINDOW_TOLERANCES` is now a named constant in `steps/asr.py`
+  (also the `ASRStep` default), the wrapper passes it explicitly and reports both it and the
+  blow-up factor (`output_blowup_factor`) in `get_config()` — read at call time (wrapper version
+  2.3). Sensitivity tests for both, plus a test that the wrapper really passes the constant through
+  to `ASRStep`.
+- **F4 (minor) — `forward.template` silently ignored.** `ForwardConfig.template` is now
+  `Literal["fsaverage"]` (`core/config.py`); any other template is rejected at validation instead
+  of being silently ignored. `spacing` deliberately left unrestricted (oct4 is exercised by an
+  existing test; restriction is not trivial). Rejection tests in `test_source_config.py`.
+- **F5 (minor) — briefing count.** `planning/audits/2026-10-16-final-verification-briefing.md`
+  said the gate gives "20 passed"; the actual result is **19 passed** (108 files / 0 offenders) —
+  corrected (and the stale "guard factor not in `get_config`" residual removed).
+- **F6 (minor) — QC copy replaced annotations.** `preprocessing_comparison_qc.py` called
+  `set_annotations(annot)` on the display copy, wiping its stim/event annotations. It now calls
+  `append_eegprep_removed_mark` → the shared append-only `append_bad_annotations` helper; still
+  display-only. New tests: `tests/unit/test_preprocessing_comparison_qc.py` (3).
+- **F7 (minor) — B8 target dominance.** `test_e2e_synthetic_source_erp.py` asserts the target ROI
+  carries the **largest N1 of the whole parcellation** (measured −8.277 vs −6.636 next,
+  `DefaultMode.PCC`; ≥ 1.1× bound), and the polarity test docstring now states it verifies the
+  `mean_flip` **sign convention**, not anatomy.
+- **Validation**: full standard suite → **2 failed / 876 passed / 2 xfailed / 0 skipped** (failures
+  exactly the two `mne_connectivity` P4 baseline tests); `pytest -m chain_e2e` → **34 passed**
+  (18 B7 + 16 B8); `pytest -m fsaverage` → **59 passed / 0 skipped**; gate →
+  **19 passed** / 108 files / 0 offenders. Per-file: `test_config_hash` 19 (+2 sensitivity/config
+  tests), `test_source_config` 22 (+1 F4), `test_e2e_synthetic_source_erp` 16 (F7 folded into the
+  existing N1 polarity/latency test — no new test method, counts unchanged),
+  `test_preprocessing_comparison_qc` 3 (new). F7 measured top-3 N1 (fixture npz, N1 window):
+  **−8.277** `SensoriMotor.Superior`, −6.636 `DefaultMode.PCC`, −2.943 `FrontoParietal.PPC_L`
+  (target/runner-up ratio 1.247 ≥ the 1.1 bound).

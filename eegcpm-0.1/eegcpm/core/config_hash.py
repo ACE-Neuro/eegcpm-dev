@@ -97,10 +97,18 @@ GOLDEN_CONFIG_LIBRARIES: List[str] = [
 #: data) and the B7-N2 output blow-up guard in ``ASRStep`` 2.0 → 2.1. Previous
 #: values were ``ca91b7f280d62804a63d5bc18aa4acfb18a1e80a193a0cedb64f343b3d75cbb7``,
 #: ``f3a40cd6ab825513b840ffed333f1de0d425c51f584023caa8b685e28613f378``,
-#: ``731756264f5c1c79783acba79dee1913b491bd5e02801c3b54105f254edef975`` and
-#: ``72c394e7801d894edf7b39dc26e543e401b2d023f67b445b83d8a5460719b3dd``.
+#: ``731756264f5c1c79783acba79dee1913b491bd5e02801c3b54105f254edef975``,
+#: ``72c394e7801d894edf7b39dc26e543e401b2d023f67b445b83d8a5460719b3dd`` and
+#: ``1ef8780d87f228609e8c55c233426e51778b5e2a0a8648ba42318e3433b8d421``.
+#: Re-pinned 2026-10-16 (**final-verification-audit fixes F1–F7**) after F2
+#: (the 100 µV ``BLOCK_REJECTION_PTP_THRESHOLD`` is a module constant in
+#: ``_BlockRejectionStepWrapper.get_config``, version 1.1) and F3
+#: (``ASR_WINDOW_TOLERANCES`` + ``ASR_OUTPUT_BLOWUP_FACTOR`` read at call time
+#: in ``_ASRStepWrapper.get_config``, version 2.3). F4
+#: (``ForwardConfig.template`` → ``Literal['fsaverage']``) is source-stage
+#: schema, not part of the preprocessing chain hash.
 GOLDEN_RESOLVED_HASHES: Dict[str, str] = {
-    "hbn_langer": "1ef8780d87f228609e8c55c233426e51778b5e2a0a8648ba42318e3433b8d421",
+    "hbn_langer": "b47de382047676631d2d096b8553ba70b79734aaaebde6774ca00a08e83f1a52",
 }
 
 

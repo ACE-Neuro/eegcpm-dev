@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from eegcpm.core.config_hash import (
@@ -165,6 +166,76 @@ def test_resolved_config_hash_sensitive_to_detector_algorithm_constants(monkeypa
     )
 
 
+def test_resolved_config_hash_sensitive_to_block_and_asr_algorithm_constants(
+    monkeypatch,
+):
+    """F2/F3 (final-verification-audit fix round): the gate and ASR constants hash.
+
+    ``_BlockRejectionStepWrapper`` decides ``BAD_BLOCK`` with the module
+    constant ``BLOCK_REJECTION_PTP_THRESHOLD``, and the ASR wrapper's
+    ``BAD_asr_window`` marks / B7-N2 guard use ``ASR_WINDOW_TOLERANCES`` /
+    ``ASR_OUTPUT_BLOWUP_FACTOR`` from ``steps/asr.py``. All three were outside
+    the resolved config before; ``get_config`` reads them at call time now, so
+    changing any of them must change the resolved hash.
+    """
+    from eegcpm.modules.preprocessing import hbn_langer_chain as chain_module
+    from eegcpm.modules.preprocessing.pipeline_builder import (
+        PreprocessingPipeline,
+    )
+    from eegcpm.modules.preprocessing.steps import asr as asr_module
+
+    baseline = resolved_config_hash(PreprocessingPipeline("hbn_langer"))
+
+    monkeypatch.setattr(
+        chain_module, "BLOCK_REJECTION_PTP_THRESHOLD", 150e-6
+    )
+    assert resolved_config_hash(PreprocessingPipeline("hbn_langer")) != baseline, (
+        "hash insensitive to BLOCK_REJECTION_PTP_THRESHOLD"
+    )
+    monkeypatch.undo()
+
+    monkeypatch.setattr(
+        asr_module, "ASR_WINDOW_TOLERANCES", (-np.inf, 5.5)
+    )
+    assert resolved_config_hash(PreprocessingPipeline("hbn_langer")) != baseline, (
+        "hash insensitive to ASR_WINDOW_TOLERANCES"
+    )
+    monkeypatch.undo()
+
+    monkeypatch.setattr(asr_module, "ASR_OUTPUT_BLOWUP_FACTOR", 1e4)
+    assert resolved_config_hash(PreprocessingPipeline("hbn_langer")) != baseline, (
+        "hash insensitive to ASR_OUTPUT_BLOWUP_FACTOR"
+    )
+
+
+def test_asr_wrapper_runs_the_configured_window_tolerances(monkeypatch):
+    """F3: the config is not cosmetic — the wrapper passes the constant through.
+
+    ``_ASRStepWrapper.process`` reads ``ASR_WINDOW_TOLERANCES`` at call time and
+    hands it to ``ASRStep(window_tolerances=...)``, so the value the resolved
+    config reports is the value that decides the ``BAD_asr_window`` marks.
+    """
+    from eegcpm.modules.preprocessing.hbn_langer_chain import _ASRStepWrapper
+    from eegcpm.modules.preprocessing.steps import asr as asr_module
+
+    captured: dict = {}
+
+    class FakeASRStep:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def process(self, raw, metadata):
+            return raw, {"applied": True}
+
+    monkeypatch.setattr(asr_module, "ASR_WINDOW_TOLERANCES", (-np.inf, 5.5))
+    monkeypatch.setattr(asr_module, "ASRStep", FakeASRStep)
+
+    wrapper = _ASRStepWrapper()
+    out_raw, _meta = wrapper.process(None, {})
+    assert captured["window_tolerances"] == (-np.inf, 5.5)
+    assert out_raw is None
+
+
 def test_chain_get_config_exposes_detector_and_asr_constants():
     """NEW-4: the detector/ASR algorithm constants are visible in get_config.
 
@@ -172,9 +243,13 @@ def test_chain_get_config_exposes_detector_and_asr_constants():
     the ASR wrapper must describe the **fixed-first-60 s** path it actually runs
     (ndarray calibration reference; ``ref_tolerances`` not passed).
     """
+    from eegcpm.modules.preprocessing.hbn_langer_chain import (
+        BLOCK_REJECTION_PTP_THRESHOLD,
+    )
     from eegcpm.modules.preprocessing.pipeline_builder import (
         PreprocessingPipeline,
     )
+    from eegcpm.modules.preprocessing.steps import asr as asr_module
     from eegcpm.modules.preprocessing.steps import bad_channels_pinned as bcp
 
     config = PreprocessingPipeline("hbn_langer").get_config()
@@ -203,6 +278,22 @@ def test_chain_get_config_exposes_detector_and_asr_constants():
     assert asr["calibration_reference"] == "first_train_duration_s_of_data"
     assert asr["ref_maxbadchannels"] == "calibration_array"
     assert asr["ref_tolerances"] == "eegprep_default"
+    # F3 (final-verification-audit fix round): the window tolerances that decide
+    # the BAD_asr_window marks and the B7-N2 blow-up guard factor are the
+    # module constants, read at call time.
+    assert asr["window_tolerances"] == [
+        float(t) for t in asr_module.ASR_WINDOW_TOLERANCES
+    ]
+    assert asr["window_tolerances"] == [-np.inf, 7.0]
+    assert asr["output_blowup_factor"] == asr_module.ASR_OUTPUT_BLOWUP_FACTOR
+
+    # F2 (final-verification-audit fix round): the block gate's fixed 100 µV
+    # median-ptp threshold is the module constant.
+    assert (
+        steps["block_rejection"]["ptp_threshold_v"]
+        == BLOCK_REJECTION_PTP_THRESHOLD
+    )
+    assert steps["block_rejection"]["ptp_threshold_v"] == 100e-6
 
     # NEW-1: the filter step's picks (EEG + EOG) are part of the config.
     assert steps["filter"]["picks"] == ["eeg", "eog"]

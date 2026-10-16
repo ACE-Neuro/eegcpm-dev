@@ -384,11 +384,20 @@ class ForwardConfig(BaseModel):
     ``extra='forbid'`` (P2-F5): the nested ``forward`` section must actually be
     consumed; unknown/misplaced keys (e.g. a flat top-level ``spacing``) raise
     instead of being silently ignored.
+
+    F4 (final-verification-audit fix round): ``template`` is constrained to
+    ``Literal['fsaverage']``. The source module's template forward, BEM,
+    head->MRI transform and CONN labels are all fsaverage-specific and the
+    module never read the field, so any other value was silently ignored — now
+    it is rejected at validation instead of pretending to select a template.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    template: str = Field(default="fsaverage", description="Template head model")
+    template: Literal["fsaverage"] = Field(
+        default="fsaverage",
+        description="Template head model (fsaverage only)",
+    )
     spacing: str = Field(default="oct6", description="Source space spacing (oct5, oct6, ico4, ico5)")
 
 

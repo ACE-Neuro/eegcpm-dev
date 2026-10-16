@@ -79,6 +79,7 @@ def make_gsn129_recording(
     contamination_ptp_v: float = CONTAMINATION_PTP_V,
     contaminated_from_start: bool = False,
     erp_mode: str = "common",
+    erp_sensor_data: np.ndarray | None = None,
     seed: int = 7,
 ) -> mne.io.BaseRaw:
     """Synthetic GSN-HydroCel-129 recording used by the chain e2e tests.
@@ -112,7 +113,21 @@ def make_gsn129_recording(
       (measured r = −0.98 on Cz), so a retention assertion on the common
       fixture would be vacuous — it would measure the reference step, not the
       chain's fidelity (B7 rev2 fix 1b).
+    - ``erp_sensor_data`` replaces the built-in template: a
+      ``(n_channels, n_samples)`` sensor-space waveform is added verbatim at
+      every ``stim`` onset. Used by the B8 synthetic source-ERP e2e
+      (``test_e2e_synthetic_source_erp.py``), which injects the B2 dipole
+      projection (``apply_forward`` of the ``SensoriMotor.Superior`` waveform)
+      instead of the template. Mutually exclusive with the non-default
+      ``erp_mode`` modes.
     """
+    if erp_sensor_data is not None:
+        if erp_mode != "common":
+            raise ValueError(
+                "erp_sensor_data replaces the built-in template; it cannot be "
+                f"combined with erp_mode={erp_mode!r}"
+            )
+        erp_sensor_data = np.asarray(erp_sensor_data, dtype=float)
     if erp_mode not in ("common", "anterior"):
         raise ValueError(f"erp_mode must be 'common' or 'anterior', got {erp_mode!r}")
     montage = mne.channels.make_standard_montage("GSN-HydroCel-129")
@@ -145,16 +160,33 @@ def make_gsn129_recording(
         + 6e-6 * np.exp(-0.5 * ((erp_t - 0.200) / 0.040) ** 2)
     )
     stim_onsets = np.arange(2.0, DURATION_S - 1.0, 2.0)
-    if erp_mode == "common":
-        erp_rows = np.ones(n_channels, dtype=bool)
+    if erp_sensor_data is not None:
+        # Caller-supplied sensor-space injection (B8 dipole projection): added
+        # verbatim at every onset, replacing the built-in template.
+        if erp_sensor_data.ndim != 2 or erp_sensor_data.shape[0] != n_channels:
+            raise ValueError(
+                "erp_sensor_data must be (n_channels, n_samples) = "
+                f"({n_channels}, n_samples); got {erp_sensor_data.shape}"
+            )
+        if erp_sensor_data.shape[1] > int(2.0 * SFREQ):
+            raise ValueError(
+                "erp_sensor_data longer than the 2-s stim interval would overlap "
+                "the next onset"
+            )
+        for onset in stim_onsets:
+            start = int(onset * SFREQ)
+            data[:, start:start + erp_sensor_data.shape[1]] += erp_sensor_data
     else:
-        # Anterior EEG subset: the average-reference step cancels a common-mode
-        # ERP exactly, so the retention assertion needs a spatially structured
-        # injection (B7 rev2 fix 1b; see the docstring).
-        erp_rows = _anterior_eeg_mask(ch_names)
-    for onset in stim_onsets:
-        start = int(onset * SFREQ)
-        data[erp_rows, start:start + erp.size] += erp[None, :]
+        if erp_mode == "common":
+            erp_rows = np.ones(n_channels, dtype=bool)
+        else:
+            # Anterior EEG subset: the average-reference step cancels a common-mode
+            # ERP exactly, so the retention assertion needs a spatially structured
+            # injection (B7 rev2 fix 1b; see the docstring).
+            erp_rows = _anterior_eeg_mask(ch_names)
+        for onset in stim_onsets:
+            start = int(onset * SFREQ)
+            data[erp_rows, start:start + erp.size] += erp[None, :]
 
     # Contaminated blocks (the "excluded" variant): sustained in-band oscillation
     # on every **EEG** channel (not on the EOG channels: the chain's EOG

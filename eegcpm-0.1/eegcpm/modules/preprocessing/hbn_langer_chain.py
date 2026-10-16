@@ -65,6 +65,16 @@ HBN_LANGER_SPEC_DEVIATIONS: List[str] = [
     "P1-F2: robust_pca removed (destroys ERP; synthetic retention 2-28%)",
 ]
 
+#: R-006 block-rejection gate: a 2-s block is flagged ``BAD_BLOCK`` when its
+#: MEDIAN channel peak-to-peak amplitude exceeds this fixed physiological
+#: threshold (100 µV). Named at module level and read at call time, so
+#: ``_BlockRejectionStepWrapper.get_config()`` — and therefore the golden
+#: resolved-config hash — covers the number that actually decides the gate
+#: (F2, final-verification-audit fix round). A fixed threshold (not a multiple
+#: of the recording's own statistics) avoids the "majority-bad" failure mode
+#: where the multiplier baseline is itself dominated by bad blocks.
+BLOCK_REJECTION_PTP_THRESHOLD: float = 100e-6   # 100 µV
+
 
 def build_hbn_langer_chain() -> List[Any]:
     """Build the canonical HBN-Langer preprocessing chain.
@@ -239,7 +249,10 @@ class _BadChannelDetectorWrapper(_PS):
 
 class _ASRStepWrapper(_PS):
     name = "asr"
-    version = "2.2"  # 2.2: B7 rev2 fix 7 (re-interpolate the ASR-excluded
+    version = "2.3"  # 2.3: F3 (final-verification-audit fix round) — the
+    # effective window_tolerances + ASR_OUTPUT_BLOWUP_FACTOR are read from
+    # ``steps.asr`` at call time and exposed in get_config (golden hash);
+    # 2.2: B7 rev2 fix 7 (re-interpolate the ASR-excluded
     # interpolated channels) + B7-N2 output blow-up guard;
     # 2.1: B6 rev2 NEW-4 (method/train_duration/
     # ref_maxbadchannels exposed in get_config -> golden hash)
@@ -293,11 +306,15 @@ class _ASRStepWrapper(_PS):
         # statistics and stores nothing in the MNE ``info`` 'temp' field
         # (it does not survive a FIF save; the executor's JSON sidecar is
         # the home of per-run provenance).
-        from .steps.asr import ASRStep
-        step = ASRStep(
+        # F3: window_tolerances is passed explicitly from the module constant
+        # (read at call time), so the value reported by `get_config()` is the
+        # value that decides the BAD_asr_window marks.
+        from .steps import asr as asr_module
+        step = asr_module.ASRStep(
             cutoff=self.cutoff,
             method=self.method,
             window_criterion=self.window_criterion,
+            window_tolerances=asr_module.ASR_WINDOW_TOLERANCES,
             calibration="fixed_first_60s",
             train_duration=self.train_duration,
         )
@@ -315,11 +332,25 @@ class _ASRStepWrapper(_PS):
         ``clean_asr(ref_maxbadchannels=...)``) and ``ref_tolerances`` is not
         passed at all (eegprep default). Reporting the data-driven constants
         here claimed a calibration the canonical chain never runs.
+
+        F3 (final-verification-audit fix round): the remaining numerics that
+        live in ``steps/asr.py`` — ``ASR_WINDOW_TOLERANCES`` (the
+        ``clean_windows`` z-thresholds that decide the ``BAD_asr_window``
+        marks) and ``ASR_OUTPUT_BLOWUP_FACTOR`` (the B7-N2 guard) — are read
+        from the module **at call time** and included, so a change to either
+        changes the resolved-config hash (see the sensitivity test in
+        ``test_config_hash.py``).
         """
+        from .steps import asr as asr_module
+
         config = super().get_config()
         config.update({
             "cutoff": self.cutoff,
             "window_criterion": self.window_criterion,
+            "window_tolerances": [
+                float(t) for t in asr_module.ASR_WINDOW_TOLERANCES
+            ],
+            "output_blowup_factor": float(asr_module.ASR_OUTPUT_BLOWUP_FACTOR),
             "calibration_window": self.calibration_window,
             "retain_burst_masks": self.retain_burst_masks,
             "method": self.method,
@@ -333,7 +364,9 @@ class _ASRStepWrapper(_PS):
 
 class _BlockRejectionStepWrapper(_PS):
     name = "block_rejection"
-    version = "1.0"
+    version = "1.1"  # 1.1: F2 (final-verification-audit fix round) — the
+    # 100 µV ptp threshold is a module constant (read at call time) exposed in
+    # get_config -> golden hash; 1.0: R-006 median-ptp gate
 
     def __init__(self, max_rejected_fraction: float = 0.20,
                  window_seconds: float = 2.0, enabled: bool = True):
@@ -344,11 +377,12 @@ class _BlockRejectionStepWrapper(_PS):
     def process(self, raw, metadata):
         # R-006: per-block (2-s) detection, hard-fail on >0.20
         # rejection fraction (NO silent truncation). A block is
-        # flagged as bad if ANY channel's ptp exceeds the FIXED
-        # physiological threshold (100 µV). Using a fixed threshold
-        # (not a multiple of the recording's statistics) avoids the
-        # "majority-bad" failure mode where the multiplier baseline
-        # is itself dominated by bad blocks.
+        # flagged as bad if its MEDIAN channel ptp exceeds the FIXED
+        # physiological threshold ``BLOCK_REJECTION_PTP_THRESHOLD``
+        # (100 µV, module constant, read at call time). Using a fixed
+        # threshold (not a multiple of the recording's statistics)
+        # avoids the "majority-bad" failure mode where the multiplier
+        # baseline is itself dominated by bad blocks.
         # Per-block statistics across channels. A block is bad if the
         # MEDIAN channel ptp exceeds the threshold — i.e. a whole-head
         # artifact, not single-channel noise (which is already handled
@@ -359,7 +393,6 @@ class _BlockRejectionStepWrapper(_PS):
         # structurally unable to pass (METH-22-009).
         from eegcpm.modules.preprocessing.steps.base import RecordingExcluded
 
-        BLOCK_REJECTION_PTP_THRESHOLD = 100e-6   # 100 µV
         data = raw.get_data(picks="eeg")
         n_channels, n_total = data.shape
         sfreq = raw.info["sfreq"]
@@ -372,6 +405,7 @@ class _BlockRejectionStepWrapper(_PS):
                 "applied": False,
                 "reason": "recording shorter than one block",
                 "n_blocks": 0,
+                "ptp_threshold_v": float(BLOCK_REJECTION_PTP_THRESHOLD),
             }
         # Per-block median and max channel ptp
         block_med = np.zeros(n_blocks)
@@ -420,16 +454,24 @@ class _BlockRejectionStepWrapper(_PS):
             "applied": True,
             "window_seconds": self.window_seconds,
             "max_rejected_fraction": self.max_rejected_fraction,
+            "ptp_threshold_v": float(BLOCK_REJECTION_PTP_THRESHOLD),
             "n_blocks_rejected": n_bad,
             "n_blocks_total": n_blocks,
             "rejected_fraction": fraction,
         }
 
     def get_config(self) -> Dict[str, Any]:
-        """Get configuration (all constructor parameters, P1-F7)."""
+        """Get configuration (all constructor parameters, P1-F7).
+
+        F2 (final-verification-audit fix round): the 100 µV ptp threshold that
+        decides the gate lives in the module constant
+        ``BLOCK_REJECTION_PTP_THRESHOLD`` (read at call time by ``process`` and
+        here), so it is part of the resolved config — and the golden hash.
+        """
         config = super().get_config()
         config.update({
             "max_rejected_fraction": self.max_rejected_fraction,
             "window_seconds": self.window_seconds,
+            "ptp_threshold_v": float(BLOCK_REJECTION_PTP_THRESHOLD),
         })
         return config

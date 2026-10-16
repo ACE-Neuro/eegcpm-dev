@@ -392,7 +392,7 @@ Plan `plan/261013-2240-p1p2-remediation.md` §B7 tasks 1–15 + the B6-carried E
 
 ### Carried B6 item — EOG regressor guard
 
-- **`steps/eog_regression.py` v5.0**: `_check_band_limited` enforces the NEW-1 contract instead of only documenting it — (1) `raw.info['lowpass']` must be finite and `<= 50 Hz` (the chain's filter sets 45; an unfiltered `RawArray` declares Nyquist and is refused outright), (2) the fraction of EOG power above 50 Hz (Welch; capped at 45 % of Nyquist) must be `<= 5 %` (catches a recording whose metadata claims a 45 Hz lowpass while the EOG data stayed unfiltered — the exact pre-NEW-1 chain behaviour). Both measurements and the check outcome (`eog_hf_power_fraction`, `eog_lowpass_hz`, `eog_band_limited_check`) are recorded; `allow_unfiltered_regressors=True` is the explicit, recorded opt-out. The guard constants are in `get_config()` (B6-NEW-4 principle). Tests: refusal on an unfiltered recording, refusal on EEG-only-filtered data (metadata lies), acceptance + recorded fraction for the chain contract, the explicit bypass, and the Nyquist-capped cutoff. **`GOLDEN_RESOLVED_HASHES['hbn_langer']` re-pinned to `ca91b7f280d62804a63d5bc18aa4acfb18a1e80a193a0cedb64f343b3d75cbb7`** (was `72c394e7…`; superseded by the B7 rev2 re-pin to `1ef8780d…`, see the B7 rev2 section).
+- **`steps/eog_regression.py` v5.0**: `_check_band_limited` enforces the NEW-1 contract instead of only documenting it — (1) `raw.info['lowpass']` must be finite and `<= 50 Hz` (the chain's filter sets 45; an unfiltered `RawArray` declares Nyquist and is refused outright), (2) the fraction of EOG power above 50 Hz (Welch; capped at 45 % of Nyquist) must be `<= 5 %` (catches a recording whose metadata claims a 45 Hz lowpass while the EOG data stayed unfiltered — the exact pre-NEW-1 chain behaviour). Both measurements and the check outcome (`eog_hf_power_fraction`, `eog_lowpass_hz`, `eog_band_limited_check`) are recorded; `allow_unfiltered_regressors=True` is the explicit, recorded opt-out. The guard constants are in `get_config()` (B6-NEW-4 principle). Tests: refusal on an unfiltered recording, refusal on EEG-only-filtered data (metadata lies), acceptance + recorded fraction for the chain contract, the explicit bypass, and the Nyquist-capped cutoff. **`GOLDEN_RESOLVED_HASHES['hbn_langer']` re-pinned to `ca91b7f280d62804a63d5bc18aa4acfb18a1e80a193a0cedb64f343b3d75cbb7`** (was `72c394e7…`; superseded by the B7 rev2 re-pin to `1ef8780d…` — itself re-pinned to `b47de382…` by the F1–F7 round; see the B7 rev2 section and the final-verification-audit section at the end of this changelog).
 
 ### New critical finding (B7-N1) — ASR degenerates on interpolated channels
 
@@ -469,7 +469,8 @@ Pre-audit findings B7-A1…A5 (Kimi K3), all applied on the uncommitted B7 worki
 All nine conditions of the Opus B7 final audit applied on the uncommitted B7 working tree; B7
 stays `[~]` (awaiting re-audit). **Golden resolved hash re-pinned `ca91b7f2…` →
 `1ef8780d87f228609e8c55c233426e51778b5e2a0a8648ba42318e3433b8d421`** (`ASRStep` 2.0 → 2.1,
-`_ASRStepWrapper` 2.1 → 2.2).
+`_ASRStepWrapper` 2.1 → 2.2; **later re-pinned to `b47de382…` by the F1–F7 round**, see the
+final-verification-audit section at the end of this changelog).
 
 - **B7-N2 (critical) — ASR output blow-up guard.** `eegprep.clean_asr` at cutoff 20 on
   0.1-Hz-high-passed data can return garbage at ~1e15–1e16 µV (probed: 4.6e15 µV from a 13 µV
@@ -530,3 +531,108 @@ stays `[~]` (awaiting re-audit). **Golden resolved hash re-pinned `ca91b7f2…` 
   (failures exactly the two `mne_connectivity` P4 baseline tests); `pytest -m chain_e2e` → 18
   passed; `pytest -m fsaverage` → 43 passed / 0 skipped; gate → 19 passed / 108 files / 0
   offenders. Probes: `/tmp/opencode/b7rev2_probe{1..8}.py`.
+
+---
+
+## Remediation batch B8 — synthetic dipole source-ERP end-to-end test (task 1) (2026-10-16)
+
+Plan `plan/261013-2240-p1p2-remediation.md` §B8 task 1 + the Opus B7 amplitude carry. **Checkpoint B**
+(real EGI-129 data) remains ⛔ blocked by the ASR high-pass decision (plan §12.6) and the second
+dataset path; it is deliberately not attempted here.
+
+### New test — `tests/unit/test_e2e_synthetic_source_erp.py` (`fsaverage` + `chain_e2e` + `slow`, 16 tests)
+
+- **Fixture** (`source_erp_run`, module-scoped: one chain run, one source run, one feature run): the
+  B7 synthetic GSN-HydroCel-129 recording (`make_gsn129_recording`) carrying an ERP generated from
+  the **B2 dipole** — the plan waveform (N1 −1.0 at 0.100 s, P2 +0.6 at 0.200 s) on every
+  `SensoriMotor.Superior` label vertex × `mne.label_sign_flip`, projected with `mne.apply_forward`
+  (10 µV sensor peak) and injected at every 2-s `stim` onset — then the full `hbn_langer` chain,
+  plain-MNE epoching (`mne.Epochs(raw, events, tmin=-0.2, tmax=0.6, baseline=(None, 0),
+  reject_by_annotation=True)`; the P3 epochs module is deliberately not used),
+  `SourceReconstructionModule` (evoked dSPM, oct6 fsaverage, `compute_crosstalk=False`) and
+  `SourceERPFeatureModule` (reads the archive **from disk**, so the provenance sidecar check runs).
+- **Measured**: chain all steps `ok` (`asr.repaired_fraction` 0.719, detector flags/interpolates
+  `E104`), `stim` samples unchanged, 74/74 epochs; target ROI N1 **−8.28 at 0.100 s** (within one
+  sample), `corr(tc, w) = 0.964` (shifted-template control far below), signed output, cerebellar
+  exclusion, ≥3 vertices/ROI; feature CSV columns
+  `1_SensoriMotor.Superior_{N1,P2}_peak_{latency,amplitude}` + `1_nave == 74`, values equal to the
+  npz; condition name pinned `'1'` (plain MNE infers `event_id={'1': 1}` from the events array; the
+  P3 module would have used the `stim` annotation name).
+- **Amplitude retention (Opus B7 carry)**: per-channel projection gain `<evoked_c, w>/<w, w>`
+  normalised by the expected average-reference factor `arf_c = p_c − mean(p)` (scalar
+  `1 − mean(p)²/mean(p²) = 0.9952`; the balanced midline dipole pattern makes the reference
+  correction small here — 0.970 un-normalised → 0.966 normalised — while the B7 binary-mask fixture
+  is where the factor is material at 0.541). Measured **retention 0.966** (aggregate 0.994), band
+  **[0.7, 1.3]**; the chain-input control returns **0.987** (the injection is intact, so the 3.4 %
+  loss is the chain's) and the shifted-template control < 0.2 × retention — the measure is
+  non-vacuous on both ends.
+- **Fixture sharing**: new `gsn129_dipole_setup` conftest fixture builds the oct6 forward **through**
+  `SourceReconstructionModule._get_template_forward` on the 109-channel EEG set the chain leaves
+  behind, so the class-level `_FORWARD_CACHE` serves the module under test (the test asserts the same
+  forward object; one ~10 s build per session). `make_gsn129_recording` gained the additive,
+  backwards-compatible `erp_sensor_data` parameter (verbatim sensor-space injection at every `stim`
+  onset; only the B8 test uses it).
+- **Probe findings while writing the test** (both caught before landing):
+  (1) injecting the *epoch-window* array (−0.2…0.6 s) at the stim onset carries the 0.2-s pre-stim
+  padding and shifts the injected ERP by 0.2 s — the first probe measured retention 0.015 and
+  `corr(tc, w) = −0.05`; the conftest fixture injects the post-stim window (126 samples) and the
+  input-gain control guards the regression;
+  (2) the two-step `apply_forward` scaling must derive the amplitude from the probe's peak of the
+  *probe-scaled* waveform: the first version computed the probe at 1 nA but scaled the unscaled
+  `stc`, producing a 1e4 V injection, which the chain's ASR covariance guard correctly rejected as
+  degenerate (the fixture now asserts the projected peak == 10 µV).
+- **Validation**: `pytest tests/unit/test_e2e_synthetic_source_erp.py -q --no-cov -p no:cacheprovider`
+  → **16 passed** (28 s); `pytest -m chain_e2e` → **34 passed** (18 B7 + 16 B8); full standard suite
+  → **2 failed / 870 passed / 2 xfailed / 0 skipped** (failures exactly the two `mne_connectivity`
+  P4 baseline tests). Probes: `/tmp/opencode/b8_probe1.py`, `/tmp/opencode/b8_probe2.py`.
+
+---
+
+## Final-verification-audit fixes (F1–F7) (2026-10-16)
+
+Fix round applied after the final deep audit of the P1/P2 acceptance conditions (briefing:
+`planning/audits/2026-10-16-final-verification-briefing.md`). **Golden resolved hash re-pinned
+`1ef8780d…` → `b47de382047676631d2d096b8553ba70b79734aaaebde6774ca00a08e83f1a52`** (F2/F3).
+
+- **F1 (major) — CI file never committed.** `.github/workflows/pipeline-verification.yml` was
+  **untracked** (the B7 commit message claimed it but it was never added); the file is complete
+  and is committed with this round. A **green remote CI run requires pushing** — recorded as a
+  user-gated open item under B8/Checkpoint B in `VERIFICATION_TODO.md` (local dry run ≠ remote
+  green run).
+- **F2 (major) — block-rejection threshold not hashed.** The 100 µV median-ptp threshold was a
+  local in `_BlockRejectionStepWrapper.process`; it is now the module constant
+  `BLOCK_REJECTION_PTP_THRESHOLD` in `hbn_langer_chain.py`, read at call time by `process` and
+  exposed via `get_config()` (`ptp_threshold_v`, wrapper version 1.0 → 1.1) and recorded in the
+  step metadata. Sensitivity test: changing the constant changes `resolved_config_hash`.
+- **F3 (major) — ASR window tolerances + blow-up factor not hashed.**
+  `ASR_OUTPUT_BLOWUP_FACTOR` and the canonical `window_tolerances=(-inf, 7.0)` (the
+  `clean_windows` z-thresholds that decide the `BAD_asr_window` marks) were missing from
+  `_ASRStepWrapper.get_config()`. `ASR_WINDOW_TOLERANCES` is now a named constant in
+  `steps/asr.py` (also the `ASRStep` default), the wrapper passes it explicitly to `ASRStep` and
+  reports it plus `output_blowup_factor` in `get_config()` — read at call time (wrapper version
+  2.2 → 2.3). Sensitivity tests for both constants, plus a test that the wrapper really passes
+  the constant through to `ASRStep` (the config is not cosmetic).
+- **F4 (minor) — `forward.template` silently ignored.** `ForwardConfig.template` is now
+  `Literal["fsaverage"]` (`core/config.py`): any other template is rejected at validation
+  instead of being accepted and silently ignored (the source module's forward/BEM/trans/labels
+  are fsaverage-specific). `spacing` deliberately left unrestricted (an existing test exercises
+  `oct4`; restriction is not trivial). Rejection tests in `test_source_config.py`.
+- **F5 (minor) — briefing count.** `planning/audits/2026-10-16-final-verification-briefing.md`
+  said the gate gives "20 passed"; the actual result is **19 passed** (108 files / 0 offenders)
+  — corrected, and the now-stale "guard factor not in `get_config`" residual marked fixed.
+- **F6 (minor) — QC copy replaced annotations.** `preprocessing_comparison_qc.py` called
+  `set_annotations(annot)` on the display copy, wiping its stim/event annotations. It now calls
+  the new `append_eegprep_removed_mark` → shared append-only `append_bad_annotations` helper
+  (offset recipe included); display-only, never processed or saved. New tests:
+  `tests/unit/test_preprocessing_comparison_qc.py` (3).
+- **F7 (minor) — B8 target dominance.** `test_e2e_synthetic_source_erp.py` now asserts the target
+  ROI carries the **largest N1 of the whole parcellation** (measured −8.277 vs −6.636 µV next,
+  `DefaultMode.PCC`; ≥ 1.1× bound, ratio 1.247), folded into the existing N1 polarity/latency test
+  so the suite counts stay pinned; the polarity docstring states it verifies the `mean_flip`
+  **sign convention**, not anatomy.
+- **Validation**: full standard suite → **2 failed / 876 passed / 2 xfailed / 0 skipped**
+  (failures exactly the two `mne_connectivity` P4 baseline tests); `pytest -m chain_e2e` →
+  **34 passed** (18 B7 + 16 B8); `pytest -m fsaverage` → **59 passed / 0 skipped**; gate →
+  **19 passed** / 108 files / 0 offenders. Per-file: `test_config_hash` 19 (+2),
+  `test_source_config` 22 (+1), `test_e2e_synthetic_source_erp` 16 (unchanged),
+  `test_preprocessing_comparison_qc` 3 (new).

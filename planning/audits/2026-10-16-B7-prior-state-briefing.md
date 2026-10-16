@@ -30,7 +30,8 @@ P4 tests); chain e2e green; no-silent-except gate green with no allow-list.
   **EOG guard** (carried from B6): refuses unfiltered regressors (`MAX_HF_POWER_FRACTION=0.05`
   above 50 Hz) + tests; golden hash re-pinned `ca91b7f2…` (superseded by the B7 rev2 re-pin to
   `1ef8780d…` — the audit conditions were applied afterwards; see the B7 rev2 evidence in
-  `planning/VERIFICATION_TODO.md`).
+  `planning/VERIFICATION_TODO.md`; re-pinned again to `b47de382…` by the final-verification-audit
+  fix round F1–F7, 2026-10-16).
 - **B7-N1 (critical, fixed)**: spherical-spline interpolation makes an interpolated channel an exact
   linear combination → ASR calibration covariance singular (cond 35 → ~1e15) → eegprep returned
   ~1e15 µV → recordings with ≥1 interpolated channel were excluded. Fix: ASR excludes interpolated

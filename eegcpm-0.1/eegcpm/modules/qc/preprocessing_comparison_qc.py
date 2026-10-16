@@ -30,6 +30,8 @@ from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 
 import mne
 
+from eegcpm.modules.preprocessing.steps.asr import append_bad_annotations
+
 from .base import BaseQC, QCResult
 
 # Check for EEGPrep availability
@@ -41,6 +43,29 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def append_eegprep_removed_mark(
+    raw: mne.io.BaseRaw,
+    onset_s: float,
+    duration_s: float,
+    description: str,
+) -> None:
+    """Append a ``BAD_eegprep_removed_*`` mark to a display copy (F6).
+
+    ``raw_annotated`` is the original-duration *display* copy used by the
+    comparison figure: it must keep every annotation the recording already
+    carries (stim events, earlier ``BAD_*`` marks) and only **add** the
+    removed-segment mark. The pre-F6 code called ``set_annotations(annot)``,
+    which replaced the whole timeline and silently dropped those annotations
+    from the figure. This helper appends via
+    :func:`~eegcpm.modules.preprocessing.steps.asr.append_bad_annotations`,
+    which applies the §0.3 offset recipe, so the mark lands ``onset_s``
+    seconds after the first data sample whatever ``first_samp``/``orig_time``
+    are. Display-only: the copy is never processed or saved.
+    """
+    append_bad_annotations(raw, [onset_s], [duration_s], [description])
+
 
 class PreprocessingComparisonQC(BaseQC):
     """
@@ -278,8 +303,13 @@ class PreprocessingComparisonQC(BaseQC):
             onset = duration_after
             duration = duration_before - duration_after
             description = f"BAD_eegprep_removed_{data_removed_pct:.1f}pct"
-            annot = mne.Annotations(onset=[onset], duration=[duration], description=[description])
-            raw_annotated.set_annotations(annot)
+            # F6 (final-verification-audit fix round): APPEND to the display
+            # copy's annotations (append-only invariant). `set_annotations`
+            # replaced the copy's whole timeline — any stim/event annotations
+            # were dropped from the comparison figure.
+            append_eegprep_removed_mark(
+                raw_annotated, onset, duration, description
+            )
 
         stats['removed_channels'] = all_removed_channels
         stats['data_removed_seconds'] = duration_before - duration_after

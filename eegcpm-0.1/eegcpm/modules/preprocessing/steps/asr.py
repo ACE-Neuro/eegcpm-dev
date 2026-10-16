@@ -104,6 +104,15 @@ DATA_DRIVEN_REF_TOLERANCES: Tuple[float, float] = (-np.inf, 5.5)
 #: repairs never *increase* the maximum amplitude by even 2×.
 ASR_OUTPUT_BLOWUP_FACTOR: float = 1e3
 
+#: Canonical ``(lower, upper)`` RMS z-thresholds passed to
+#: ``clean_windows(zthresholds=...)``; they decide which windows are marked
+#: ``BAD_asr_window`` (``(-inf, 7.0)`` flags only over-power windows). Named at
+#: module level and read at call time so ``_ASRStepWrapper.get_config()`` — and
+#: therefore the golden resolved-config hash — covers the value the canonical
+#: chain actually uses (F3, final-verification-audit fix round). This is the
+#: default of :class:`ASRStep` and what the hbn_langer wrapper passes.
+ASR_WINDOW_TOLERANCES: Tuple[float, float] = (-np.inf, 7.0)
+
 
 def _true_runs(mask: np.ndarray) -> list:
     """Sample runs of a boolean mask as ``[(start_sample, n_samples), ...]``."""
@@ -227,8 +236,9 @@ class ASRStep(ProcessingStep):
         window length (ENG-010) and it never falls back to ``window_length``.
     window_tolerances : tuple of float
         ``(lower, upper)`` RMS z-thresholds for window flagging, passed as
-        ``clean_windows(zthresholds=...)``. Default ``(-inf, 7.0)``: only
-        over-power windows are flagged.
+        ``clean_windows(zthresholds=...)``. Default
+        :data:`ASR_WINDOW_TOLERANCES` = ``(-inf, 7.0)``: only over-power
+        windows are flagged.
     calibration : {'data_driven', 'fixed_first_60s'}
         'data_driven' (default): eegprep picks clean calibration data itself
         (``ref_maxbadchannels=0.075``, ``ref_tolerances=(-inf, 5.5)``).
@@ -276,7 +286,7 @@ class ASRStep(ProcessingStep):
         mode: str = "single",
         method: str = "eegprep",
         window_criterion: float = 0.25,
-        window_tolerances: Tuple[float, float] = (-np.inf, 7.0),
+        window_tolerances: Tuple[float, float] = ASR_WINDOW_TOLERANCES,
         calibration: str = "data_driven",
         train_duration: float = 60.0,
         window_length: Optional[float] = None,

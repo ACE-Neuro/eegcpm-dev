@@ -1,0 +1,85 @@
+name: pipeline-verification
+
+# P1 condition C6 (plan §B7 task 7): the pipeline environment must be verified
+# on every push/PR with the *real* optional dependencies installed (eegprep,
+# pyzaplineplus, eeglabio, autoreject, mne-icalabel) — the unit suite skips or
+# degrades those paths when they are missing, which is exactly the silent
+# failure mode the audits found.
+
+on:
+  push:
+    branches: [main, remediation/**]
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: eegcpm-0.1
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install the verified pipeline environment
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[pipeline]" pytest pytest-cov
+
+      - name: Assert the optional pipeline backends are importable
+        # A missing backend must fail the job here, not silently skip a step.
+        run: python -c "import eegprep, pyzaplineplus, eeglabio, autoreject, mne_icalabel; print('pipeline backends OK')"
+
+      - name: Cache fsaverage
+        id: fsaverage-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/mne_data
+          key: mne-fsaverage-${{ runner.os }}-${{ hashFiles('eegcpm-0.1/pyproject.toml') }}
+
+      - name: Fetch fsaverage (the only allowed download)
+        run: python -c "import mne; mne.datasets.fetch_fsaverage(verbose=True)"
+
+      - name: Standard unit suite (§0.1)
+        # specparam/fooof are intentionally not installed; those two files are
+        # ignored and their collection errors must never be counted as passes.
+        #
+        # The two P4 `mne_connectivity` tests are deselected (B7 rev2 fix 2):
+        # `mne_connectivity` is deliberately NOT part of `.[pipeline]`, so both
+        # tests fail on import — they are the documented P4 baseline (tracked in
+        # VERIFICATION_TODO.md, out of scope for B7) and would keep this job red
+        # forever. Exactly these two are deselected; everything else runs.
+        run: |
+          pytest tests/unit -q --no-cov -p no:cacheprovider \
+            --ignore=tests/unit/test_specparam_basemodule.py \
+            --ignore=tests/unit/test_specparam_features.py \
+            --deselect tests/unit/test_connectivity.py::test_wpli_close_to_mne_connectivity \
+            --deselect tests/unit/test_connectivity.py::test_dwpli_close_to_mne_connectivity
+
+      - name: fsaverage subset must not skip (prefetch validation)
+        # P2 condition 4 / plan §B7 task 7: the fsaverage tests must actually
+        # RUN after the prefetch. A missing cache makes the `fsaverage_subjects_dir`
+        # fixture skip, which pytest would report as a green run — this step
+        # fails on any skip and requires at least one pass (B7 rev2 fix 2).
+        run: |
+          set -o pipefail
+          pytest -m fsaverage -q --no-cov -p no:cacheprovider 2>&1 | tee /tmp/fsaverage_pytest.txt
+          if grep -Eq "[0-9]+ skipped" /tmp/fsaverage_pytest.txt; then
+            echo "::error::fsaverage-marked tests were skipped — the prefetch or the fixture failed silently"
+            exit 1
+          fi
+          grep -Eq "[0-9]+ passed" /tmp/fsaverage_pytest.txt
+
+      - name: Full-chain e2e (synthetic hbn_langer)
+        run: pytest -m chain_e2e -q --no-cov -p no:cacheprovider
+
+      - name: No-silent-except gate (explicit, with the scan report)
+        run: pytest tests/unit/test_no_silent_continue.py -q --no-cov -p no:cacheprovider -rA -s
