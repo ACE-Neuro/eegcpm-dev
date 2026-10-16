@@ -278,8 +278,14 @@ class RunProcessor:
 
             # Create modular pipeline
             pipeline = PreprocessingPipeline(spec.pipeline_steps(), output_dir=output_dir)
-            # P1-F7: the workflow row carries the resolved-config hash of the
-            # pipeline that actually ran (same value as the JSON sidecar).
+            # P1-F7/R3: the workflow row carries the resolved-config hash of the
+            # pipeline that actually ran (same value as the JSON sidecar). This
+            # entry point always (re)processes the run — there is no
+            # COMPLETED/EXCLUDED skip here (the output directory is cleared
+            # above), so a stale result from a different config can never be
+            # resumed; the recorded hash is what lets `cli/preprocess.py`'s
+            # resume check detect the mismatch and reprocess instead of
+            # skipping (ASR scoped audit R3, 2026-10-16).
             if self.state_manager:
                 workflow.config_hash = resolved_config_hash(pipeline)
             preproc_result = pipeline.process(

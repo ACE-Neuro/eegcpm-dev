@@ -20,9 +20,10 @@ of P2 condition 4; the real-data half is Checkpoint B (plan §B8 task 3).
 Assertions (measured values from the 2026-10-16 probe / test run):
 
 1. **chain + epoching sanity** — every chain step ``ok``/``noop`` (the fixture's
-   ASR ``repaired_fraction`` is 0.72 — the documented B7-N2 distortion is still
-   present, see the ⛔ ASR high-pass decision, plan §12.6), the ``stim`` event
-   samples unchanged, all 74 epochs kept (no ``BAD_*`` annotation rejects them);
+   ASR ``repaired_fraction`` is 0.404 with the EEGLAB-standard input high-pass
+   — 0.719 before the plan §12.6 decision, implemented 2026-10-16), the ``stim``
+   event samples unchanged, all 74 epochs kept (no ``BAD_*`` annotation rejects
+   them);
 2. **source recovery** — the target ROI's N1 is **negative** and its latency is
    within one sample of the injected 0.100 s (measured −8.28 at 0.100 s), the ROI
    time course correlates with ``w`` (measured r = 0.964; a shifted-template
@@ -36,9 +37,10 @@ Assertions (measured values from the 2026-10-16 probe / test run):
    the source stage wrote;
 4. **amplitude retention (Opus B7 carry)** — the *projection gain* of the
    chain-output evoked onto ``w``, normalised by the **expected average-reference
-   factor** (measured 0.966; see :class:`TestAmplitudeRetention`). The B7 e2e
-   measured the same quantity on its anterior-injection fixture (0.516 measured /
-   0.541 expected = 0.954) and the audit required the amplitude half of the
+   factor** (measured 0.949 after the §12.6 EEGLAB-standard ASR path; 0.966
+   before it — see :class:`TestAmplitudeRetention`). The B7 e2e measured the
+   same quantity on its anterior-injection fixture (0.516 measured / 0.541
+   expected = 0.954) and the audit required the amplitude half of the
    ERP-retention statement, not only the waveform correlation.
 
 Notes on the deliberate interface choices:
@@ -495,18 +497,19 @@ class TestAmplitudeRetention:
     ``1 − mean(p)²/mean(p²)``.
 
     Documented values (this fixture, measured 2026-10-16; probe
-    ``/tmp/opencode/b8_probe1.py``):
+    ``/tmp/opencode/b8_probe1.py``; re-measured after the plan §12.6
+    EEGLAB-standard ASR path landed):
 
     - expected average-reference factor ``arf = 0.9952`` — the midline dipole
       pattern is spatially balanced (``mean(p) = −0.32 µV`` vs ``rms(p) =
       4.62 µV``), so the reference correction is small *for this pattern* (it
-      moves the number by 0.4 %: 0.970 un-normalised → 0.966 normalised); the
+      moves the number by ~1 %: 0.960 un-normalised → 0.949 normalised); the
       per-channel factor is still used, and it matters most near the pattern
       null, where the floor excludes the noisiest channels. The B7 mask fixture
       is where the factor is material (0.541);
-    - normalised retention **0.966** (median), aggregate 0.994, un-normalised
-      0.970, chain-input control **0.987** (the injection is intact, so the
-      3.4 % loss is the chain's);
+    - normalised retention **0.949** (median; 0.966 before §12.6), aggregate
+      0.951, un-normalised 0.960, chain-input control **0.987** (the injection
+      is intact, so the ~5 % loss is the chain's);
     - band ``[RETENTION_LO, RETENTION_HI] = [0.7, 1.3]``: fails if the chain loses
       more than 30 % of the injected amplitude or *amplifies* it by more than
       30 %. A chain that ASR-destroys the ERP — the audited failure mode — falls

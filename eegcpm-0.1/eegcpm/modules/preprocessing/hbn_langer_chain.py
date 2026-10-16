@@ -20,11 +20,23 @@ Steps (in order):
      the budget; B4-D2 blink-aware log-kurtosis + relative near-flat floor)
   5. interpolate (spherical_spline; max 11/109)
   6. eog_regression (9 EOG channels; regressors band-passed by step 3)
-  7. asr (eegprep; cutoff_sd=20; window_criterion=0.25 = REJECTION
-     FRACTION not window length, per ENG-010; fixed first-60-s
-     calibration; full-length repair with BAD_asr_window marks and
-     burden metadata — never cuts samples, keeps no state in the MNE
-     ``info`` 'temp' field)
+  7. asr (eegprep; EEGLAB-standard input high-pass ``clean_drifts(0.25, 0.75)``
+     before ASR, no add-back — the write-back is the high-passed repaired data
+     and ``info['highpass']`` is updated to 0.75 Hz; the ASR pseudo-inverse
+     runs under the MATLAB-equivalent tolerance (R1 — the actual fix for the
+     real-data blow-ups);
+     ``max_dims=0.66``; cutoff_sd=20 = the EEGLAB *conservative* setting
+     (aggressive 3, default 5, GUI default 20; Chang et al. 2019 optimal 20-30),
+     window_criterion=0.25 = REJECTION FRACTION not window length, per ENG-010;
+     fixed first-60-s calibration; full-length repair with BAD_asr_window marks
+     and burden metadata — never cuts samples, keeps no state in the MNE
+     ``info`` 'temp' field). Plan §12.6 decision (2026-10-16; justification
+     corrected by the ASR scoped audit R2): the drift high-pass exists for
+     **EEGLAB-standard input + lower repair burden** (``repaired_fraction``
+     0.762 → 0.481 on the e2e fixture), **not** as blow-up prevention — the
+     blow-up fix is the pinv tolerance (R1). Per-dataset tuning of these ASR
+     parameters goes through
+     ``PreprocessingSpec.chain_params`` (``HbnLangerParams``).
   8. block_rejection (max_rejected_fraction=0.20, S12 reconciled)
   9. reference (average over 109 scalp; Cz INCLUDED via eeg typing;
      post-ref Cz variance > 0 enforced by the step; RECOVERED column)
@@ -45,7 +57,7 @@ passed explicitly via ``exempt=`` from the channel_roles metadata).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -76,7 +88,12 @@ HBN_LANGER_SPEC_DEVIATIONS: List[str] = [
 BLOCK_REJECTION_PTP_THRESHOLD: float = 100e-6   # 100 µV
 
 
-def build_hbn_langer_chain() -> List[Any]:
+def build_hbn_langer_chain(
+    asr_cutoff: float = 20.0,
+    asr_drift_transition_hz: Optional[Tuple[float, float]] = (0.25, 0.75),
+    asr_max_dims: float = 0.66,
+    asr_calibration: str = "fixed_first_60s",
+) -> List[Any]:
     """Build the canonical HBN-Langer preprocessing chain.
 
     Returns the ordered list of ProcessingStep instances. The
@@ -85,8 +102,41 @@ def build_hbn_langer_chain() -> List[Any]:
 
     9 steps — ``RobustPCAStep`` is deliberately absent (P1-F2 spec
     deviation, see the module docstring and ``HBN_LANGER_SPEC_DEVIATIONS``).
+
+    Parameters
+    ----------
+    asr_cutoff : float
+        ASR cutoff (EEGLAB: aggressive 3, default 5, conservative 20).
+        Default 20 = the conservative/GUI-default setting.
+    asr_drift_transition_hz : (float, float) or None
+        Transition band of the EEGLAB-standard ``clean_drifts`` high-pass
+        applied to the ASR input (default ``(0.25, 0.75)`` — EEGLAB's own
+        ``clean_artifacts`` band). ``None`` disables it (non-EEGLAB regime;
+        the step warns).
+    asr_max_dims : float
+        Maximum fraction of dimensions ASR may reconstruct (default 0.66).
+    asr_calibration : {'fixed_first_60s', 'data_driven'}
+        ``'fixed_first_60s'`` (default): the canonical HBN-Langer
+        calibration. ``'data_driven'``: EEGLAB's automatic clean-window
+        calibration (eegprep selects the calibration data itself) — the
+        built-in per-recording adaptivity, opt-in per dataset via
+        ``PreprocessingSpec.chain_params``.
+
+    The keyword names are exactly the ``HbnLangerParams`` fields, so
+    ``build_hbn_langer_chain(**spec.chain_params.model_dump())`` is the
+    per-dataset tuning path (plan §12.6).
+
+    Returns a :class:`~eegcpm.modules.preprocessing.pipeline_builder
+    .ResolvedChainSteps`: the step list carries ``HBN_LANGER_SPEC_DEVIATIONS``
+    so every construction path — the chain name, the spec's
+    ``pipeline_steps()`` and a direct call — resolves to the same config (and
+    hash).
     """
-    return [
+    # Lazy import: ``pipeline_builder`` is the consumer and imports this module
+    # lazily in turn, so a module-level import here would risk a cycle.
+    from eegcpm.modules.preprocessing.pipeline_builder import ResolvedChainSteps
+
+    return ResolvedChainSteps([
         ChannelRolesStep(),
         ZaplineStep(fline=60.0, nremove=None, nfft=8192),
         # Filter is 0.1-45 Hz FIR (per A-RT24; NOT 40 Hz from code.md) over
@@ -104,12 +154,17 @@ def build_hbn_langer_chain() -> List[Any]:
         _BadChannelDetectorWrapper(threshold_sd=3.0, exclude_cz=True),
         InterpolateBadChannelsStep(max_bad_percent=11/109*100),
         EOGRegressionStep(),
-        # ASR via eegprep; cutoff_sd=20; window_criterion=0.25 is
-        # the REJECTION FRACTION, NOT a window length (per ENG-010).
+        # ASR via eegprep; cutoff_sd=20 (EEGLAB *conservative*; aggressive 3,
+        # default 5, GUI default 20); window_criterion=0.25 is the REJECTION
+        # FRACTION, NOT a window length (per ENG-010). The ASR input is
+        # high-passed with clean_drifts (EEGLAB-standard, plan §12.6) and the
+        # write-back is the high-passed repaired data (no add-back).
         # retain_burst_masks=True so the ASR-burden covariate is
         # computable downstream.
-        _ASRStepWrapper(cutoff=20.0, window_criterion=0.25,
-                          calibration_window="fixed_first_60s",
+        _ASRStepWrapper(cutoff=asr_cutoff, window_criterion=0.25,
+                          calibration_window=asr_calibration,
+                          drift_transition_hz=asr_drift_transition_hz,
+                          max_dims=asr_max_dims,
                           retain_burst_masks=True),
         # Block rejection: max_rejected_fraction 0.20 (S12 reconciled
         # with safety.md EC≥160/200).
@@ -121,7 +176,7 @@ def build_hbn_langer_chain() -> List[Any]:
         # RECOVERED column downstream.
         ReferenceStep(type="average", projection=False,
                       check_reference_channel_variance="Cz"),
-    ]
+    ], HBN_LANGER_SPEC_DEVIATIONS)
 
 
 # --- Wrappers around existing steps to pin the spec parameters ---
@@ -249,17 +304,22 @@ class _BadChannelDetectorWrapper(_PS):
 
 class _ASRStepWrapper(_PS):
     name = "asr"
-    version = "2.3"  # 2.3: F3 (final-verification-audit fix round) — the
-    # effective window_tolerances + ASR_OUTPUT_BLOWUP_FACTOR are read from
-    # ``steps.asr`` at call time and exposed in get_config (golden hash);
-    # 2.2: B7 rev2 fix 7 (re-interpolate the ASR-excluded
-    # interpolated channels) + B7-N2 output blow-up guard;
-    # 2.1: B6 rev2 NEW-4 (method/train_duration/
+    version = "2.5"  # 2.5: ASR scoped-audit R1 (MATLAB-equivalent pinv
+    # tolerance, exposed in get_config -> golden hash); 2.4: plan §12.6
+    # (2026-10-16) — EEGLAB-standard ASR: clean_drifts(drift_transition_hz) on
+    # the ASR input, max_dims forwarded, data_driven calibration_window
+    # accepted; 2.3: F3 (final-verification-audit fix round) — the effective
+    # window_tolerances + ASR_OUTPUT_BLOWUP_FACTOR are read from ``steps.asr``
+    # at call time and exposed in get_config (golden hash); 2.2: B7 rev2 fix 7
+    # (re-interpolate the ASR-excluded interpolated channels) + B7-N2 output
+    # blow-up guard; 2.1: B6 rev2 NEW-4 (method/train_duration/
     # ref_maxbadchannels exposed in get_config -> golden hash)
 
     def __init__(self, cutoff: float = 20.0,
                  window_criterion: float = 0.25,
                  calibration_window: str = "fixed_first_60s",
+                 drift_transition_hz: Optional[Tuple[float, float]] = (0.25, 0.75),
+                 max_dims: float = 0.66,
                  retain_burst_masks: bool = True,
                  enabled: bool = True):
         super().__init__(enabled=enabled)
@@ -267,13 +327,22 @@ class _ASRStepWrapper(_PS):
         # window_criterion is a REJECTION FRACTION [0, 1] — NOT a
         # window length. Per ENG-010: code.md misread it.
         self.window_criterion = window_criterion
-        if calibration_window != "fixed_first_60s":
+        if calibration_window not in ("fixed_first_60s", "data_driven"):
             raise ValueError(
                 "_ASRStepWrapper implements calibration_window="
-                f"'fixed_first_60s' only (got {calibration_window!r}); use "
-                "ASRStep(calibration=...) for other calibrations"
+                f"'fixed_first_60s' or 'data_driven' (got {calibration_window!r})"
             )
         self.calibration_window = calibration_window
+        # Plan §12.6: the EEGLAB-standard input high-pass and the maximum
+        # reconstructed dimensionality are part of the chain's resolved config.
+        # Validation (None/'off'/pair, 0 < max_dims <= 1) is delegated to
+        # ASRStep's constructor checks via a throwaway instance, so the two
+        # layers cannot disagree.
+        from .steps.asr import ASRStep
+        probe = ASRStep(drift_transition_hz=drift_transition_hz,
+                        max_dims=max_dims)
+        self.drift_transition_hz = probe.drift_transition_hz
+        self.max_dims = probe.max_dims
         self.retain_burst_masks = retain_burst_masks
         # NEW-4 (B6 rev2): the delegated ASRStep constants are pinned here so
         # `get_config()` (and the golden resolved hash) covers them.
@@ -286,16 +355,18 @@ class _ASRStepWrapper(_PS):
         ASRStep(method=self.method).check_dependencies()
 
     def validate_inputs(self, raw) -> bool:
-        """Delegate the fixed-first-60 s minimum-length check (B3-K1).
+        """Delegate the calibration minimum-length check (B3-K1).
 
         The base implementation returns True, so without this override the
         golden chain silently capped a short recording's calibration to its
-        length instead of failing the run.
+        length instead of failing the run. The fixed-first-60 s calibration
+        needs ``train_duration`` seconds; the data-driven calibration selects
+        its own window and has no fixed minimum.
         """
         from .steps.asr import ASRStep
         return ASRStep(
             method=self.method,
-            calibration="fixed_first_60s",
+            calibration=self.calibration_window,
             train_duration=self.train_duration,
         ).validate_inputs(raw)
 
@@ -315,8 +386,11 @@ class _ASRStepWrapper(_PS):
             method=self.method,
             window_criterion=self.window_criterion,
             window_tolerances=asr_module.ASR_WINDOW_TOLERANCES,
-            calibration="fixed_first_60s",
+            calibration=self.calibration_window,
             train_duration=self.train_duration,
+            # Plan §12.6: EEGLAB-standard input high-pass + max_dims.
+            drift_transition_hz=self.drift_transition_hz,
+            max_dims=self.max_dims,
         )
         out_raw, step_meta = step.process(raw, metadata)
         return out_raw, {**step_meta,
@@ -331,7 +405,10 @@ class _ASRStepWrapper(_PS):
         first ``train_duration`` seconds of the data (passed as an ndarray to
         ``clean_asr(ref_maxbadchannels=...)``) and ``ref_tolerances`` is not
         passed at all (eegprep default). Reporting the data-driven constants
-        here claimed a calibration the canonical chain never runs.
+        here claimed a calibration the canonical chain never runs. With
+        ``calibration_window='data_driven'`` (plan §12.6 per-dataset option) the
+        reported calibration fields switch to the data-driven constants the
+        step actually passes.
 
         F3 (final-verification-audit fix round): the remaining numerics that
         live in ``steps/asr.py`` — ``ASR_WINDOW_TOLERANCES`` (the
@@ -340,6 +417,17 @@ class _ASRStepWrapper(_PS):
         from the module **at call time** and included, so a change to either
         changes the resolved-config hash (see the sensitivity test in
         ``test_config_hash.py``).
+
+        R1 (ASR scoped audit, 2026-10-16): ``PINV_TOLERANCE_SPEC`` — the
+        MATLAB-equivalent pseudo-inverse tolerance ``clean_asr`` runs under
+        (it changes the repaired data) — is read from the module at call time
+        and included for the same reason.
+
+        Plan §12.6 (2026-10-16): ``drift_transition_hz`` (the EEGLAB-standard
+        ``clean_drifts`` high-pass applied to the ASR input; ``None`` = the
+        non-EEGLAB regime) and ``max_dims`` are part of the resolved config —
+        changing either changes the golden hash, so a per-dataset
+        ``chain_params`` override is visible in provenance.
         """
         from .steps import asr as asr_module
 
@@ -355,10 +443,31 @@ class _ASRStepWrapper(_PS):
             "retain_burst_masks": self.retain_burst_masks,
             "method": self.method,
             "train_duration": self.train_duration,
-            "calibration_reference": "first_train_duration_s_of_data",
-            "ref_maxbadchannels": "calibration_array",
-            "ref_tolerances": "eegprep_default",
+            # Plan §12.6: EEGLAB-standard ASR input high-pass + dimensionality.
+            "drift_transition_hz": (
+                None if self.drift_transition_hz is None
+                else [float(t) for t in self.drift_transition_hz]
+            ),
+            "max_dims": float(self.max_dims),
+            # R1 (ASR scoped audit): the eegprep ASR pseudo-inverse runs under
+            # the MATLAB-equivalent tolerance (it changes the repaired data).
+            "pinv_tolerance": asr_module.PINV_TOLERANCE_SPEC,
         })
+        if self.calibration_window == "fixed_first_60s":
+            config.update({
+                "calibration_reference": "first_train_duration_s_of_data",
+                "ref_maxbadchannels": "calibration_array",
+                "ref_tolerances": "eegprep_default",
+            })
+        else:
+            config.update({
+                "calibration_reference": "eegprep_clean_windows_selection",
+                "ref_maxbadchannels": float(
+                    asr_module.DATA_DRIVEN_REF_MAXBADCHANNELS),
+                "ref_tolerances": [
+                    float(t) for t in asr_module.DATA_DRIVEN_REF_TOLERANCES
+                ],
+            })
         return config
 
 

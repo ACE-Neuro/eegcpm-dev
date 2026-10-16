@@ -988,23 +988,104 @@ renaming hard-coded ROI names; REST API; user management; `_legacy` code (exclud
    (3) relative near-flat floor; no chain reordering (detector stays step 4; EOG regression / ICA
    keep handling ocular removal downstream). Validate on pilot5 × 3 tasks and the user's other
    dataset; target: clean recordings within budget.
-6. **ASR high-pass design (B7-N2, Opus B7 final audit 2026-10-16 — ⛔ open user decision, blocks
-   B8; recorded, deliberately NOT implemented in B7 rev2):** `eegprep.clean_asr` at `cutoff=20` on
-   the chain's 0.1-Hz-high-passed data rewrites most of a *clean* recording — measured evidence:
-   `repaired_fraction = 0.762` on the e2e fixture (audit 0.76; 0.63 after the rev2
-   ERP-topography fixture change), **94 % of <0.5 Hz power and 52 % of 0.5–2 Hz power removed**
-   (audit probe), and a blow-up regime (2.6e16–5.7e16 µV output with moderate spatial mixing;
-   calibration covariance condition number 9e4–1.4e6 — a separate 32-channel near-duplicate probe
-   returned 4.6e15 µV at condition number 2.2e8). B7 rev2 adds the loud guard
-   (`asr_output_magnitude_blowup`, `ASRStep` fails before any write-back; blow-ups can no longer
-   be misattributed to the block-rejection gate) and the `repaired_fraction`/ERP-retention bounds,
-   but does not change the numerics. Options:
-   (i) compute the ASR correction on a **≥0.5–1 Hz high-passed copy** of the data and add the
-   correction to the 0.1-Hz data (keeps the 0.1 Hz chain and downstream results; isolates the ASR
-   calibration/correction from slow drift and the high-pass phase);
-   (ii) move to a **1 Hz chain variant** (changes the chain composition, the golden hash and every
-   downstream result — needs a full re-validation);
-   (iii) **keep as-is** with the guard + the documented distortion (status quo of B7 rev2).
-   The choice changes what the B8 Checkpoint-B real-data verification validates, so B8 must not
-   proceed until the user picks one. Probes: `/tmp/opencode/b7rev2_probe{1,4,6}.py`; evidence in
-   `planning/VERIFICATION_TODO.md` (B7 rev2 section).
+6. **ASR high-pass design (B7-N2, Opus B7 final audit 2026-10-16):** ✅ **RESOLVED 2026-10-16
+   (user): option (iv) — the EEGLAB-standard path.** `eegprep.clean_asr` requires zero-mean /
+   high-passed input (its docstring: *"assumed to be zero mean, e.g., appropriately high-passed
+   (e.g. >0.5Hz or with a 0.5Hz - 1.0Hz transition band)"*) and EEGLAB's own `clean_artifacts`
+   applies `clean_drifts(EEG, (0.25, 0.75))` internally before ASR and keeps the high-passed
+   output (verified in the installed eegprep source, `plugins/clean_rawdata/clean_artifacts.py`).
+   Running ASR on the chain's 0.1-Hz data instead rewrote most of a *clean* recording
+   (`repaired_fraction = 0.762` on the e2e fixture; 94 % of <0.5 Hz + 52 % of 0.5–2 Hz power
+   removed) and blew up on the real pilot recording (`sub-NDARAC853CR6` RestingState, max ratio
+   8.85e13 at cutoff 20 — the probe of the EEGLAB-standard path is clean, max ratio 0.31,
+   matching the `clean_artifacts` variant C of `/tmp/opencode/asr_design_probe.py` at 0.35).
+
+   **Decision (implemented 2026-10-16, plan §B7-N2 follow-up):**
+   - the ASR **input** is high-passed with `eegprep.clean_drifts(eeg, (0.25, 0.75))` (EEGLAB's own
+     transition band) before the calibration reference is extracted; the **write-back is the
+     high-passed repaired data — no add-back**, exactly EEGLAB's `clean_artifacts` behaviour;
+   - `drift_transition_hz=None`/`'off'` skips the filter (the non-EEGLAB regime the B7-N2 guard
+     exists for): the run emits a `RuntimeWarning` and the metadata records
+     `drift_filter_applied: False`;
+   - `max_dims` (default 0.66, eegprep/EEGLAB default) is a step/wrapper/config parameter;
+   - **cutoff semantics corrected:** 20 is EEGLAB's *conservative* setting (aggressive 3,
+     default 5, conservative 20; GUI default 20; Chang et al. 2019 optimal 20–30) — the earlier
+     "aggressive 20" wording was wrong and is fixed in the code docstrings;
+   - **per-dataset configurability:** `PreprocessingSpec.chain_params` (`HbnLangerParams`,
+     `extra='forbid'`) exposes `asr_cutoff`, `asr_drift_transition_hz`, `asr_max_dims` and
+     `asr_calibration` (`'fixed_first_60s'` default = canonical; `'data_driven'` = EEGLAB's
+     automatic clean-window calibration, the built-in per-recording adaptivity), forwarded by
+     `build_hbn_langer_chain(**params)`; `pipeline_steps()` builds the chain with them and
+     `chain_params` next to an explicit step list is rejected. Per-subject adaptivity can be
+     layered later; the applied values are recorded in the resolved config, the sidecar and the
+     ASR step metadata;
+   - the B7-N2 guard, the B7-N1 interpolated-channel exclusion and the re-interpolation stay.
+     **Corrected 2026-10-16 (ASR scoped audit R2):** the high-pass did *not* fix the real-data
+     blow-ups — 4 of 6 pilot5 recordings that reach ASR still failed under this path, and the
+     fix is the MATLAB-equivalent pinv tolerance (R1 below). Re-probed: the exactly-singular
+     interpolated-channel case is still caught with the filter on and off;
+   - re-measured e2e bounds: clean-fixture `repaired_fraction` 0.481 (< 0.65 bound; separate
+     `drift_filter_modified_fraction` 0.355), ERP retention 0.866 (anterior fixture) / 0.949 (B8
+     dipole fixture); golden resolved hash re-pinned
+     `b47de382…` → `b07bfe39930a4525ef48d0d2ca053df2144bbd396e95388adcaf963edf82fb8f`.
+
+   Original options recorded for the audit trail: (i) ASR on a ≥0.5–1 Hz high-passed copy added
+   back to the 0.1 Hz data; (ii) a 1 Hz chain variant; (iii) keep as-is with the guard. Option
+   (iv) is the EEGLAB-standard path, chosen because it is the vendor-supported behaviour (no
+   custom add-back math, no new chain variant) and the single-recording pilot probe was clean
+   (the full pilot5 re-run later showed this alone did **not** fix the blow-ups — see R1 below).
+   Probes: `/tmp/opencode/b7rev2_probe{1,4,6}.py`,
+   `/tmp/opencode/p1_chain_asr_realdata_probe.py`; evidence in `planning/VERIFICATION_TODO.md`
+   (§12.6 section).
+
+**ASR scoped-audit fixes R1–R6 (2026-10-16, same uncommitted tree; task list from the §12.6
+scoped audit).** The re-audit found the drift filter correct but insufficient: running the full
+chain on pilot5, **4 of 6 recordings that reach ASR failed** with
+`asr_output_magnitude_blowup` *under the EEGLAB-standard path*. Root cause (auditor,
+reproduced): eegprep 0.4.0 calls `np.linalg.pinv` with numpy's default `rcond=1e-15` at
+`plugins/clean_rawdata/asr_process.py:214` (via `finite_pinv(Q)`), while MATLAB's `pinv` uses
+the absolute tolerance `max(size(A)) * eps(norm(A))` (≈2.2e-14 for ~100 channels).
+
+- **R1 (critical) — pinv tolerance, scoped + provenance.** `ASRStep` runs `clean_asr` under a
+  temporary, source-verified patch of that call site with the MATLAB tolerance (the module
+  global `finite_pinv` in `eegprep.plugins.clean_rawdata.asr_process`, restored in `finally`);
+  `pinv_tolerance: 'matlab_max_size_eps(norm)'` is recorded in the step metadata and in both
+  `get_config` implementations (so the golden hash covers it). The patch is version-guarded:
+  if the installed eegprep does not expose the expected call site, the step raises
+  `eegprep_pinv_assumption_broken` instead of silently reverting to the default tolerance.
+  Deterministic 32-channel reproducer (calibration covariance condition number ~1.2e4 + a 10 Hz
+  common sinusoid): default pinv → `asr_output_magnitude_blowup`; MATLAB tolerance → clean
+  (ratio ~1). **Pilot5 re-run (RestingState + DespicableMe, full chain to ASR): all 6
+  recordings that reach ASR process cleanly (ratios 0.28–1.27); before the fix 4/6 failed at
+  ratios 4.3e12–6.9e13** (the other 4 of the 10 recordings are excluded earlier by the
+  bad-channel detector, unchanged). Upstream bug-report **draft** (not filed; user-gated):
+  `planning/audits/eegprep-pinv-bug-report-draft.md`.
+- **R2 (docs) — overclaim corrected.** The drift filter's justification is **EEGLAB-standard
+  input + lower repair burden** (`repaired_fraction` 0.762 → 0.481 on the e2e fixture), not
+  blow-up prevention; the "near-singular blow-up regime is tamed by the high-pass" claims are
+  removed from the plan, the code docstrings, the changelog and `VERIFICATION_TODO.md`.
+- **R3 (resume) — config-hash comparison.** `cli/preprocess.py` only skips a
+  COMPLETED/EXCLUDED run when the stored `config_hash` equals
+  `resolved_config_hash(current pipeline)`; a mismatch **reprocesses** (loud console message) —
+  a changed `chain_params`/step parameter can no longer be silently skipped. `run_processor`
+  has no COMPLETED/EXCLUDED skip path (verified: it clears outputs and reprocesses
+  unconditionally); the hash semantics are documented there.
+- **R4 (truthful `info['highpass']`).** When the drift filter runs, `info['highpass']` is set to
+  the transition band's passband edge (0.75 Hz for the default band) inside `info._unlock()` —
+  the convention MNE's own `filter` uses — so the FIF describes the high-passed data it holds;
+  the full band stays in the metadata (`drift_transition_hz`, `info_highpass_hz`). Measured
+  attenuation of the filter on ERP components (design probe): **N1 0.995, P2 0.978, P3 0.889,
+  LPP 0.573; an 0.8-s ramp is attenuated to 0.49 with its peak shifted 196 ms.** An add-back
+  option for slow-ERP datasets is a **recorded follow-up, not implemented**.
+- **R5 (test honesty).** The chain-e2e `repaired_fraction < 0.65` bound is documented as a
+  **regression tripwire**, not a fidelity measure (the fixture spectrum is too red for the
+  repair fraction to say anything about ERP distortion); the ERP-retention assertion remains
+  the fidelity measure.
+- **R6 (bounds).** `HbnLangerParams.asr_cutoff` is bounded to **[1, 200]**;
+  `asr_drift_transition_hz` must satisfy `0 < low < high <= 5` Hz at schema level, and the
+  upper edge must stay below the recording's Nyquist frequency — checked at runtime in
+  `ASRStep` (`validate_inputs` and the eegprep path). `asr_max_dims` was already bounded.
+
+**Golden resolved hash re-pinned `b07bfe39…` → `a216dc00…`** (R1 `pinv_tolerance` in both
+`get_config`s + `ASRStep` 2.2 → 2.3 / wrapper 2.4 → 2.5; R6 bounds are schema-level and do not
+change the resolved config). Evidence table: `planning/VERIFICATION_TODO.md` (§ASR R1–R6).

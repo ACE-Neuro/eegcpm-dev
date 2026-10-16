@@ -19,18 +19,25 @@ The second variant contaminates 30 % of the 2-s blocks with an in-band
 high-amplitude oscillation: the block-rejection gate must **exclude** the
 recording (sidecar ``*_preprocessing_EXCLUDED.json``, no FIF).
 
-**Fidelity assertions (B7 rev2 fix 1b).** The clean fixture's ASR burden is
-bounded (``repaired_fraction < 0.85``; measured 0.762 with this fixture — the
-audit measured 0.76) and a second run of the same fixture with the ERP injected
-on the **anterior EEG subset** (``erp_mode='anterior'``) asserts the injected
-N1/P2 template is still measurable in the chain output (median per-channel
-evoked↔template correlation ≥ 0.5; measured 0.88). The subset injection exists
-because the base fixture's ERP is *common* to all channels and the chain's
-average-reference step cancels a common-mode ERP exactly (measured r = −0.98 on
-``Cz``): with the common injection the retention measure would be vacuous
-(0.07), not a statement about ASR. Both bounds are recorded in
-``VERIFICATION_TODO.md``; they tighten after the ASR high-pass design decision
-(plan §12.6), which is recorded but deliberately not implemented in B7.
+**Fidelity assertions (B7 rev2 fix 1b; re-measured after §12.6).** The clean
+fixture's ASR burden is bounded (``repaired_fraction < 0.65``; measured
+**0.481** with the EEGLAB-standard path — it was 0.762 on the pre-§12.6
+non-high-passed input, and the separate ``drift_filter_modified_fraction`` is
+0.355, i.e. most of the old "repair" was the low-frequency content the
+EEGLAB high-pass now removes deliberately). **The burden bound is a regression
+tripwire, not a fidelity measure** (ASR scoped audit R5, 2026-10-16): this
+fixture's 1/f spectrum is far redder than real EEG, so how much of it ASR
+rewrites says nothing about how much *ERP* ASR distorts — the bound exists to
+catch a regression that returns to rewriting most of a clean recording. A
+second run of the same fixture
+with the ERP injected on the **anterior EEG subset** (``erp_mode='anterior'``)
+asserts the injected N1/P2 template is still measurable in the chain output
+(median per-channel evoked↔template correlation ≥ 0.5; measured 0.866). The
+subset injection exists because the base fixture's ERP is *common* to all
+channels and the chain's average-reference step cancels a common-mode ERP
+exactly (measured r = −0.98 on ``Cz``): with the common injection the retention
+measure would be vacuous (0.07), not a statement about ASR. Both bounds are
+recorded in ``VERIFICATION_TODO.md``.
 
 Marked ``chain_e2e`` + ``slow``; the CI workflow runs ``pytest -m chain_e2e``.
 """
@@ -103,9 +110,12 @@ def make_gsn129_recording(
       contaminated — which is the realistic "30 % contaminated blocks" case.
       **An interpolated channel makes the ASR calibration covariance exactly
       singular** (spherical-spline interpolation is an exact linear combination
-      of the remaining channels) and ``eegprep.clean_asr`` then returns
-      ~1e15 µV; ``ASRStep`` excludes the channels a previous ``interpolate``
-      step reconstructed (B7-N1), which this fixture exercises.
+      of the remaining channels), which fails loudly in ``ASRStep``
+      (``asr_calibration_covariance_degenerate``; re-probed 2026-10-16 with the
+      §12.6 drift high-pass on and off — the rank deficiency is a property of
+      the interpolation, not the input high-pass); ``ASRStep`` excludes the
+      channels a previous ``interpolate`` step reconstructed (B7-N1), which
+      this fixture exercises.
     - ``erp_mode='anterior'`` injects the same N1/P2 template on the anterior
       EEG subset only (montage y ≥ median, EOG excluded). The default
       ``'common'`` injection puts the identical template on every channel; the
@@ -402,6 +412,10 @@ class TestHbnChainE2E:
         )
         assert asr_cfg["params"]["calibration_window"] == "fixed_first_60s"
         assert asr_cfg["params"]["train_duration"] == 60.0
+        # §12.6: the resolved config states the EEGLAB-standard input
+        # high-pass and max_dims the chain actually ran.
+        assert asr_cfg["params"]["drift_transition_hz"] == [0.25, 0.75]
+        assert asr_cfg["params"]["max_dims"] == 0.66
 
     def test_cz_variance_non_zero_after_reference(self, base_run):
         out = base_run["result"].outputs["data"]
@@ -414,23 +428,36 @@ class TestHbnChainE2E:
         assert block_meta["rejected_fraction"] == 0.0
 
     def test_clean_fixture_asr_burden_bound(self, base_run):
-        """B7 rev2 fix 1b: bound on the clean fixture's ASR repair burden.
+        """Bound on the clean fixture's ASR repair burden (B7 rev2 fix 1b, §12.6).
 
-        The audit measured ``repaired_fraction = 0.76`` on this fixture and
-        probed 94 %/<0.5 Hz + 52 %/0.5-2 Hz power removed — ``eegprep.clean_asr``
-        at cutoff 20 on 0.1-Hz-high-passed data rewrites most of a *clean*
-        recording. Measured here: **0.762**. The bound is deliberately loose
-        (>0 is already true) but non-vacuous: it fails if the distortion grows
-        past 85 % of the recording. It tightens after the recorded ASR
-        high-pass design decision (plan §12.6) — do not raise it without that
-        decision.
+        Pre-§12.6 (ASR on the chain's 0.1-Hz data) the audit measured
+        ``repaired_fraction = 0.76`` and probed 94 %/<0.5 Hz + 52 %/0.5-2 Hz
+        power removed: ``clean_asr`` at cutoff 20 rewrote most of a *clean*
+        recording. The chain now runs the EEGLAB-standard path
+        (``clean_drifts(0.25, 0.75)`` before ASR, no add-back), measured here:
+        ``repaired_fraction = 0.481`` with ``drift_filter_modified_fraction =
+        0.355`` — i.e. ASR rewrites less, and a large part of the old number
+        was the low-frequency content the high-pass now removes deliberately.
+
+        **Regression tripwire, not a fidelity measure** (ASR scoped audit R5,
+        2026-10-16): the fixture's 1/f spectrum is far redder than real EEG, so
+        this fraction says nothing about ERP distortion (the retention test
+        below covers that). The bound is deliberately loose but non-vacuous: it
+        fails if the distortion grows past 65 % of the recording. Do not raise
+        it without a recorded decision.
         """
-        repaired = base_run["result"].metadata["asr"]["repaired_fraction"]
+        asr_meta = base_run["result"].metadata["asr"]
+        repaired = asr_meta["repaired_fraction"]
         assert repaired > 0.0, "ASR repaired nothing at all — fixture or step changed"
-        assert repaired < 0.85, (
+        assert repaired < 0.65, (
             f"ASR repaired {repaired:.3f} of a clean recording "
-            "(measured 0.762; the audit measured 0.76)"
+            "(measured 0.481 with the EEGLAB-standard path; 0.762 before §12.6)"
         )
+        # The chain runs the EEGLAB-standard path and records it.
+        assert asr_meta["drift_filter_applied"] is True
+        assert asr_meta["drift_transition_hz"] == [0.25, 0.75]
+        assert asr_meta["max_dims"] == 0.66
+        assert asr_meta["drift_filter_modified_fraction"] > 0.0
 
     def test_qc_row_reads_chain_metadata(self, base_run):
         """The recording QC row must consume the chain metadata truthfully (P1-F10)."""
@@ -618,11 +645,12 @@ class TestHbnChainE2EFidelity:
     def test_erp_retention_against_injected_template(self, erp_run):
         """Median per-channel evoked↔template correlation must stay ≥ 0.5.
 
-        Measured 2026-10-16: **0.88** on the chain output (0.62 on the raw
-        input — the chain's 0.1-45 Hz filter removes the low-frequency drift
-        that limits the input correlation, so the retention improves rather
-        than degrades). Threshold 0.5 is the audit's suggested bound; a chain
-        that ASR-destroys the ERP (or a fixture regression that makes the ERP
+        Measured 2026-10-16: **0.88** on the chain output before §12.6 and
+        **0.866** after the EEGLAB-standard ASR path (0.62 on the raw input —
+        the chain's 0.1-45 Hz filter removes the low-frequency drift that
+        limits the input correlation, so the retention improves rather than
+        degrades). Threshold 0.5 is the audit's suggested bound; a chain that
+        ASR-destroys the ERP (or a fixture regression that makes the ERP
         unmeasurable) fails loudly here.
         """
         result = erp_run["result"]

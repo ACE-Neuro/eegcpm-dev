@@ -7,7 +7,7 @@ Stage-First Architecture:
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from pydantic import (
     BaseModel,
@@ -126,6 +126,110 @@ class StepSpec(BaseModel):
         return value
 
 
+class HbnLangerParams(BaseModel):
+    """Per-dataset parameters of the code-defined ``hbn_langer`` chain.
+
+    The chain's steps and their pinned parameters live in code
+    (:func:`build_hbn_langer_chain`); this schema exposes the parameters a
+    dataset may tune without editing the chain — currently the ASR ones
+    (plan §12.6, 2026-10-16 EEGLAB-standard decision). Every field name is
+    exactly a ``build_hbn_langer_chain`` keyword, so
+    ``build_hbn_langer_chain(**params.model_dump())`` is the forwarding path.
+
+    ``extra='forbid'``: an unknown/misspelled key is a hard error, never a
+    silent no-op. The applied values are recorded in the resolved config and
+    the per-run sidecar (via the ASR step metadata), so a non-default dataset
+    is identifiable from its provenance.
+
+    Attributes
+    ----------
+    asr_cutoff : float
+        ASR cutoff in standard deviations. EEGLAB semantics: aggressive 3,
+        default 5, conservative 20 (GUI default 20; Chang et al. 2019
+        optimal 20-30). Default 20 (the chain's conservative setting).
+        Bounded to [1, 200] (R6).
+    asr_drift_transition_hz : (float, float) or None
+        Transition band (Hz) of the EEGLAB-standard ``clean_drifts``
+        high-pass applied to the ASR **input** (default ``(0.25, 0.75)``,
+        EEGLAB's own ``clean_artifacts`` band). ``clean_asr`` requires
+        high-passed input; the write-back is the high-passed repaired data
+        (no add-back) and the step updates ``info['highpass']`` to the
+        passband edge. ``None`` disables the filter (the non-EEGLAB regime;
+        the step warns). Bounds (R6): ``0 < low < high`` and ``high <= 5 Hz``
+        here; the upper edge must also stay below the recording's Nyquist
+        frequency, which :class:`ASRStep` checks at runtime.
+    asr_max_dims : float
+        Maximum fraction of dimensions ASR may reconstruct (eegprep/EEGLAB
+        default 0.66; must be in (0, 1]).
+    asr_calibration : {'fixed_first_60s', 'data_driven'}
+        ``'fixed_first_60s'`` (default): the canonical HBN-Langer
+        calibration — the first 60 s of the recording are the calibration
+        reference. ``'data_driven'``: EEGLAB's automatic clean-window
+        calibration (``clean_windows`` selects low-artifact windows
+        internally) — the built-in per-recording adaptivity, opted into per
+        dataset. The spec default stays ``fixed_first_60s``.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    asr_cutoff: float = Field(
+        default=20.0, ge=1.0, le=200.0,
+        description=(
+            "ASR cutoff (SD); EEGLAB: aggressive 3, default 5, conservative 20. "
+            "R6 (ASR scoped audit): bounded to [1, 200] — outside that range the "
+            "cutoff is not a usable EEGLAB setting"
+        ),
+    )
+    asr_drift_transition_hz: Optional[Tuple[float, float]] = Field(
+        default=(0.25, 0.75),
+        description=(
+            "Transition band (Hz) of the clean_drifts high-pass applied to the "
+            "ASR input (EEGLAB-standard); None disables it (non-EEGLAB regime)"
+        ),
+    )
+    asr_max_dims: float = Field(
+        default=0.66, gt=0.0, le=1.0,
+        description="Maximum fraction of dimensions ASR may reconstruct",
+    )
+    asr_calibration: Literal['fixed_first_60s', 'data_driven'] = Field(
+        default='fixed_first_60s',
+        description=(
+            "ASR calibration: fixed first-60-s reference (canonical) or "
+            "EEGLAB's automatic clean-window calibration (per-recording adaptivity)"
+        ),
+    )
+
+    @field_validator('asr_drift_transition_hz')
+    @classmethod
+    def _check_drift_transition(
+        cls, value: Optional[Tuple[float, float]]
+    ) -> Optional[Tuple[float, float]]:
+        """Require a strictly increasing, positive transition band below 5 Hz.
+
+        R6 (ASR scoped audit): ``0 < low < high`` (a non-increasing band is a
+        hard error, not a silent no-op) **and** ``high <= 5 Hz`` — the band is a
+        drift high-pass, and an edge above 5 Hz is not an EEGLAB transition
+        band. The upper edge must also stay below the recording's Nyquist
+        frequency; that is checked at runtime in :class:`ASRStep`
+        (``_check_drift_nyquist``), because Nyquist is a property of the data,
+        not of the schema.
+        """
+        if value is None:
+            return None
+        low, high = value
+        if not 0.0 < low < high:
+            raise ValueError(
+                "asr_drift_transition_hz must be a (low, high) pair with "
+                f"0 < low < high (Hz); got {value!r}"
+            )
+        if high > 5.0:
+            raise ValueError(
+                "asr_drift_transition_hz upper edge must be <= 5 Hz (it is a "
+                f"drift high-pass transition band); got {value!r}"
+            )
+        return (float(low), float(high))
+
+
 class PreprocessingSpec(BaseModel):
     """The single preprocessing configuration schema.
 
@@ -136,6 +240,12 @@ class PreprocessingSpec(BaseModel):
     chain — ``variant: hbn_langer`` next to an explicit step list is
     rejected (older configs relied on the variant alone, which silently
     changed meaning once the chain became code-defined).
+
+    ``chain_params`` tunes the named chain per dataset (currently the ASR
+    parameters, :class:`HbnLangerParams`). It is only meaningful with
+    ``steps: hbn_langer``; an explicit step list carries its parameters
+    per step, so ``chain_params`` next to a list is rejected instead of
+    being silently ignored.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -153,6 +263,13 @@ class PreprocessingSpec(BaseModel):
     steps: Union[Literal['hbn_langer'], conlist(StepSpec, min_length=1)] = Field(
         ..., description="Named chain or non-empty list of step specs"
     )
+    chain_params: HbnLangerParams = Field(
+        default_factory=HbnLangerParams,
+        description=(
+            "Named-chain parameters (only meaningful with steps: hbn_langer); "
+            "forwarded to build_hbn_langer_chain"
+        ),
+    )
 
     @model_validator(mode='after')
     def _validate_variant_chain_consistency(self):
@@ -161,7 +278,10 @@ class PreprocessingSpec(BaseModel):
         Only ``steps:`` selects the chain. Older configs declared
         ``variant: hbn_langer`` and were silently executed as their
         (different) explicit step list, or vice versa — that silent
-        meaning change is now a hard error.
+        meaning change is now a hard error. Likewise ``chain_params``
+        next to an explicit step list would be silently ignored, so it is
+        rejected too (``model_fields_set`` distinguishes "explicitly given"
+        from the schema default).
         """
         if self.variant == 'hbn_langer' and self.steps != 'hbn_langer':
             raise ValueError(
@@ -169,19 +289,40 @@ class PreprocessingSpec(BaseModel):
                 "(only `steps` selects the processing chain; a variant "
                 "name alone does not)"
             )
+        if 'chain_params' in self.model_fields_set and self.steps != 'hbn_langer':
+            raise ValueError(
+                "chain_params is only meaningful with steps: hbn_langer "
+                "(an explicit step list carries its parameters per step; "
+                "chain_params would be silently ignored)"
+            )
         return self
 
     def pipeline_steps(self):
         """Return the ``PreprocessingPipeline`` input for these steps.
 
+        For the named chain the steps are built here (with
+        ``chain_params`` forwarded to :func:`build_hbn_langer_chain`) and
+        returned as a :class:`ResolvedChainSteps` — a prebuilt step list that
+        also carries the chain's recorded spec deviations, so
+        ``PreprocessingPipeline(spec.pipeline_steps())`` resolves to the same
+        config (and hash) as ``PreprocessingPipeline('hbn_langer')`` for
+        default parameters.
+
         Returns
         -------
-        str or list of dict
-            ``'hbn_langer'`` for the named chain, else a list of
-            ``{'name', 'params', 'required'}`` dicts.
+        ResolvedChainSteps or list of dict
+            Prebuilt named-chain step instances (plus spec deviations), else
+            a list of ``{'name', 'params', 'required'}`` dicts.
         """
         if self.steps == 'hbn_langer':
-            return 'hbn_langer'
+            from eegcpm.modules.preprocessing.hbn_langer_chain import (
+                build_hbn_langer_chain,
+            )
+
+            # Returns a ResolvedChainSteps: prebuilt step instances that carry
+            # the chain's spec deviations, so the resolved config (and hash)
+            # matches `PreprocessingPipeline('hbn_langer')`.
+            return build_hbn_langer_chain(**self.chain_params.model_dump())
         return [step.model_dump() for step in self.steps]
 
 

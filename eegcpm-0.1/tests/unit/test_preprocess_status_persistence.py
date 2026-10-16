@@ -206,12 +206,52 @@ def test_cli_invalid_config_returns_non_zero(bids_tree, tmp_path):
 
 def test_cli_skips_completed_run_by_session_and_run(
         bids_tree, registered_steps, tmp_path):
-    """The skip check must match the stored session/run identity.
+    """The skip check must match the stored session/run identity **and** config.
 
     A COMPLETED row for (subject, session='01', run='1') is matched, so
     the run is never reprocessed (the old subject-level check compared
-    session=None/run=None and never matched)."""
+    session=None/run=None and never matched). R3 (ASR scoped audit): the row
+    must also carry the *current* resolved-config hash — a row without a hash
+    (or with a different one) is not a resume hit.
+    """
     from datetime import datetime
+
+    from eegcpm.core.config import load_preprocessing_spec
+    from eegcpm.core.config_hash import resolved_config_hash
+    from eegcpm.modules.preprocessing import PreprocessingPipeline
+    from eegcpm.workflow.state import WorkflowState
+
+    config = _write_config(tmp_path / "fail.yaml",
+                           [{"name": "injected_failure", "params": {}}])
+    spec = load_preprocessing_spec(yaml.safe_load(config.read_text()))
+    current_hash = resolved_config_hash(
+        PreprocessingPipeline(spec.pipeline_steps()))
+
+    manager = WorkflowStateManager(bids_tree / "eegcpm" / ".eegcpm" / "state.db")
+    manager.save_state(WorkflowState(
+        subject_id="01", task="T", pipeline=PIPELINE,
+        status=ProcessingStatus.COMPLETED,
+        session="01", run="1", created_at=datetime.now(),
+        config_hash=current_hash,
+    ))
+
+    preprocess_command(_cli_args(config, bids_tree))
+
+    _, state = _state(bids_tree, bids_tree / "eegcpm")
+    assert state.status == ProcessingStatus.COMPLETED  # untouched
+    assert not _run_dir(bids_tree).exists(), "the run was not skipped"
+
+
+def test_cli_config_hash_mismatch_is_not_a_resume_hit(
+        bids_tree, registered_steps, tmp_path):
+    """R3 (ASR scoped audit): a COMPLETED row from another config is reprocessed.
+
+    Skipping it would leave the old outputs labelled with the new config's
+    hash. The run must be reprocessed and the stored hash updated to the
+    current pipeline's.
+    """
+    from datetime import datetime
+
     from eegcpm.workflow.state import WorkflowState
 
     manager = WorkflowStateManager(bids_tree / "eegcpm" / ".eegcpm" / "state.db")
@@ -219,15 +259,53 @@ def test_cli_skips_completed_run_by_session_and_run(
         subject_id="01", task="T", pipeline=PIPELINE,
         status=ProcessingStatus.COMPLETED,
         session="01", run="1", created_at=datetime.now(),
+        config_hash="stale-hash-from-a-different-config",
     ))
 
-    config = _write_config(tmp_path / "fail.yaml",
-                           [{"name": "injected_failure", "params": {}}])
-    preprocess_command(_cli_args(config, bids_tree))
+    config = _write_config(tmp_path / "good.yaml", [])   # succeeds
+    assert preprocess_command(_cli_args(config, bids_tree)) is None
 
     _, state = _state(bids_tree, bids_tree / "eegcpm")
-    assert state.status == ProcessingStatus.COMPLETED  # untouched
-    assert not _run_dir(bids_tree).exists(), "the run was not skipped"
+    assert state.status == ProcessingStatus.COMPLETED
+    assert state.config_hash != "stale-hash-from-a-different-config", (
+        "the mismatching COMPLETED row was not reprocessed")
+    # The run really ran: its output directory carries a FIF + success sidecar.
+    run_dir = _run_dir(bids_tree)
+    assert len(list(run_dir.glob("*_preprocessed_raw.fif"))) == 1
+    assert len(list(run_dir.glob("*_preprocessing.json"))) == 1
+
+
+def test_cli_reprocesses_when_config_changes(bids_tree, tmp_path):
+    """R3: a changed config (new resolved hash) is not skipped on re-run.
+
+    The same mechanism covers ``chain_params`` changes: the hash covers every
+    step parameter (``test_config_hash.py::test_resolved_config_hash_sensitive
+    _to_chain_params`` pins the chain-params sensitivity). Run 1 completes
+    under config A; re-running under config B (different filter parameters)
+    must reprocess, and the stored hash must be B's.
+    """
+    config_a = _write_config(tmp_path / "a.yaml", [])
+    assert preprocess_command(_cli_args(config_a, bids_tree)) is None
+    _, state_a = _state(bids_tree, bids_tree / "eegcpm")
+    hash_a = state_a.config_hash
+    assert hash_a
+
+    config_b = tmp_path / "b.yaml"
+    with open(config_b, "w") as f:
+        yaml.safe_dump({
+            "stage": "preprocessing",
+            "name": "test",
+            "steps": [
+                {"name": "filter", "params": {"l_freq": 0.5, "h_freq": 40.0}},
+            ],
+        }, f)
+
+    assert preprocess_command(_cli_args(config_b, bids_tree)) is None
+    _, state_b = _state(bids_tree, bids_tree / "eegcpm")
+    assert state_b.config_hash != hash_a, (
+        "the run was skipped although the pipeline config changed")
+    assert state_b.status == ProcessingStatus.COMPLETED
+    assert len(list(_run_dir(bids_tree).glob("*_preprocessed_raw.fif"))) == 1
 
 
 def test_cli_forced_rerun_failure_clears_stale_outputs(

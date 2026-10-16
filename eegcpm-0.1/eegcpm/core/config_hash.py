@@ -107,8 +107,25 @@ GOLDEN_CONFIG_LIBRARIES: List[str] = [
 #: in ``_ASRStepWrapper.get_config``, version 2.3). F4
 #: (``ForwardConfig.template`` → ``Literal['fsaverage']``) is source-stage
 #: schema, not part of the preprocessing chain hash.
+#: Re-pinned 2026-10-16 (**ASR EEGLAB-standard path + configurability, plan
+#: §12.6 decision**) after the chain's ASR step moved to the EEGLAB-standard
+#: input high-pass (``clean_drifts(0.25, 0.75)`` before ``clean_asr``, no
+#: add-back; ``ASRStep`` 2.1 → 2.2) with configurable ``max_dims`` (0.66) and
+#: the new ``drift_transition_hz``/``max_dims`` entries in
+#: ``_ASRStepWrapper.get_config`` (version 2.3 → 2.4), plus the per-dataset
+#: ``chain_params`` (``HbnLangerParams``) plumbing (defaults resolve to the
+#: same chain). Previous value was
+#: ``b47de382047676631d2d096b8553ba70b79734aaaebde6774ca00a08e83f1a52``.
+#: Re-pinned 2026-10-16 (**ASR scoped-audit fixes R1–R6**) after R1 (the ASR
+#: pseudo-inverse runs under the MATLAB-equivalent tolerance
+#: ``PINV_TOLERANCE_SPEC`` — exposed in ``ASRStep.get_config`` and
+#: ``_ASRStepWrapper.get_config``, versions 2.2 → 2.3 and 2.4 → 2.5) and R4
+#: (``info['highpass']`` updated to the drift filter's passband edge). R6's
+#: ``HbnLangerParams`` bounds and R2's docstring corrections do not change the
+#: resolved config. Previous value was
+#: ``b07bfe39930a4525ef48d0d2ca053df2144bbd396e95388adcaf963edf82fb8f``.
 GOLDEN_RESOLVED_HASHES: Dict[str, str] = {
-    "hbn_langer": "b47de382047676631d2d096b8553ba70b79734aaaebde6774ca00a08e83f1a52",
+    "hbn_langer": "a216dc003f898808c7e52e0c964bf752cacf15322b13f4cc320f8f7934658422",
 }
 
 

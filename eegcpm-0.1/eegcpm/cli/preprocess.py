@@ -158,6 +158,26 @@ def preprocess_command(args):
     console.print(f"Output: {preprocessing_root}")
     console.print(f"State DB: {db_path}\n")
 
+    # R3 (ASR scoped audit, 2026-10-16): the resolved-config hash of the
+    # pipeline this invocation would run. A stored COMPLETED/EXCLUDED row is
+    # only a resume hit when its recorded ``config_hash`` equals this value —
+    # otherwise the result was produced by a different pipeline configuration
+    # (e.g. different ``chain_params``) and is stale. Built once: ``get_config``
+    # does not depend on the output directory, so the value is identical for
+    # every run in the batch and equals the hash recorded per run below. A
+    # construction failure (e.g. dependency preflight) is a global
+    # configuration/environment error, not a per-run data failure, so the
+    # command fails loudly with a non-zero exit code instead of marking every
+    # run FAILED.
+    try:
+        current_config_hash = resolved_config_hash(
+            PreprocessingPipeline(spec.pipeline_steps()))
+    except Exception as e:
+        console.print(
+            f"[red]Error: cannot build the preprocessing pipeline from "
+            f"{args.config}: {e}[/red]")
+        return 1
+
     # Process subjects
     with Progress(
         SpinnerColumn(),
@@ -222,7 +242,13 @@ def preprocess_command(args):
                         '_ses-')[1].split('_')[0] if '_ses-' in input_file.stem else "01"
 
                     # Skip runs already completed or excluded for this
-                    # exact identity (subject/session/task/run).
+                    # exact identity (subject/session/task/run) — but only when
+                    # the stored result was produced by the *same* resolved
+                    # pipeline config (R3, ASR scoped audit 2026-10-16). A
+                    # config change (e.g. different ``chain_params``) must
+                    # reprocess: silently reusing a stale result would label
+                    # outputs with the new config's hash while the data came
+                    # from the old pipeline.
                     existing_state = manager.load_state(
                         subject_id, task, args.pipeline,
                         session=session, run=run_num)
@@ -230,12 +256,21 @@ def preprocess_command(args):
                             and existing_state.status in (ProcessingStatus.COMPLETED,
                                                           ProcessingStatus.EXCLUDED)
                             and not args.force):
+                        stored_hash = existing_state.config_hash
+                        if stored_hash == current_config_hash:
+                            console.print(
+                                f"    [dim]✓ run {run_num} already "
+                                f"{existing_state.status.value} "
+                                f"(use --force to reprocess)[/dim]")
+                            batch_skipped += 1
+                            continue
                         console.print(
-                            f"    [dim]✓ run {run_num} already "
-                            f"{existing_state.status.value} "
-                            f"(use --force to reprocess)[/dim]")
-                        batch_skipped += 1
-                        continue
+                            f"    [yellow]↻ run {run_num} was "
+                            f"{existing_state.status.value} under a different "
+                            f"pipeline config (stored "
+                            f"{stored_hash or 'no config_hash'}, current "
+                            f"{current_config_hash[:12]}…); reprocessing"
+                            f"[/yellow]")
 
                     # Fresh handle per run: an exception below must mark
                     # *this* run FAILED, never re-save the previous row.

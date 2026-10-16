@@ -199,7 +199,9 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | 2026-10-15 | P2 | **`mean_flip` decision (resolved)** | Option (a): keep `mean_flip`; document the uniform-patch attenuation (11/30 vs 22/30) and the midline polarity convention; P2 condition 4 sign-off after the docs land | resolved (docs at B6 tier-2) |
 | 2026-10-15 | P0/B8 | **Real data (resolved)** | Checkpoint B will use a pilot5 subject (`~/proj/adhd-hbn/data_raw/hbn-eeg/pilot5`) **and** the user's other dataset ("one EP one attention"; path TBD) | resolved |
 | 2026-10-16 | P1 | B6 implementation notes (for the auditor) | **RPCA removed** from `build_hbn_langer_chain()` (9 steps) with the deviation in `get_config`/`spec_deviations`; the golden resolved hash is pinned (`f3a40cd6…` rev1 → `73175626…` rev2 → **re-pinned `72c394e7…` after the scoped-re-audit ASR fix**, which now reports the fixed-first-60 s path truthfully) and covers the 9 chain steps + spec deviations + 9 library versions + the detector/ASR algorithm constants; **`robust_pca` was never in `STEP_REGISTRY`**, so "keep the step class + registry" was implemented as "keep the class importable" (adding a registry entry would newly enable it in YAML step lists); **B4-D2 detector**: kurtosis upper-tail on blink-free samples + relative near-flat floor implemented as the ratio rule only — the decision's `log-variance z < −K` alternative is documented as unusable (the lowest channel of the healthy fixture, at 29 % of the median variance, has z = −54, i.e. it flags healthy channels); pilot5 × 3 at rev1: **6/12** (Rest 4/4, DM 1/4, FF 1/4) — **superseded by rev2: 8/12 (Rest 4/4, DM 2/4, FF 2/4)** after log-Pearson kurtosis + band-passed blink ranking + EEG+EOG filtering; the movie-task over-budget (4/8 movie recordings) is genuine artifact burden, not blinks (a vertical-EOG reference mask finds 10–40× more blinks yet changes pass/fail on zero recordings); **blink under-detection persists** (band-passed-variance ranking still picks infraorbital channels in 9/12; 2–6 blinks vs 17–88 for the vertical-EOG reference; plausibility floor 1/min fires once) — carried to B8 (vertical-EOG derivation, floor ≈5/min); follow-ups: pilot-50 budget recalibration. **B6 rev2 (2026-10-16, Opus final-audit conditions NEW-1…NEW-10): EOG band-passed by the chain filter (NEW-1), band-passed blink-channel ranking + rate plausibility (NEW-2), log-Pearson upper-tail kurtosis (NEW-3), algorithm constants in `get_config` (NEW-4), numpy/scipy pinned (NEW-5), pilot table re-run in true chain order incl. zapline (NEW-6), stale RPCA numbers fixed (NEW-7), xfail `raises=AssertionError` + normal instrumentation tests (NEW-8), behavioural detector tests (NEW-9), RPCA write-back only on convergence (NEW-10); scoped-re-audit fix: ASR wrapper `get_config` fixed-path truthfulness + hash re-pin** | implemented 2026-10-16 + rev1 K3 fixes + rev2 final-audit fixes + scoped-re-audit fix; awaiting desk-check/commit |
+| 2026-10-16 | P1 | **ASR high-pass decision (resolved, plan §12.6)** | Option (iv), the **EEGLAB-standard path**: `clean_drifts(0.25, 0.75)` on the ASR **input** before `clean_asr`, write-back = the high-passed repaired data (**no add-back**, EEGLAB's own `clean_artifacts` behaviour), cutoff 20 recorded as **conservative** (aggressive 3 / default 5 / GUI default 20 / Chang 2019 20–30), `max_dims` 0.66, all per-dataset configurable via `PreprocessingSpec.chain_params` (`HbnLangerParams`; `asr_calibration: data_driven` = EEGLAB's automatic clean-window calibration). Real pilot probe (`sub-NDARAC853CR6` RestingState): new path finite, max ratio **0.312** (pre-§12.6: `asr_output_magnitude_blowup` at ratio 8.85e13). Golden hash re-pinned `b47de382…` → `b07bfe39…` | **implemented 2026-10-16; awaiting audit** (see the §12.6 evidence section) |
 | 2026-10-16 | P1/P2 | **B7 rev2 — Opus final audit (B7-N2 + majors)** | `revise` conditions applied on the uncommitted B7 tree: **(1) B7-N2 critical — ASR output blow-up guard** (`ASRStep` fails loudly with reason `asr_output_magnitude_blowup` when `max|post| > 1e3·max|pre|`; calibration-covariance condition number recorded; blow-ups can no longer be misattributed to block rejection) **+ e2e fidelity assertions** (`repaired_fraction < 0.85`, measured 0.762; ERP-retention median evoked↔template correlation ≥ 0.5, measured 0.88 on the anterior-injection fixture) **+ fix 7**: the ASR-excluded interpolated channels are **re-interpolated from the ASR-cleaned data** (they previously kept pre-ASR spline values; 1.02/1.09 relative-norm divergence) → `ASRStep` 2.0→2.1, wrapper 2.1→2.2, **golden hash re-pinned `ca91b7f2…` → `1ef8780d…`**; **(2) CI can go green**: the two P4 `mne_connectivity` tests deselected in the workflow + a step that fails on any fsaverage skip; **(3) blink gate timeline guard** (`timeline_mismatch` when sfreq/n_times/first_samp differ — a resampled post used to get a bogus pass/fail verdict); **(4) blink ratio bias**: pre and post ptp now measured on identically 1–15 Hz band-passed copies (100 µV 60 Hz in the pre recording was a false pass); **(5) crosstalk direction** corrected everywhere (rows are CTFs: `C[i, j]` is leakage **from ROI j into ROI i**; row = target, column = source); **(6) crosstalk artifact**: the saved primary `crosstalk` is now the **flip-aligned** numpy estimator (matches `mean_flip`), the library matrix is kept as `crosstalk_unflipped`, QC/provenance state which matrix the statistics use; **(8) e2e honesty** (contaminated-variant event check no longer compares a file with itself; `assert interpolated`); **(9) smaller gaps** (gate prints the scan count; line-noise failures are NaN + note instead of 0.0; `run_processor.load_processed_runs` records an unreadable FIF instead of defaulting to 128 channels and reads `bad_channel_detection`; crosstalk `{"computed": false}` carries a reason; role-exclusion accounting uses the before-EEG set) | **rev2 applied 2026-10-16; awaiting re-audit. ⛔ NEW OPEN USER DECISION (blocks B8): ASR high-pass design (plan §12.6). Hash later re-pinned `1ef8780d…` → `b47de382…` by the F1–F7 fix round (see the B8 evidence)** |
+| 2026-10-16 | P1 | **ASR scoped audit → fixes R1–R6** | `revise` (scoped): the §12.6 drift filter is correct but **did not fix the real-data blow-ups** — full chain on pilot5, **4 of 6 recordings that reach ASR failed with `asr_output_magnitude_blowup` under the EEGLAB-standard path**. Root cause (reproduced): eegprep 0.4.0 calls `np.linalg.pinv` with numpy's default `rcond=1e-15` (`asr_process.py:214` via `finite_pinv(Q)`), MATLAB uses `max(size(A))·eps(norm(A))` (absolute). **R1** (critical): `clean_asr` runs under a temporary, source-verified patch of that call site with the MATLAB tolerance; `pinv_tolerance: 'matlab_max_size_eps(norm)'` recorded in metadata + both `get_config`s; changed call site → `eegprep_pinv_assumption_broken`; deterministic reproducer both directions; **pilot5: 6/6 reach-ASR recordings clean (ratios 0.28–1.27; before 4/6 at 4.3e12–6.9e13)**; upstream bug-report **draft** (not filed). **R2** overclaims corrected (justification = EEGLAB-standard input + lower burden, 0.762→0.481, not blow-up prevention). **R3** resume check compares `config_hash` (mismatch → reprocess; `run_processor` has no skip path). **R4** `info['highpass']` = 0.75 Hz when the drift filter runs (attenuation N1 0.995/P2 0.978/P3 0.889/LPP 0.573, 0.8-s ramp 0.49 @ +196 ms; add-back recorded as follow-up). **R5** e2e burden bound labelled a regression tripwire (docstring). **R6** `HbnLangerParams` bounds ([1,200] cutoff; `0<lo<hi<=5` drift; Nyquist at runtime). Hash re-pinned `b07bfe39…` → `a216dc00…` | **implemented 2026-10-16; awaiting re-audit** (see the §ASR R1–R6 evidence section) |
 
 ## Remediation batches — `plan/261013-2240-p1p2-remediation.md`
 
@@ -212,7 +214,7 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev1 applied (N1/N2/A1/A2/A3/A6/A7/N6) → scoped re-audit `approve`, no conditions left (residuals → B6/B7/B8) |
 | B6 | ⛔ Checkpoint A (RPCA) + instrumentation + golden resolved-config hash + P1 tier-2 debt | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev2 (NEW-1…NEW-10) + scoped-re-audit ASR-fix applied; desk-check + suites (2F connectivity-only / 729P) per the re-audit; hash `72c394e7…` |
 | B7 | QC truthfulness, test-suite honesty, CI job | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev2 (B7-N2 ASR guard + majors) + scoped re-audit: all conditions met (hash `1ef8780d…`; suite 2F connectivity-only / 853P / 0 skipped; chain e2e 18; fsaverage 43/0; gate 108 files / 0 offenders) — **hash later re-pinned to `b47de382…` by the final-verification-audit fix round (F1–F7), see the B8 evidence** |
-| B8 | End-to-end verification prep; ⛔ Checkpoint B (real EGI-129 subject) | `[~]` **task 1 verified 2026-10-16 (code scope)** — final-verification audit `revise` → fixes F1–F7 applied + scoped re-check `confirm-with-notes`; **P1 C1–C6 and P2 conditions 1–4 verified for code scope**; ⛔ Checkpoint B (real data) blocked by the ASR high-pass decision §12.6, the second-dataset path, and a green remote CI run (push-gated) |
+| B8 | End-to-end verification prep; ⛔ Checkpoint B (real EGI-129 subject) | `[~]` **task 1 verified 2026-10-16 (code scope)** — final-verification audit `revise` → fixes F1–F7 applied + scoped re-check `confirm-with-notes`; **P1 C1–C6 and P2 conditions 1–4 verified for code scope**; ⛔ Checkpoint B (real data) blocked by the second-dataset path and a green remote CI run (push-gated) — the **ASR high-pass decision §12.6 is resolved** (EEGLAB-standard path implemented 2026-10-16, awaiting audit) |
 
 B1 evidence (2026-10-14, after rev1 + rev2): focused suite green (six files: executor semantics,
 schema, status persistence [15 tests], reachability, chain, output discovery → **93 passed**);
@@ -780,8 +782,10 @@ decision (a), P1-F2/F7/F9/F13–F22 + B3-K9/B3-K5/B5-N3/B5-A4 + B4-D2**, plan §
       Next: **B8** — task 1 (synthetic dipole source-ERP e2e + the Opus B7 amplitude-retention carry)
       **implemented 2026-10-16, awaiting audit**; **final-verification-audit fix round F1–F7 applied
       2026-10-16** (golden hash re-pinned `1ef8780d…` → `b47de382…`; green remote CI run requires
-      pushing — user-gated open item under B8/Checkpoint B); ⛔ Checkpoint B (real data) blocked by
-      the ASR high-pass decision (plan §12.6), the second dataset path **and the push-gated CI run**.
+      pushing — user-gated open item under B8/Checkpoint B); **ASR high-pass decision (plan §12.6)
+      resolved 2026-10-16 — EEGLAB-standard path implemented, golden hash re-pinned
+      `b47de382…` → `b07bfe39…`** (see the §12.6 evidence section); ⛔ Checkpoint B (real data)
+      blocked by the second dataset path **and the push-gated CI run**.
       B6/B7 residuals to watch: movie-task detector budget + the "other dataset" half of the B4-D2
       validation.
 - [ ] **Final-audit model note:** Opus 5.5 was intermittently unavailable for B3; per user decision
@@ -790,14 +794,12 @@ decision (a), P1-F2/F7/F9/F13–F22 + B3-K9/B3-K5/B5-N3/B5-A4 + B4-D2**, plan §
 - [ ] **Science decision before P2 condition 4:** `mean_flip` vs `pca_flip` (plan §12 item 4;
       11/30 vs 22/30 dominance under uniform-patch injection, midline polarity near-ties) — does
       not block B3–B8.
-- [ ] **⛔ ASR high-pass design decision (B7-N2, plan §12 item 6) — BLOCKS B8:** `eegprep.clean_asr`
-      at cutoff 20 on the chain's 0.1-Hz-high-passed data rewrites most of a clean recording
-      (measured `repaired_fraction` 0.762 on the e2e fixture; audit 0.76; 94 %/<0.5 Hz + 52 %/0.5–2 Hz
-      power removed; blow-up regime 2.6e16–5.7e16 µV at calibration condition number 9e4–1.4e6).
-      B7 rev2 adds the guard (`asr_output_magnitude_blowup`) and records the options — (i) ASR on a
-      ≥0.5–1 Hz high-passed copy added back to the 0.1 Hz data, (ii) 1 Hz chain variant, (iii) keep
-      as-is with the guard + documented distortion. B8 must not run the real-data chain until the
-      user picks one (the choice changes what the real-data verification validates).
+- [x] **ASR high-pass design decision (B7-N2, plan §12 item 6) — RESOLVED 2026-10-16:**
+      **EEGLAB-standard path implemented** (option (iv)): `clean_drifts(0.25, 0.75)` on the ASR
+      input before `clean_asr`, write-back = the high-passed repaired data (**no add-back**),
+      `max_dims` configurable, cutoff 20 documented as **conservative**, per-dataset via
+      `chain_params`. Evidence, real-data numbers and the new golden hash in the §12.6 evidence
+      section below. ⛔ Checkpoint B no longer blocked by this item — **the unblocking fix is R1 (the MATLAB-tolerance pinv patch), not the drift filter**: with R1, **6/6 pilot5 recordings that reach ASR process cleanly** (was 2/6; see the R1–R6 table).
 - [ ] Real-subject end-to-end verification (Checkpoint B artifacts → `planning/audits/`)
 - [ ] **⛔ B8/Checkpoint B open item — green remote CI run (F1, user-gated):**
       `.github/workflows/pipeline-verification.yml` is tracked with the F1–F7 round (it was
@@ -875,7 +877,8 @@ Plan §B7 tasks 1–15 + the B6-carried `EOGRegressionStep` guard. Files: `modul
   `eog_band_limited_check`), with the explicit recorded `allow_unfiltered_regressors` opt-out; the
   guard constants are in `get_config()`; **golden hash re-pinned to `ca91b7f2…`** (was `72c394e7…`;
   superseded by the B7 rev2 re-pin to `1ef8780d…`, itself re-pinned to `b47de382…` by the
-  F1–F7 round — see the B7 rev2 / B8 evidence sections).
+  F1–F7 round and to `b07bfe39…` by the §12.6 ASR round — see the B7 rev2 / B8 / §12.6 evidence
+  sections).
 - **⛔ NEW CRITICAL FINDING B7-N1 (found by the task-6 fixture; fixed minimally, needs approval)**:
   spherical-spline interpolation makes an interpolated channel an **exact** linear combination of the
   others, so the ASR calibration covariance is exactly singular (probed on the EGI-129 fixture:
@@ -1149,3 +1152,173 @@ Fix round applied after the final deep audit of the P1/P2 acceptance conditions 
   `test_preprocessing_comparison_qc` 3 (new). F7 measured top-3 N1 (fixture npz, N1 window):
   **−8.277** `SensoriMotor.Superior`, −6.636 `DefaultMode.PCC`, −2.943 `FrontoParietal.PPC_L`
   (target/runner-up ratio 1.247 ≥ the 1.1 bound).
+
+### §12.6 ASR EEGLAB-standard path + per-dataset configurability (2026-10-16, same uncommitted tree)
+
+Plan §12 item 6 (B7-N2 follow-up), resolved as option (iv) — the **EEGLAB-standard path** —
+and implemented; awaiting audit. **Golden resolved hash re-pinned
+`b47de382…` → `b07bfe39930a4525ef48d0d2ca053df2144bbd396e95388adcaf963edf82fb8f`.**
+
+- **What changed (`steps/asr.py`, `ASRStep` 2.1 → 2.2).** The ASR **input** is high-passed with
+  `eegprep.clean_drifts(eeg, drift_transition_hz)` (default `(0.25, 0.75)`, EEGLAB's own
+  `clean_artifacts` band) after the picks/exclusions and before the calibration reference is
+  extracted; `max_dims` (default 0.66) is forwarded to `clean_asr`; the **write-back is the
+  high-passed repaired data — no add-back** (exactly EEGLAB's `clean_artifacts`). `None`/`'off'`
+  skips the filter with a `RuntimeWarning` and records `drift_filter_applied: False` (the
+  non-EEGLAB regime the B7-N2 guard exists for). Metadata gains `drift_transition_hz`,
+  `drift_filter_applied`, `drift_filter_modified_fraction`, `max_dims`; `pre_max_uv` /
+  `repaired_fraction` are measured against the **post-drift ASR input** (the high-pass effect is
+  recorded separately, so `repaired_fraction` keeps meaning "samples ASR rewrote"). The B7-N2
+  blow-up guard and the B7-N1 exclusion/re-interpolation are unchanged (re-probed: the
+  exactly-singular interpolated-channel covariance is still caught — the EGI-129 fixture raises
+  `asr_calibration_covariance_degenerate` with the drift filter on and off). **Correction
+  (2026-10-16, ASR scoped audit R2):** the earlier claim that the near-singular 32-channel
+  control "is tamed by the high-pass" was wrong for real data — 4 of 6 pilot5 recordings that
+  reach ASR still failed under this path; the fix is the MATLAB-equivalent pinv tolerance (see
+  the §ASR R1–R6 section below).
+- **Cutoff semantics corrected.** 20 = EEGLAB **conservative** (aggressive 3, default 5,
+  conservative 20; GUI default 20; Chang et al. 2019 optimal 20–30) — the old "aggressive 20"
+  wording is fixed in the `ASRStep`/chain docstrings and the golden YAML.
+- **Chain + configurability (`hbn_langer_chain.py`, wrapper 2.3 → 2.4; `core/config.py`;
+  `pipeline_builder.py`).** `build_hbn_langer_chain(asr_cutoff=20, asr_drift_transition_hz=(0.25,
+  0.75), asr_max_dims=0.66, asr_calibration='fixed_first_60s')` returns a `ResolvedChainSteps`
+  (prebuilt steps + `HBN_LANGER_SPEC_DEVIATIONS`, so every construction path resolves to the same
+  config/hash). `_ASRStepWrapper` accepts `calibration_window='data_driven'` (EEGLAB's automatic
+  clean-window calibration — the built-in per-recording adaptivity; the spec default stays
+  fixed-first-60 s) and reports the branch it actually runs in `get_config`
+  (`calibration_reference`/`ref_maxbadchannels`/`ref_tolerances` switch with the branch;
+  `DATA_DRIVEN_REF_*` read at call time). New pydantic schema `HbnLangerParams` (`extra='forbid'`)
+  exposed as `PreprocessingSpec.chain_params`, forwarded by `pipeline_steps()` via
+  `build_hbn_langer_chain(**params)`; `chain_params` next to an explicit step list is rejected
+  (`model_fields_set`), unknown keys / wrong types / non-increasing transition bands are hard
+  errors. Per-dataset YAML example: `chain_params: {asr_cutoff: 30, asr_calibration: data_driven}`.
+- **Real-data probe (`/tmp/opencode/p1_chain_asr_realdata_probe.py`; chain steps 1–6 then the
+  actual `ASRStep`, `sub-NDARAC853CR6` RestingState, 368 s, 109 EEG channels, 5 interpolated):**
+  - new path: **finite**, `max_ratio = 0.312` (target < 10; the `clean_artifacts` variant C of
+    `/tmp/opencode/asr_design_probe.py` measured 0.35), `repaired_fraction = 0.048`,
+    `drift_filter_modified_fraction = 0.955`, band-power ratios vs the 0.1 Hz input: <0.5 Hz 0.078,
+    0.5–2 Hz 0.49, 2–8 Hz 0.83, 8–45 Hz 0.81, window-rejected fraction 0.022;
+  - pre-§12.6 configuration (`drift_transition_hz=None`): loud
+    `asr_output_magnitude_blowup` at **ratio 8.85e13** (matches the recorded 9e13 evidence).
+- **e2e re-measurements (bounds updated):** clean fixture `repaired_fraction` **0.481** (bound
+  `< 0.65`; was 0.762/`< 0.85`; separate drift effect 0.355), ERP retention **0.866** on the
+  anterior fixture (≥ 0.5 bound; was 0.88), B8 dipole fixture: `repaired_fraction` 0.404, amplitude
+  retention **0.949** (band [0.7, 1.3]; was 0.966), aggregate 0.951, chain-input control 0.987.
+- **Tests added/updated:** `test_asr_timeline.py` (+5: clean_drifts-before-clean_asr identity spy,
+  sub-transition band-power removal, `None`/`'off'` skip + warning + metadata, `max_dims` reaches
+  `clean_asr` through step and wrapper, blow-up guard re-scoped to the non-high-passed regime with
+  the EEGLAB-path non-vacuity control; wrapper metadata/calibration tests extended);
+  `test_config_hash.py` (+2: `chain_params` sensitivity across cutoff/drift/max_dims/calibration,
+  data-driven calibration truthfulness + `DATA_DRIVEN_REF_*` sensitivity; existing constant/config
+  tests extended); `test_preprocessing_schema.py` (+4: unknown key, wrong type, explicit-step-list
+  rejection, accepted values reach the wrapper + default chain equality); `test_hbn_chain_e2e.py`
+  (burden bound + drift/max_dims provenance assertions); `test_e2e_synthetic_source_erp.py`
+  (docstring re-measurements).
+- **Validation** (see the final report for the exact commands): full standard suite → failures
+  exactly the two `mne_connectivity` P4 baseline tests; `pytest -m chain_e2e` → **34 passed**;
+  `pytest -m fsaverage` → **59 passed / 0 skipped**; gate → **19 passed** / 108 files / 0 offenders.
+
+### §ASR R1–R6 — ASR scoped-audit fixes (2026-10-16, same uncommitted tree)
+
+Scoped audit of the §12.6 drift filter: the filter itself is correct, but it does **not** fix the
+real-data blow-ups. Full chain on pilot5: **4 of 6 recordings that reach ASR failed with
+`asr_output_magnitude_blowup` under the EEGLAB-standard path**. Root cause (auditor, reproduced):
+eegprep 0.4.0 calls `np.linalg.pinv` with numpy's default `rcond=1e-15`
+(`plugins/clean_rawdata/asr_process.py:214`, via the module-global `finite_pinv(Q)`), while
+MATLAB's `pinv` uses the absolute tolerance `max(size(A)) * eps(norm(A))` (≈2.2e-14 for ~100
+channels). Task list R1–R6; plan record: §12.6 ("ASR scoped-audit fixes R1–R6"). **Golden
+resolved hash re-pinned `b07bfe39930a4525ef48d0d2ca053df2144bbd396e95388adcaf963edf82fb8f` →
+`a216dc003f898808c7e52e0c964bf752cacf15322b13f4cc320f8f7934658422`** (R1 `pinv_tolerance` in
+both `get_config`s + `ASRStep` 2.2 → 2.3 / `_ASRStepWrapper` 2.4 → 2.5).
+
+- **R1 (critical) — pinv tolerance, scoped + provenance (`steps/asr.py`).** `clean_asr` runs
+  under a temporary patch of exactly the eegprep call site: the module global `finite_pinv` in
+  `eegprep.plugins.clean_rawdata.asr_process` is replaced with
+  `_pinv_with_matlab_tolerance` (SVD, then MATLAB's absolute cutoff `max(size)·eps(norm)` — the
+  exact semantics, not numpy's relative `rcond`) and restored in `finally`. Before every patched
+  call the assumption is source-verified (the module exposes `finite_pinv` and `asr_process`
+  contains `finite_pinv(Q)`); a mismatch raises `eegprep_pinv_assumption_broken` instead of
+  silently reverting. Metadata records `pinv_tolerance: 'matlab_max_size_eps(norm)'`,
+  `eegprep_version`, `eegprep_pinv_verified_version`; `get_config` (step + wrapper) carries
+  `pinv_tolerance` so the golden hash covers it. **Reproducer (both directions):** deterministic
+  32-channel fixture (calibration covariance condition number 1.2e4, 10 Hz common sinusoid;
+  `test_pinv_tolerance_is_the_blowup_fix`) — with the real eegprep default pinv the step raises
+  `asr_output_magnitude_blowup` (and writes nothing back); with the fix the same call is clean
+  (ratio 1.0). Helper pinned against MATLAB semantics on a crafted 64×64 matrix
+  (`test_matlab_pinv_tolerance_helper_matches_matlab_semantics`: numpy inverts a 3e-15 singular
+  value, the MATLAB cutoff zeroes it). Patch scoping + guard pinned by
+  `test_pinv_patch_is_scoped_and_guarded`.
+- **Pilot5 re-run table** (read-only; chain steps 1–6 then the **real** `ASRStep` with the chain
+  defaults — cutoff 20, fixed-first-60 s, drift (0.25, 0.75), max_dims 0.66; RestingState +
+  DespicableMe = the 10 recordings; `/tmp/opencode/pilot5_step_probe.py`, 2026-10-16). "Before"
+  = the pre-fix tree (`/tmp/opencode/pilot5_pinv_probe.py`; the same 4/6 failure the audit
+  reproduced). 4 recordings are excluded by the bad-channel detector before ASR (unchanged by
+  R1), 6 reach ASR:
+
+| recording | task | reaches ASR | before (default pinv) | after (R1) | `repaired_fraction` | `window_rejected_fraction` | max ratio | `info['highpass']` |
+|---|---|---|---|---|---|---|---|---|
+| sub-NDARAC853CR6 | RestingState | yes | ok (0.379) | **ok** | 0.0483 | 0.0219 | 0.3785 | 0.75 |
+| sub-NDARAC853CR6 | DespicableMe | yes | **blow-up 4.26e12** | **ok** | 0.2171 | 0.0563 | 0.2828 | 0.75 |
+| sub-NDARAC904DMU | RestingState | yes | **blow-up 3.25e13** | **ok** | 0.1958 | 0.3206 | 0.4893 | 0.75 |
+| sub-NDARAM873GAC | RestingState | yes | **blow-up 6.87e13** | **ok** | 0.0820 | 0.0116 | 0.5697 | 0.75 |
+| sub-NDARCD661GL0 | RestingState | yes | ok (1.267) | **ok** | 0.0805 | 0.5833 | 1.2666 | 0.75 |
+| sub-NDARCD661GL0 | DespicableMe | yes | **blow-up 4.23e13** | **ok** | 0.0393 | 0.0311 | 0.7434 | 0.75 |
+| sub-NDARAC904DMU | DespicableMe | no | — | — | — | — | — | — |
+| sub-NDARAM487XU3 | RestingState | no (corrupt: 94/109 flat) | — | — | — | — | — | — |
+| sub-NDARAM487XU3 | DespicableMe | no (corrupt) | — | — | — | — | — | — |
+| sub-NDARAM873GAC | DespicableMe | no | — | — | — | — | — | — |
+
+  **ASR success rate: 6/6 recordings that reach ASR (100 %), target met**; before R1 it was 2/6.
+  Every patched run reports `pinv_tolerance: matlab_max_size_eps(norm)`, `eegprep_version 0.4.0`
+  and a finite output; `info['highpass']` is 0.75 Hz on all of them (R4). Upstream bug-report
+  **draft** (title, call site, MATLAB semantics, reproducer, observed vs expected) at
+  `planning/audits/eegprep-pinv-bug-report-draft.md` — **not filed** (user-gated).
+- **R2 — overclaims corrected.** The drift filter's justification is EEGLAB-standard input +
+  lower repair burden (`repaired_fraction` 0.762 → 0.481 on the e2e fixture), **not** blow-up
+  prevention. Removed the "near-singular blow-up regime is tamed by the high-pass" claims from
+  plan §12.6, `steps/asr.py` docstrings, `hbn_langer_chain.py`, `implementation/CHANGELOG.md`
+  and this file's §12.6 evidence.
+- **R3 — resume check compares config hashes (`cli/preprocess.py`).** The CLI computes
+  `resolved_config_hash(PreprocessingPipeline(spec.pipeline_steps()))` once per batch (identical
+  for every run; a construction failure is a global error → exit 1) and skips a
+  COMPLETED/EXCLUDED run **only** when the stored `config_hash` equals it. A mismatch prints the
+  stored/current hashes and **reprocesses**. `run_processor` has no COMPLETED/EXCLUDED skip path
+  (verified: it clears the output dir and always reprocesses; `load_processed_runs` only reads
+  results for QC) — its hash semantics are documented there. Tests: matching-hash skip
+  (`test_cli_skips_completed_run_by_session_and_run`, updated), stale-hash reprocess
+  (`test_cli_config_hash_mismatch_is_not_a_resume_hit`), two-config reprocess
+  (`test_cli_reprocesses_when_config_changes`); the `chain_params` hash sensitivity itself is
+  pinned by `test_config_hash.py::test_resolved_config_hash_sensitive_to_chain_params`.
+- **R4 — truthful `info['highpass']` (`steps/asr.py`).** When the drift filter runs,
+  `info['highpass']` is set inside `info._unlock()` to the transition band's passband edge
+  (`drift_transition_hz[1]`, 0.75 Hz default) — MNE's own `filter` records the passband edge
+  (probed on 1.13.2). Metadata gains `info_highpass_hz` (None when the filter is off, and the
+  chain's value is then left untouched). Tests:
+  `test_info_highpass_updated_when_drift_filter_runs`,
+  `test_info_highpass_untouched_when_drift_filter_off`, and the timeline test now pins 0.75.
+  **Measured attenuation (design probe, recorded in plan §12.6):** N1 0.995, P2 0.978, P3 0.889,
+  LPP 0.573; an 0.8-s ramp is attenuated to 0.49 with its peak shifted 196 ms — an **add-back
+  option for slow-ERP datasets is a recorded follow-up, not implemented.**
+- **R5 — bound honesty (`test_hbn_chain_e2e.py`, docstring only).** The
+  `repaired_fraction < 0.65` bound is labelled a **regression tripwire**, not a fidelity measure
+  (the fixture's 1/f spectrum is too red); the ERP-retention assertion remains the fidelity
+  measure. Measured after R1: still 0.481 (drift effect 0.355).
+- **R6 — bounds (`core/config.py`, `steps/asr.py`).** `HbnLangerParams.asr_cutoff`:
+  `ge=1, le=200`; `asr_drift_transition_hz`: `0 < low < high` **and** `high <= 5` Hz at schema
+  level, plus `high < Nyquist` at runtime in the step (`_check_drift_nyquist`, called from
+  `validate_inputs` and the eegprep path). Tests:
+  `test_preprocessing_schema.py::test_chain_params_r6_bounds_are_hard_errors` (cutoff 0.5/500 and
+  drift (0, 0.75)/(1, 0.5)/(0.25, 0.25)/(0.5, 5.5) rejected; (1, 200)/(0.5, 5) accepted),
+  `test_asr_timeline.py::test_drift_transition_above_nyquist_refused` (sfreq 4 Hz, band
+  (0.5, 2.5) → ValueError from both `validate_inputs` and `process`).
+- **Validation commands (2026-10-16, working tree; exact commands in the final report):**
+  `pytest tests/unit/test_asr_timeline.py` → **39 passed** (33 → 39: +6 R1/R4/R6 tests, 2 B7-N2
+  tests re-scoped to the default-tolerance regime); `pytest tests/unit/test_preprocessing_schema.py
+  tests/unit/test_preprocess_status_persistence.py` → **56 passed** (R6 bounds, R3
+  skip/reprocess); `pytest tests/unit/test_config_hash.py` → **21 passed** (hash re-pinned,
+  `PINV_TOLERANCE_SPEC` sensitivity); `pytest -m chain_e2e` → **18 passed**; `pytest -m
+  fsaverage` → **59 passed / 0 skipped**; **full standard suite → 2 failed / 896 passed /
+  2 xfailed**, failures exactly the two `mne_connectivity` P4 baseline tests
+  (`test_connectivity.py::test_wpli_close_to_mne_connectivity`,
+  `::test_dwpli_close_to_mne_connectivity`); `test_no_silent_continue` gate green (19 passed,
+  108 files / 0 offenders).

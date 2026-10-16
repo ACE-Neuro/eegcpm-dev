@@ -206,6 +206,91 @@ def test_resolved_config_hash_sensitive_to_block_and_asr_algorithm_constants(
     assert resolved_config_hash(PreprocessingPipeline("hbn_langer")) != baseline, (
         "hash insensitive to ASR_OUTPUT_BLOWUP_FACTOR"
     )
+    monkeypatch.undo()
+
+    # R1 (ASR scoped audit): the pseudo-inverse tolerance the eegprep path
+    # runs under changes the repaired data, so it is part of the resolved
+    # config (read at call time in both get_config implementations).
+    monkeypatch.setattr(asr_module, "PINV_TOLERANCE_SPEC", "numpy_default_1e-15")
+    assert resolved_config_hash(PreprocessingPipeline("hbn_langer")) != baseline, (
+        "hash insensitive to PINV_TOLERANCE_SPEC"
+    )
+
+
+def test_resolved_config_hash_sensitive_to_chain_params():
+    """§12.6: per-dataset ``chain_params`` (ASR cutoff/drift/max_dims) hash.
+
+    The per-dataset tuning path is ``build_hbn_langer_chain(**chain_params)``;
+    changing any ASR parameter must change the resolved hash (the values are in
+    ``_ASRStepWrapper.get_config``), so a non-default dataset is identifiable
+    from its recorded provenance.
+    """
+    from eegcpm.modules.preprocessing.hbn_langer_chain import (
+        build_hbn_langer_chain,
+    )
+    from eegcpm.modules.preprocessing.pipeline_builder import (
+        PreprocessingPipeline,
+    )
+
+    def chain_hash(**params):
+        return resolved_config_hash(
+            PreprocessingPipeline(build_hbn_langer_chain(**params))
+        )
+
+    baseline = chain_hash()
+    assert baseline == resolved_config_hash(
+        PreprocessingPipeline("hbn_langer")
+    ), "the default chain_params must resolve to the golden chain"
+
+    assert chain_hash(asr_cutoff=30.0) != baseline, (
+        "hash insensitive to asr_cutoff"
+    )
+    assert chain_hash(asr_drift_transition_hz=(0.5, 1.0)) != baseline, (
+        "hash insensitive to asr_drift_transition_hz"
+    )
+    assert chain_hash(asr_drift_transition_hz=None) != baseline, (
+        "hash insensitive to the drift filter being off"
+    )
+    assert chain_hash(asr_max_dims=0.5) != baseline, (
+        "hash insensitive to asr_max_dims"
+    )
+    assert chain_hash(asr_calibration="data_driven") != baseline, (
+        "hash insensitive to asr_calibration"
+    )
+
+
+def test_data_driven_calibration_config_is_truthful_and_sensitive(monkeypatch):
+    """A data-driven chain reports the data-driven constants it actually passes.
+
+    The fixed-first-60 s wrapper must not claim the data-driven constants (B6
+    re-audit fix) — and the data-driven wrapper must not claim the fixed path.
+    The constants it passes are read from ``steps/asr.py`` at call time, so a
+    change to them changes the data-driven chain's hash.
+    """
+    from eegcpm.modules.preprocessing.hbn_langer_chain import (
+        build_hbn_langer_chain,
+    )
+    from eegcpm.modules.preprocessing.pipeline_builder import (
+        PreprocessingPipeline,
+    )
+    from eegcpm.modules.preprocessing.steps import asr as asr_module
+
+    dd_pipeline = PreprocessingPipeline(
+        build_hbn_langer_chain(asr_calibration="data_driven"))
+    cfg = dd_pipeline.steps[6].get_config()
+    assert cfg["calibration_window"] == "data_driven"
+    assert cfg["calibration_reference"] == "eegprep_clean_windows_selection"
+    assert cfg["ref_maxbadchannels"] == asr_module.DATA_DRIVEN_REF_MAXBADCHANNELS
+    assert cfg["ref_tolerances"] == list(asr_module.DATA_DRIVEN_REF_TOLERANCES)
+
+    baseline = resolved_config_hash(dd_pipeline)
+    monkeypatch.setattr(
+        asr_module, "DATA_DRIVEN_REF_MAXBADCHANNELS",
+        asr_module.DATA_DRIVEN_REF_MAXBADCHANNELS / 2.0,
+    )
+    assert resolved_config_hash(dd_pipeline) != baseline, (
+        "hash insensitive to DATA_DRIVEN_REF_MAXBADCHANNELS"
+    )
 
 
 def test_asr_wrapper_runs_the_configured_window_tolerances(monkeypatch):
@@ -223,6 +308,11 @@ def test_asr_wrapper_runs_the_configured_window_tolerances(monkeypatch):
     class FakeASRStep:
         def __init__(self, **kwargs):
             captured.update(kwargs)
+            # The wrapper's constructor instantiates the real ASRStep to
+            # validate/derive drift_transition_hz + max_dims; the fake must
+            # carry the same attributes.
+            self.drift_transition_hz = kwargs.get("drift_transition_hz")
+            self.max_dims = kwargs.get("max_dims")
 
         def process(self, raw, metadata):
             return raw, {"applied": True}
@@ -286,6 +376,10 @@ def test_chain_get_config_exposes_detector_and_asr_constants():
     ]
     assert asr["window_tolerances"] == [-np.inf, 7.0]
     assert asr["output_blowup_factor"] == asr_module.ASR_OUTPUT_BLOWUP_FACTOR
+    # §12.6 (EEGLAB-standard ASR): the input high-pass and max_dims are part
+    # of the resolved config.
+    assert asr["drift_transition_hz"] == [0.25, 0.75]
+    assert asr["max_dims"] == 0.66
 
     # F2 (final-verification-audit fix round): the block gate's fixed 100 µV
     # median-ptp threshold is the module constant.

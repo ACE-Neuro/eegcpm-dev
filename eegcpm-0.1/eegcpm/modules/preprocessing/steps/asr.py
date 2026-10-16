@@ -10,9 +10,59 @@ existing annotations. Windows flagged by ``clean_windows`` are **annotated**
 intervals are recorded in the step metadata only (``repaired_intervals_s`` /
 ``repaired_fraction``) — repaired data are correct data, not bad data.
 
+**EEGLAB-standard input high-pass (2026-10-16 design decision, plan §12.6;
+justification corrected 2026-10-16 — ASR scoped audit R2).**
+``clean_asr`` requires zero-mean (high-passed) input: its docstring states the
+data are *"assumed to be zero mean, e.g., appropriately high-passed (e.g.
+>0.5Hz or with a 0.5Hz - 1.0Hz transition band)"*, and EEGLAB's
+``clean_artifacts`` applies ``clean_drifts(EEG, (0.25, 0.75))`` internally
+before ASR (verified in the installed eegprep source,
+``plugins/clean_rawdata/clean_artifacts.py`` line ~203). The filter's
+justification is **EEGLAB-standard input + lower repair burden**: on the chain's
+0.1-Hz data ASR rewrote most of a *clean* recording (``repaired_fraction``
+0.762 on the e2e fixture; 0.481 with the filter), i.e. most of the old "repair"
+was low-frequency content EEGLAB removes before ASR. It is **not** the fix for
+the real-data blow-ups: the auditor reproduced ``asr_output_magnitude_blowup``
+on 4 of 6 pilot recordings that reach ASR *with this filter on* — that failure
+mode is eegprep's default pseudo-inverse tolerance (R1 below). This step
+therefore applies ``eegprep.clean_drifts(eeg, drift_transition_hz)`` to the ASR
+**input** (default ``(0.25, 0.75)``, EEGLAB's own transition band) and passes
+``max_dims`` (default 0.66, eegprep/EEGLAB default) to ``clean_asr``.
+``drift_transition_hz = None``/``'off'`` skips the filter (a warning is emitted
+and recorded).
+
+**No add-back + truthful ``info['highpass']``:** the write-back is the
+high-passed repaired data — exactly EEGLAB's behaviour (``clean_artifacts``
+returns the high-passed output and does not add the pre-high-pass signal back).
+Because the write-back really is high-passed, the step updates
+``info['highpass']`` to the filter's passband edge (``drift_transition_hz[1]``,
+default 0.75 Hz) — the convention MNE's own ``filter`` uses — so the FIF no
+longer claims the chain's 0.1 Hz passband for data that no longer has it (ASR
+scoped audit R4). The metadata keeps the full transition band
+(``drift_transition_hz``, ``drift_filter_applied``, ``info_highpass_hz``).
+``repaired_fraction`` is measured against the **ASR input** (post-drift) so it
+keeps meaning "samples ASR rewrote", and ``drift_filter_modified_fraction``
+records the separate high-pass effect.
+
+**R1 (ASR scoped audit, 2026-10-16) — MATLAB-equivalent pinv tolerance.**
+eegprep 0.4.0's ASR reconstruction calls ``np.linalg.pinv`` with numpy's
+default ``rcond=1e-15`` (``plugins/clean_rawdata/asr_process.py`` line ~214,
+via the module-global ``finite_pinv(Q)``), while MATLAB's ``pinv`` uses the
+**absolute** tolerance ``max(size(A)) * eps(norm(A))`` (≈2.2e-14 for ~100
+channels; ``eps`` = ``np.spacing``, ``norm`` = largest singular value). The
+near-singular directions numpy inverts make ``clean_asr`` return ~1e15 µV
+instead of repaired data on real recordings. This step runs ``clean_asr``
+under a temporary patch of exactly that call site (replacing the
+``finite_pinv`` module global for the duration of the call, restored in
+``finally``) and records ``pinv_tolerance: 'matlab_max_size_eps(norm)'``. The
+patch is guarded: if the installed eegprep does not expose the expected call
+site, the step refuses to run (``eegprep_pinv_assumption_broken``) instead of
+silently falling back to the default tolerance.
+
 Supports both eegprep (EEGLab port) and asrpy implementations. The asrpy
 branch is kept functional but is not part of any golden chain: it does not
-annotate rejected windows and does not report the eegprep burden fields.
+annotate rejected windows, does not report the eegprep burden fields, and does
+not apply the drift high-pass (recorded honestly in its metadata).
 
 Probe findings (2026-10-14, eegprep 0.4.0 / mne 1.13.2, recorded per the
 skill's "verify, never trust memory" rule; probe under ``/tmp/opencode/``):
@@ -34,6 +84,14 @@ skill's "verify, never trust memory" rule; probe under ``/tmp/opencode/``):
   bool, ``True`` = retained. A value in (0, 1) is interpreted as a *fraction
   of bad channels per window*; other values as an absolute channel count.
   The mask is used for annotations only; the data are never cut here.
+- ``eegprep.clean_drifts(EEG, transition=(0.25, 0.75))`` (probed 2026-10-16)
+  applies a forward-backward Kaiser-windowed FIR high-pass (``transition`` =
+  lower/upper edge of the transition band in Hz), mutates and returns the
+  *same* EEG dict, and works directly on the ``eeg_mne2eeg`` output (which
+  carries an empty ``etc`` dict; ``clean_drifts`` writes its kernel into it).
+- ``eegprep.clean_asr(..., max_dims=0.66)`` — the fraction of dimensions ASR
+  may reconstruct; 0.66 is the eegprep/EEGLAB default and is now configurable
+  through the step and the chain.
 
 **B7-N1 (probed 2026-10-16) — interpolated channels must not enter ASR.**
 Spherical-spline interpolation (``InterpolateBadChannelsStep``, chain step 5)
@@ -44,7 +102,15 @@ fixture with one interpolated channel; 0 interpolated → 35). ``eegprep``'s
 ``clean_asr`` takes ``sqrtm`` of that matrix (``LinAlgWarning: Matrix is
 singular``) and returns ~1e15 µV instead of repaired data; the block-rejection
 gate then sees every 2-s block above its 100 µV threshold and the recording is
-excluded. This step therefore excludes the channels a previous ``interpolate``
+excluded. **Re-probed 2026-10-16 after the §12.6 drift high-pass and again
+after the R1 pinv fix:** the exactly-singular EGI-129 case is still
+rank-deficient (it is caught by the ``asr_calibration_covariance_degenerate``
+check below, with or without the drift filter), and the *near*-singular
+32-channel control (condition number ~2e4) that used to blow up is handled by
+the R1 MATLAB-equivalent pinv tolerance (the drift high-pass alone did **not**
+fix the real-data blow-ups — see the R1 note above) — so the exclusion is
+still required, and the failure mode stays loud either way. This step therefore
+excludes the channels a previous ``interpolate``
 step reconstructed (``metadata['interpolate']['interpolated_channels']``) from
 the ASR **input** — they are synthetic, carry no independent information, and
 stay in the recording (the average reference re-mixes them). Excluding them
@@ -59,16 +125,19 @@ otherwise contradict the repaired data (measured 1.02 / 1.09 relative-norm
 divergence from a fresh re-interpolation on the EGI-129 chain fixture).
 
 **B7-N2 (probed 2026-10-16) — ASR output magnitude blow-up guard.**
-``eegprep.clean_asr`` at ``cutoff=20`` on 0.1-Hz-high-passed data can return
-garbage at a huge scale instead of repaired data: the audit measured
-2.6e16–5.7e16 µV with moderate spatial mixing (calibration covariance
-condition number 9e4–1.4e6, i.e. *not* exactly singular). Probed here on a
-32-channel 0.1-Hz fixture with three near-duplicate channel pairs
-(condition number 2.2e8): ``clean_asr`` returned **4.6e15 µV** from a 13 µV
-input. Without a guard this garbage flows into the block-rejection gate, which
-then sees every block above its 100 µV threshold and reports the recording as
-*excluded for block contamination* — a catastrophic misattribution of a
-backend failure to the data. This step therefore fails loudly
+``eegprep.clean_asr`` at ``cutoff=20`` can return garbage at a huge scale
+instead of repaired data: the audit measured 2.6e16–5.7e16 µV with moderate
+spatial mixing (calibration covariance condition number 9e4–1.4e6, i.e. *not*
+exactly singular) — the root cause is the default pseudo-inverse tolerance,
+fixed by R1 above. Probed here on a 32-channel fixture with three
+near-duplicate channel pairs (condition number 2.2e8): ``clean_asr`` returned
+**4.6e15 µV** from a 13 µV input before R1. The guard stays as
+defense-in-depth: it covers the ``drift_transition_hz=None`` opt-out, other
+degenerate inputs, and any future backend regression, so a blow-up can never
+flow into the block-rejection gate, which would see every block above its
+100 µV threshold and report the recording as *excluded for block
+contamination* — a catastrophic misattribution of a backend failure to the
+data. This step therefore fails loudly
 (``RuntimeError``, reason ``asr_output_magnitude_blowup``) whenever the
 repaired output's maximum absolute amplitude exceeds
 :data:`ASR_OUTPUT_BLOWUP_FACTOR` × the input maximum, and records the
@@ -80,6 +149,7 @@ Author: EEGCPM Development Team
 Created: 2025-12
 """
 
+import warnings
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import mne
@@ -112,6 +182,162 @@ ASR_OUTPUT_BLOWUP_FACTOR: float = 1e3
 #: chain actually uses (F3, final-verification-audit fix round). This is the
 #: default of :class:`ASRStep` and what the hbn_langer wrapper passes.
 ASR_WINDOW_TOLERANCES: Tuple[float, float] = (-np.inf, 7.0)
+
+#: R1 (ASR scoped audit, 2026-10-16): metadata/get_config value recording that
+#: the ASR pseudo-inverse ran with MATLAB's default ``pinv`` tolerance
+#: (``max(size(A)) * eps(norm(A))``) instead of numpy's ``rcond=1e-15``. Named
+#: at module level so the hbn_langer wrapper's ``get_config()`` — and therefore
+#: the golden resolved-config hash — covers it.
+PINV_TOLERANCE_SPEC: str = "matlab_max_size_eps(norm)"
+
+#: eegprep release the R1 call-site assumption was verified against. The
+#: runtime guard checks the installed **source** (not only the version, which a
+#: patch release can keep while changing the call); a mismatch between the
+#: installed version and this value is recorded in the metadata, and a changed
+#: call site refuses the run loudly.
+EEGPREP_PINV_VERIFIED_VERSION: str = "0.4.0"
+
+
+def _matlab_pinv_tolerance(matrix: np.ndarray) -> float:
+    """MATLAB's default ``pinv`` tolerance: ``max(size(A)) * eps(norm(A))``.
+
+    MATLAB's ``eps(x)`` is the distance from ``x`` to the next larger float
+    (``np.spacing``) and ``norm(A)`` is the matrix 2-norm (largest singular
+    value), so this is an **absolute** cutoff compared against the singular
+    values of ``A`` — numpy's ``rcond`` is relative (``rcond * s_max``), which
+    is why the patched pinv converts this value.
+    """
+    matrix = np.asarray(matrix)
+    if matrix.size == 0:
+        return 0.0
+    spectral_norm = float(np.linalg.norm(matrix, 2))
+    return max(matrix.shape) * float(np.spacing(spectral_norm))
+
+
+def _pinv_with_matlab_tolerance(matrix: np.ndarray) -> np.ndarray:
+    """``np.linalg.pinv`` with MATLAB's default tolerance (R1).
+
+    Mirrors numpy's own pinv algorithm (SVD, then ``s > cutoff`` masking) but
+    uses MATLAB's absolute cutoff :func:`_matlab_pinv_tolerance` instead of
+    ``rcond * s_max`` with numpy's default ``rcond=1e-15``. The difference is
+    the whole point: near-singular directions in eegprep's ASR reconstruction
+    matrix are inverted under the numpy default and produce ~1e15 µV instead of
+    repaired data (measured on 4 of 6 pilot recordings that reach ASR), while
+    the MATLAB cutoff truncates them.
+    """
+    matrix = np.asarray(matrix)
+    if matrix.ndim != 2 or matrix.size == 0:
+        return np.linalg.pinv(matrix)
+    if np.iscomplexobj(matrix):
+        # N4 (scoped re-audit): numpy's pinv conjugates; this implementation
+        # does not. eegprep's ASR path forces a real matrix, so this cannot be
+        # reached today — fail loudly if that ever changes.
+        raise TypeError(
+            "matlab-tolerance pinv is implemented for real matrices only; "
+            "eegprep's ASR reconstruction matrix changed to complex input"
+        )
+    u, s, vt = np.linalg.svd(matrix, full_matrices=False)
+    if s.size == 0:
+        return np.zeros((matrix.shape[1], matrix.shape[0]), dtype=float)
+    tol = max(matrix.shape) * float(np.spacing(float(s[0])))
+    large = s > tol
+    s = np.divide(1, s, where=large, out=s)
+    s[~large] = 0
+    # numpy's own pinv reconstruction: ``vt.T @ (s[:, None] * u.T)`` (scales
+    # the rows of ``u.T``, i.e. ``vt.T @ diag(s) @ u.T``).
+    return vt.T @ (s[:, np.newaxis] * u.T)
+
+
+def _eegprep_asr_process_module():
+    """Import and return ``eegprep.plugins.clean_rawdata.asr_process``.
+
+    ``from eegprep.plugins.clean_rawdata import asr_process`` yields the
+    *function* (the package re-exports it), so the module is fetched through
+    ``importlib`` — the R1 patch needs the module object whose globals
+    ``asr_process`` resolves ``finite_pinv`` from.
+    """
+    import importlib
+
+    return importlib.import_module(
+        "eegprep.plugins.clean_rawdata.asr_process")
+
+
+def _verify_eegprep_pinv_assumption(asr_module) -> None:
+    """Fail loudly when eegprep's ASR no longer calls ``finite_pinv(Q)`` (R1).
+
+    The R1 patch replaces the ``finite_pinv`` module global for the duration of
+    ``clean_asr``. If a future eegprep renames the call, moves it to another
+    module, or otherwise changes the pseudo-inverse path, the patch would
+    silently do nothing and the blow-up regime would return unnoticed — so the
+    assumption is verified against the installed source before every patched
+    call and the run refuses to continue on a mismatch.
+    """
+    import inspect
+
+    import eegprep
+
+    problems = []
+    if not hasattr(asr_module, "finite_pinv"):
+        problems.append(
+            f"{asr_module.__name__} has no module-level finite_pinv")
+    else:
+        try:
+            asr_source = inspect.getsource(asr_module.asr_process)
+        except (OSError, TypeError):  # pragma: no cover - source unavailable
+            problems.append(
+                "asr_process source is unavailable for verification")
+        else:
+            if "finite_pinv(Q)" not in asr_source:
+                problems.append(
+                    "asr_process no longer calls finite_pinv(Q)")
+    if problems:
+        raise RuntimeError(
+            "eegprep_pinv_assumption_broken: the R1 MATLAB-pinv patch "
+            "(ASR scoped audit 2026-10-16) cannot be applied to the installed "
+            f"eegprep {getattr(eegprep, '__version__', 'unknown')}: "
+            + "; ".join(problems)
+            + ". Re-verify the eegprep ASR pseudo-inverse call site and update "
+            "steps/asr.py before running ASR (the default numpy tolerance "
+            "returns ~1e15 µV instead of repaired data)."
+        )
+
+
+class _MatlabPinvTolerancePatch:
+    """Context manager temporarily replacing eegprep's ASR ``finite_pinv`` (R1).
+
+    The replacement is the module global in
+    ``eegprep.plugins.clean_rawdata.asr_process`` — the minimal scoped target:
+    ``clean_asr`` calls ``asr_process`` from that module and ``asr_process``
+    resolves ``finite_pinv`` from its module globals at call time. Restored in
+    ``finally``, so an exception inside ``clean_asr`` never leaves the process
+    with a patched pinv. Nested/repeated use is safe (the saved original is the
+    current value, which is the patch itself only if a caller nests it).
+
+    N5 (scoped re-audit): the swap is a module-global mutation and is therefore
+    **not thread-safe** — ASR must run one recording at a time per process
+    (the pipeline's single-writer assumption). The assumption guard is a source
+    substring check on ``finite_pinv(Q)``; if eegprep changes the call site the
+    patch raises ``eegprep_pinv_assumption_broken`` rather than silently
+    reverting to the buggy tolerance.
+    """
+
+    def __init__(self) -> None:
+        self._asr_module = None
+        self._original = None
+
+    def __enter__(self):
+        asr_module = _eegprep_asr_process_module()
+        _verify_eegprep_pinv_assumption(asr_module)
+        self._asr_module = asr_module
+        self._original = asr_module.finite_pinv
+        asr_module.finite_pinv = _pinv_with_matlab_tolerance
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._asr_module is not None and self._original is not None:
+            self._asr_module.finite_pinv = self._original
+        return False
+
 
 
 def _true_runs(mask: np.ndarray) -> list:
@@ -216,16 +442,30 @@ class ASRStep(ProcessingStep):
 
     ASR identifies and reconstructs high-amplitude artifact subspaces. The
     EEGLab recommended workflow uses two-stage ASR (mild before ICA,
-    aggressive after ICA); the canonical HBN-Langer chain uses a single
-    aggressive pass (``cutoff=20``) after ICA-free artifact regression.
+    conservative after ICA); the canonical HBN-Langer chain uses a single
+    **conservative** pass (``cutoff=20``) after ICA-free artifact regression.
+    EEGLAB's cutoff semantics: **aggressive 3, default 5, conservative 20**
+    (``clean_asr`` docstring; the EEGLAB GUI's default is 20 and Chang et al.
+    2019 report the optimal range as 20-30), so 20 is the *conservative*
+    setting — not "aggressive" as an earlier version of this docstring said.
+
+    The ASR **input** is high-passed with ``eegprep.clean_drifts`` first
+    (EEGLAB's ``clean_artifacts`` does the same with ``(0.25, 0.75)``; the
+    ``clean_asr`` docstring requires zero-mean/high-passed input) and the
+    write-back is the high-passed repaired data — **no add-back**, exactly
+    EEGLAB's behaviour. ``info['highpass']`` is updated to the filter's
+    passband edge so the FIF describes the data it holds (R4). ``clean_asr``
+    runs under the MATLAB-equivalent pinv tolerance (R1). See the module
+    docstring.
 
     Parameters
     ----------
     cutoff : float
         ASR cutoff parameter (standard deviations). Lower = more aggressive.
-        Recommended: 40 for mild, 20 for aggressive.
+        EEGLAB: aggressive 3, default 5, conservative 20 (GUI default 20;
+        Chang et al. 2019 optimal 20-30).
     mode : str
-        Processing label only ('mild', 'aggressive' or 'single'); it does not
+        Processing label only ('mild', 'conservative' or 'single'); it does not
         change the numerics — ``cutoff`` does. Reported in the metadata.
     method : str
         Implementation: 'eegprep' (default, recommended) or 'asrpy'.
@@ -255,6 +495,21 @@ class ASRStep(ProcessingStep):
         ASR statistics window length in seconds; passed to
         ``clean_asr(window_len=...)`` only when set (``None`` = eegprep's own
         default ``max(0.5, 1.5 * n_channels / sfreq)``).
+    drift_transition_hz : (float, float) or None or 'off'
+        Transition band of the ``eegprep.clean_drifts`` high-pass applied to
+        the ASR **input** before calibration/repair (default ``(0.25, 0.75)``
+        — EEGLAB's own ``clean_artifacts`` band; ``clean_asr`` requires
+        zero-mean/high-passed input). The write-back is the high-passed
+        repaired data (no add-back) and ``info['highpass']`` is set to the
+        band's passband edge (R4). The upper edge must stay below the Nyquist
+        frequency (checked at runtime). ``None``/``'off'`` skips the filter;
+        that is the non-EEGLAB configuration the blow-up guard exists for, so
+        it emits a warning and records ``drift_filter_applied: False``.
+        eegprep backend only (asrpy is not part of any chain and does not
+        apply it; its metadata says so).
+    max_dims : float
+        Maximum fraction of dimensions ``clean_asr`` may reconstruct; passed
+        as ``max_dims`` (eegprep/EEGLAB default 0.66).
     exclude_channels : sequence of str
         Channels that must not enter ASR (in addition to bad channels). The
         recording's reference channel from
@@ -265,7 +520,7 @@ class ASRStep(ProcessingStep):
 
     Examples
     --------
-    Aggressive ASR (chain default):
+    Conservative ASR on EEGLAB-high-passed input (chain default):
 
     >>> step = ASRStep(cutoff=20, method='eegprep')
 
@@ -273,12 +528,22 @@ class ASRStep(ProcessingStep):
 
     >>> step = ASRStep(cutoff=20, calibration='fixed_first_60s',
     ...                train_duration=60.0)
+
+    The pre-2026-10-16 non-EEGLAB regime (no input high-pass; the blow-up
+    guard exists for it):
+
+    >>> step = ASRStep(cutoff=20, drift_transition_hz=None)
     """
 
     name = "asr"
-    version = "2.1"  # 2.1: B7 rev2 fix 7 (re-interpolate the ASR-excluded
-    # interpolated channels from the repaired data) + B7-N2 output blow-up
-    # guard; 2.0: full-length repair + BAD_asr_window + sidecar metadata
+    version = "2.3"  # 2.3: ASR scoped-audit R1 (MATLAB-equivalent pinv
+    # tolerance on clean_asr, guarded + recorded) and R4 (info['highpass']
+    # updated to the drift filter's passband edge); 2.2: EEGLAB-standard input
+    # high-pass (clean_drifts 0.25-0.75 before ASR, no add-back) + configurable
+    # max_dims (plan §12.6); 2.1: B7 rev2 fix 7 (re-interpolate the
+    # ASR-excluded interpolated channels from the repaired data) + B7-N2
+    # output blow-up guard; 2.0: full-length repair + BAD_asr_window + sidecar
+    # metadata
 
     def __init__(
         self,
@@ -290,6 +555,8 @@ class ASRStep(ProcessingStep):
         calibration: str = "data_driven",
         train_duration: float = 60.0,
         window_length: Optional[float] = None,
+        drift_transition_hz: Optional[Tuple[float, float]] = (0.25, 0.75),
+        max_dims: float = 0.66,
         exclude_channels: Sequence[str] = (),
         max_bad_chans: float = 0.1,
         enabled: bool = True,
@@ -313,6 +580,30 @@ class ASRStep(ProcessingStep):
         if not float(train_duration) > 0:
             raise ValueError(
                 f"train_duration must be > 0 s; got {train_duration!r}")
+        if drift_transition_hz is None or (
+            isinstance(drift_transition_hz, str) and drift_transition_hz == "off"
+        ):
+            # The non-EEGLAB regime (ASR on non-high-passed data). Kept
+            # expressible for probing/back-compat; the run warns and the
+            # metadata records that the filter was skipped.
+            self.drift_transition_hz: Optional[Tuple[float, float]] = None
+        else:
+            try:
+                values = tuple(float(v) for v in drift_transition_hz)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "drift_transition_hz must be None, 'off', or a "
+                    f"(low, high) transition band in Hz; got "
+                    f"{drift_transition_hz!r}")
+            if len(values) != 2 or not 0.0 < values[0] < values[1]:
+                raise ValueError(
+                    "drift_transition_hz must be a (low, high) pair with "
+                    f"0 < low < high (Hz); got {drift_transition_hz!r}")
+            self.drift_transition_hz = values
+        if not 0.0 < float(max_dims) <= 1.0:
+            raise ValueError(
+                "max_dims must be a fraction in (0, 1] (eegprep's maximum "
+                f"reconstructed dimensionality); got {max_dims!r}")
 
         self.cutoff = float(cutoff)
         self.mode = mode
@@ -322,6 +613,7 @@ class ASRStep(ProcessingStep):
         self.calibration = calibration
         self.train_duration = float(train_duration)
         self.window_length = None if window_length is None else float(window_length)
+        self.max_dims = float(max_dims)
         self.exclude_channels = tuple(exclude_channels)
         self.max_bad_chans = max_bad_chans
 
@@ -397,10 +689,17 @@ class ASRStep(ProcessingStep):
         The data-driven calibration selects its own window and works on
         arbitrarily short recordings (eegprep raises if there is not enough
         data for even one window).
+
+        R6 (ASR scoped audit): the ``drift_transition_hz`` upper edge must
+        stay below the Nyquist frequency — a transition band reaching Nyquist
+        is not a meaningful high-pass and ``clean_drifts`` would build a
+        degenerate kernel.
         """
         eeg_picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
         if len(eeg_picks) == 0:
             raise ValueError("No EEG channels available for ASR")
+
+        self._check_drift_nyquist(float(raw.info["sfreq"]))
 
         if self.calibration == "fixed_first_60s":
             required_samples = int(round(self.train_duration * raw.info["sfreq"]))
@@ -410,6 +709,20 @@ class ASRStep(ProcessingStep):
                     f"(calibration='fixed_first_60s'): need {self.train_duration}s "
                     f"({required_samples} samples), have {raw.n_times} samples")
         return True
+
+    def _check_drift_nyquist(self, sfreq: float) -> None:
+        """Refuse a drift transition band whose upper edge reaches Nyquist (R6)."""
+        if self.drift_transition_hz is None:
+            return
+        upper = float(self.drift_transition_hz[1])
+        nyquist = sfreq / 2.0
+        if upper >= nyquist:
+            raise ValueError(
+                "drift_transition_hz upper edge must be below the Nyquist "
+                f"frequency: got {upper:g} Hz with sfreq {sfreq:g} Hz "
+                f"(Nyquist {nyquist:g} Hz). clean_drifts cannot apply a "
+                "high-pass that reaches Nyquist."
+            )
 
     # ------------------------------------------------------------------
     # processing
@@ -508,6 +821,14 @@ class ASRStep(ProcessingStep):
         The recording is never rebuilt: only the picked rows of the original
         ``raw._data`` are overwritten, so ``meas_date``, ``highpass``,
         ``lowpass``, ``bads``, the montage and every annotation survive.
+
+        The ASR **input** is high-passed with ``eegprep.clean_drifts`` first
+        (EEGLAB-standard; ``clean_asr`` requires zero-mean input — see the
+        module docstring) and the write-back is the high-passed repaired data
+        (no add-back, exactly EEGLAB). ``pre_max_uv`` and the
+        ``repaired_fraction`` mask are measured against that post-drift ASR
+        input; the separate high-pass effect is recorded as
+        ``drift_filter_modified_fraction``.
         """
         import eegprep  # imported lazily; check_dependencies() preflights it
 
@@ -524,7 +845,37 @@ class ASRStep(ProcessingStep):
         eeg = eegprep.eeg_mne2eeg(raw.copy().pick(picks))
         sfreq = float(eeg["srate"])
         n_samples = int(np.asarray(eeg["data"]).shape[1])
-        pre_uv = np.asarray(eeg["data"], dtype=float)
+
+        # R6: a drift transition band reaching Nyquist is refused at runtime
+        # too (validate_inputs is the executor's pre-flight; a direct
+        # process() call must not bypass the check).
+        self._check_drift_nyquist(sfreq)
+
+        # --- EEGLAB-standard input high-pass (plan §12.6) ---
+        # clean_asr requires high-passed (zero-mean) input; EEGLAB's
+        # clean_artifacts applies clean_drifts((0.25, 0.75)) internally before
+        # ASR and keeps the high-passed output. Applied to the ASR input only
+        # (after the picks/exclusions, before the calibration reference is
+        # extracted). `clean_drifts` mutates and returns the same EEG dict —
+        # this is a fresh dict from `eeg_mne2eeg`, so the caller's Raw is
+        # untouched.
+        drift_filter_applied = self.drift_transition_hz is not None
+        if drift_filter_applied:
+            eeg = eegprep.clean_drifts(eeg, tuple(self.drift_transition_hz))
+        else:
+            warnings.warn(
+                "ASRStep: drift_transition_hz is off — running clean_asr on "
+                "non-high-passed data. EEGLAB requires zero-mean/high-passed "
+                "input (clean_asr docstring); this is the non-EEGLAB "
+                "configuration, numerically less conditioned than the "
+                "EEGLAB-standard path, and the B7-N2 magnitude guard stays in "
+                "place for it. Set drift_transition_hz=(0.25, 0.75) for the "
+                "EEGLAB-standard path.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        pre_uv = np.asarray(eeg["data"], dtype=float)   # ASR input, post-drift
         pre_max_uv = float(np.max(np.abs(pre_uv))) if pre_uv.size else 0.0
 
         # --- calibration ---
@@ -572,7 +923,20 @@ class ASRStep(ProcessingStep):
         if self.window_length is not None:
             asr_kwargs["window_len"] = self.window_length
 
-        eeg_repaired = eegprep.clean_asr(eeg, cutoff=self.cutoff, **asr_kwargs)
+        # R1 (ASR scoped audit, 2026-10-16): eegprep 0.4.0's ASR reconstruction
+        # calls ``np.linalg.pinv`` with numpy's default ``rcond=1e-15``, while
+        # MATLAB's ``pinv`` uses the absolute tolerance
+        # ``max(size(A)) * eps(norm(A))``. The default inverts near-singular
+        # directions and returns ~1e15 µV instead of repaired data on real
+        # recordings (4 of 6 pilot recordings that reach ASR). ``clean_asr``
+        # runs under the MATLAB-equivalent tolerance; the patch replaces the
+        # module global in ``asr_process`` and is restored in ``finally``, and
+        # the call site is source-verified first (a changed eegprep raises
+        # ``eegprep_pinv_assumption_broken`` instead of silently reverting).
+        with _MatlabPinvTolerancePatch():
+            eeg_repaired = eegprep.clean_asr(
+                eeg, cutoff=self.cutoff, max_dims=self.max_dims, **asr_kwargs)
+        eegprep_version = str(getattr(eegprep, "__version__", "unknown"))
         post_uv = np.asarray(eeg_repaired["data"], dtype=float)
 
         # --- output checks (fail loudly; never zero-fill, never cut) ---
@@ -608,6 +972,25 @@ class ASRStep(ProcessingStep):
 
         post = post_uv * 1e-6                     # µV → V
         raw._data[picks] = post
+
+        # R4 (ASR scoped audit, 2026-10-16): the write-back is the
+        # clean_drifts-high-passed data (no add-back), so `info['highpass']`
+        # must describe the data the recording now holds. MNE's own
+        # `filter(l_freq, h_freq)` records `info['highpass'] = l_freq` (the
+        # passband edge, verified on mne 1.13.2); the equivalent edge here is
+        # the transition band's upper edge (0.75 Hz for the default
+        # (0.25, 0.75)). Before this, the FIF kept the chain's stale 0.1 Hz
+        # value and claimed a passband the data no longer has. The full
+        # transition band stays in the metadata (`drift_transition_hz`).
+        info_highpass_hz: Optional[float] = None
+        if drift_filter_applied:
+            # N1 (scoped re-audit): never *lower* an existing stronger
+            # high-pass (explicit configs use 0.5–1 Hz); report the effective
+            # edge, i.e. the max of the prior value and this band's edge.
+            prior_highpass = float(raw.info["highpass"])
+            info_highpass_hz = max(prior_highpass, float(self.drift_transition_hz[1]))
+            with raw.info._unlock():
+                raw.info["highpass"] = info_highpass_hz
 
         # B7 rev2 fix 7: the excluded interpolated channels still hold their
         # pre-ASR spline values; re-interpolate them from the repaired data.
@@ -646,11 +1029,27 @@ class ASRStep(ProcessingStep):
         # A sample counts as repaired when the cross-channel RMS of the
         # post−pre difference exceeds half the cross-channel RMS of the
         # pre-ASR data: a conservative detector of samples ASR rewrote.
-        pre_rms = np.sqrt(np.mean(pre ** 2, axis=0))
-        diff_rms = np.sqrt(np.mean((post - pre) ** 2, axis=0))
+        # `pre` here is the ASR INPUT (post-drift, in V): the drift high-pass
+        # is a deliberate EEGLAB-standard transform, not an ASR repair, so it
+        # must not inflate `repaired_fraction` (its own effect is recorded
+        # separately below as `drift_filter_modified_fraction`).
+        asr_input = pre_uv * 1e-6                 # µV → V (post-drift)
+        pre_rms = np.sqrt(np.mean(asr_input ** 2, axis=0))
+        diff_rms = np.sqrt(np.mean((post - asr_input) ** 2, axis=0))
         repaired_mask = diff_rms > 0.5 * pre_rms
         repaired_runs = _true_runs(repaired_mask)
         repaired_fraction = float(repaired_mask.mean())
+        # Separate record of the drift high-pass's own effect on the write-back
+        # (post-drift ASR input vs the original pre-ASR data): without it the
+        # metadata would not show that the output is high-passed relative to
+        # the chain input. None when the filter was skipped.
+        if drift_filter_applied:
+            raw_rms = np.sqrt(np.mean(pre ** 2, axis=0))
+            drift_diff_rms = np.sqrt(np.mean((asr_input - pre) ** 2, axis=0))
+            drift_filter_modified_fraction: Optional[float] = float(
+                (drift_diff_rms > 0.5 * raw_rms).mean())
+        else:
+            drift_filter_modified_fraction = None
         # The mask is computed on the REPAIRED data (B3-K7): these numbers
         # measure RESIDUAL post-repair badness. Windows ASR fully repaired are
         # deliberately NOT marked — repaired data are correct data (user
@@ -667,6 +1066,29 @@ class ASRStep(ProcessingStep):
             "calibration": self.calibration,
             "n_calibration_samples": n_calibration_samples,
             "cutoff": self.cutoff,
+            "max_dims": self.max_dims,
+            # Plan §12.6 (EEGLAB-standard): the ASR input was high-passed with
+            # clean_drifts(drift_transition_hz) and the write-back is the
+            # high-passed repaired data (no add-back — EEGLAB keeps the HP
+            # output). `drift_filter_applied=False` is the non-EEGLAB regime
+            # (warned about above).
+            "drift_transition_hz": (
+                None if self.drift_transition_hz is None
+                else list(self.drift_transition_hz)
+            ),
+            "drift_filter_applied": drift_filter_applied,
+            "drift_filter_modified_fraction": drift_filter_modified_fraction,
+            # R4: the passband edge written into info['highpass'] (None when
+            # the filter was skipped — the recording keeps the chain's value).
+            "info_highpass_hz": info_highpass_hz,
+            # R1: the pseudo-inverse tolerance clean_asr ran under (MATLAB's
+            # default) and the eegprep release it was verified against. The
+            # call site is source-verified before the patch; a version that
+            # differs from the verified one while still exposing the expected
+            # call site is recorded here so provenance shows the drift.
+            "pinv_tolerance": PINV_TOLERANCE_SPEC,
+            "eegprep_version": eegprep_version,
+            "eegprep_pinv_verified_version": EEGPREP_PINV_VERIFIED_VERSION,
             "window_criterion": self.window_criterion,
             "window_tolerances": list(self.window_tolerances),
             "window_length": self.window_length,
@@ -734,7 +1156,10 @@ class ASRStep(ProcessingStep):
         Raw (asrpy's own copy) and does not annotate rejected windows or
         report the eegprep burden fields. asrpy always fits on the first
         ``train_duration`` seconds, so its ``calibration`` metadata value is
-        ``'asrpy_fit_first_train_duration'``, never the eegprep value.
+        ``'asrpy_fit_first_train_duration'``, never the eegprep value. The
+        EEGLAB-standard drift high-pass is **not** applied here (``max_dims``
+        is an eegprep-only parameter too); the metadata records both facts
+        instead of silently implying the EEGLAB path.
 
         **Recorded limitation (B7-N1):** this branch receives no ``metadata``,
         so it does **not** exclude interpolated channels from the fit. asrpy
@@ -770,6 +1195,16 @@ class ASRStep(ProcessingStep):
             'n_calibration_samples': train_samples,
             'cutoff': self.cutoff,
             'mode': self.mode,
+            # Truthfulness: the EEGLAB drift high-pass / max_dims are not part
+            # of this backend's path.
+            'drift_transition_hz': None,
+            'drift_filter_applied': False,
+            'drift_filter_note': 'asrpy backend: clean_drifts not applied',
+            'max_dims': None,
+            # R1: the MATLAB-pinv patch is an eegprep-path fix; asrpy does not
+            # use numpy's pinv for its reconstruction.
+            'pinv_tolerance': None,
+            'pinv_tolerance_note': 'asrpy backend: numpy pinv tolerance not applicable',
             'n_samples_before': int(raw.n_times),
             'n_samples_after': int(raw_cleaned.n_times),
         }
@@ -812,7 +1247,19 @@ class ASRStep(ProcessingStep):
             'calibration': self.calibration,
             'train_duration': self.train_duration,
             'window_length': self.window_length,
+            # Plan §12.6: the ASR input high-pass (clean_drifts) and the
+            # maximum reconstructed dimensionality are behaviour-affecting.
+            'drift_transition_hz': (
+                None if self.drift_transition_hz is None
+                else list(self.drift_transition_hz)
+            ),
+            'max_dims': self.max_dims,
             'exclude_channels': list(self.exclude_channels),
             'max_bad_chans': self.max_bad_chans,
+            # R1 (ASR scoped audit): the eegprep ASR pseudo-inverse runs under
+            # the MATLAB-equivalent tolerance; the spec string is a
+            # behaviour-affecting constant of the eegprep path (it changes the
+            # repaired data), so it is part of the resolved config.
+            'pinv_tolerance': PINV_TOLERANCE_SPEC,
         })
         return config

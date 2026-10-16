@@ -20,6 +20,7 @@ The data-relative position of an annotation is therefore
 ``onset - raw.first_time``, and an event's sample is ``onset * sfreq``.
 """
 
+import contextlib
 import json
 from datetime import datetime, timezone
 
@@ -49,7 +50,8 @@ CH_NAMES = [
     "FC5", "FC6", "CP1", "CP2", "CP5", "CP6", "TP9", "TP10",
 ]
 
-# Metadata keys ASRStep must report (plan §B3 task 2; B7 rev2 additions).
+# Metadata keys ASRStep must report (plan §B3 task 2; B7 rev2 additions;
+# §12.6 EEGLAB-standard ASR additions; R1/R4 ASR scoped audit additions).
 REQUIRED_METADATA_KEYS = [
     "applied", "implementation", "calibration", "n_calibration_samples",
     "cutoff", "window_criterion", "window_tolerances", "n_channels_asr",
@@ -62,6 +64,12 @@ REQUIRED_METADATA_KEYS = [
     "reinterpolation_relative_norm", "pre_max_uv", "post_max_uv",
     "output_magnitude_ratio", "calibration_cov_cond",
     "calibration_cov_min_eig",
+    # Plan §12.6 (EEGLAB-standard ASR): input high-pass + max_dims provenance.
+    "drift_transition_hz", "drift_filter_applied",
+    "drift_filter_modified_fraction", "max_dims",
+    # R1/R4 (ASR scoped audit): pinv tolerance + truthful info['highpass'].
+    "info_highpass_hz", "pinv_tolerance", "eegprep_version",
+    "eegprep_pinv_verified_version",
 ]
 
 
@@ -165,7 +173,11 @@ def test_events_identical_after_asr(calibration):
     assert out.n_times == N_TIMES
     assert out is raw, "ASR must write back into the original Raw"
     assert out.info["meas_date"] == meas_date_before
-    assert out.info["highpass"] == highpass_before
+    # R4 (ASR scoped audit): the write-back is the clean_drifts-high-passed
+    # data, so info['highpass'] is updated to the filter's passband edge
+    # (0.75 Hz) — the fixture's own 0.5 Hz value describes the pre-ASR data.
+    assert highpass_before == 0.5
+    assert out.info["highpass"] == 0.75
     assert out.info["lowpass"] == lowpass_before
     assert list(out.info["bads"]) == bads_before
 
@@ -472,27 +484,62 @@ def _near_duplicate_hp_raw(seed=3, duration_s=120.0):
     return raw
 
 
-def test_asr_blowup_guard_fires_on_real_eegprep_output():
+def test_asr_blowup_guard_fires_on_real_eegprep_output(monkeypatch):
     """B7-N2: real eegprep garbage (4.6e15 µV) fails loudly in the ASR step.
 
     The guard must fire *inside* the step (reason ``asr_output_magnitude_blowup``)
     and must not have written the garbage back into the caller's recording, so
     the block-rejection gate can never misattribute the blow-up to the data.
+
+    R1 (ASR scoped audit, 2026-10-16): the step now runs ``clean_asr`` under the
+    MATLAB-equivalent pinv tolerance, which fixes *this very fixture* — so the
+    default-tolerance regime is reproduced here by disabling the patch
+    (``_MatlabPinvTolerancePatch`` -> a no-op context manager). The guard stays
+    as defense-in-depth: a flat channel entering ASR still blows up even with
+    the patch (see ``test_reference_channel_excluded``), and future backend
+    regressions must still fail here rather than in the block gate.
     """
-    raw = _near_duplicate_hp_raw()
-    input_max_uv = float(np.abs(raw.get_data()).max()) * 1e6
-    assert input_max_uv < 1e3  # sanity: a µV-scale fixture
+    from eegcpm.modules.preprocessing.steps import asr as asr_mod
 
-    with pytest.raises(RuntimeError, match="asr_output_magnitude_blowup") as excinfo:
-        ASRStep(calibration="fixed_first_60s", train_duration=60.0).process(raw, {})
+    with monkeypatch.context() as m:
+        m.setattr(asr_mod, "_MatlabPinvTolerancePatch", contextlib.nullcontext)
 
-    message = str(excinfo.value)
-    assert "input max" in message and "output max" in message
-    # The failed run must not leave the caller's data corrupted (the guard runs
-    # before the write-back).
-    assert float(np.abs(raw.get_data()).max()) * 1e6 == pytest.approx(input_max_uv)
-    # Attribution: the message names the eegprep failure mode, not the data.
-    assert "clean_asr" in message and "sqrtm" in message
+        raw = _near_duplicate_hp_raw()
+        input_max_uv = float(np.abs(raw.get_data()).max()) * 1e6
+        assert input_max_uv < 1e3  # sanity: a µV-scale fixture
+
+        with pytest.raises(RuntimeError,
+                           match="asr_output_magnitude_blowup") as excinfo:
+            ASRStep(calibration="fixed_first_60s", train_duration=60.0,
+                    drift_transition_hz=None).process(raw, {})
+
+        message = str(excinfo.value)
+        assert "input max" in message and "output max" in message
+        # The failed run must not leave the caller's data corrupted (the guard
+        # runs before the write-back).
+        assert float(np.abs(raw.get_data()).max()) * 1e6 == pytest.approx(
+            input_max_uv)
+        # Attribution: the message names the eegprep failure mode, not the data.
+        assert "clean_asr" in message and "sqrtm" in message
+
+    # R1 non-vacuity: the same fixture is now clean even in the non-high-passed
+    # (drift-off) regime — the fix, not the high-pass, is what tames it.
+    raw2 = _near_duplicate_hp_raw()
+    _, meta = ASRStep(calibration="fixed_first_60s", train_duration=60.0,
+                      drift_transition_hz=None).process(raw2, {})
+    assert np.isfinite(raw2.get_data()).all()
+    assert meta["output_magnitude_ratio"] < 2.0, (
+        "the MATLAB-tolerance pinv no longer tames the near-duplicate fixture "
+        f"(ratio {meta['output_magnitude_ratio']:.3g})"
+    )
+
+    # ... and the EEGLAB-standard path (the chain default) is clean too.
+    raw3 = _near_duplicate_hp_raw()
+    _, meta3 = ASRStep(calibration="fixed_first_60s",
+                       train_duration=60.0).process(raw3, {})
+    assert meta3["drift_filter_applied"] is True
+    assert np.isfinite(raw3.get_data()).all()
+    assert meta3["output_magnitude_ratio"] < 2.0
 
 
 def test_asr_blowup_guard_reports_pre_and_post_maxima(monkeypatch):
@@ -532,7 +579,7 @@ def test_asr_guard_does_not_fire_on_legitimate_repair():
     assert meta["pre_max_uv"] > 0 and meta["post_max_uv"] > 0
 
 
-def test_asr_blowup_is_never_reported_as_block_exclusion(tmp_path):
+def test_asr_blowup_is_never_reported_as_block_exclusion(tmp_path, monkeypatch):
     """B7-N2: a blow-up fails the ASR step, never the block-rejection gate.
 
     The garbage output would make every 2-s block exceed the block gate's
@@ -540,13 +587,25 @@ def test_asr_blowup_is_never_reported_as_block_exclusion(tmp_path):
     ``excluded`` for *block contamination* — a backend failure blamed on the
     data. Through the executor: ``asr`` is ``failed``, the run has no FIF and a
     FAILED sidecar, and there is no ``excluded`` record.
+
+    R1: the step's MATLAB-tolerance pinv fixes this fixture's blow-up, so the
+    default-tolerance regime is reproduced by disabling the patch — the point
+    here is the *attribution* (step failure, never a data exclusion) if any
+    backend ever returns garbage again.
     """
+    from eegcpm.modules.preprocessing.steps import asr as asr_mod
+
     raw = _near_duplicate_hp_raw()
     pipeline = PreprocessingPipeline(
-        [{"name": "asr", "params": {"calibration": "fixed_first_60s"}}],
+        [{"name": "asr",
+          # The non-high-passed regime (see the guard test above).
+          "params": {"calibration": "fixed_first_60s",
+                     "drift_transition_hz": None}}],
         tmp_path,
     )
-    result = pipeline.process(raw, subject_id="blowup")
+    with monkeypatch.context() as m:
+        m.setattr(asr_mod, "_MatlabPinvTolerancePatch", contextlib.nullcontext)
+        result = pipeline.process(raw, subject_id="blowup")
 
     assert result.success is False
     assert result.metadata["step_status"]["asr"] == "failed"
@@ -557,6 +616,180 @@ def test_asr_blowup_is_never_reported_as_block_exclusion(tmp_path):
     assert (tmp_path / "blowup_preprocessing_FAILED.json").exists()
 
 
+
+
+# ----------------------------------------------------------------------
+# §12.6 — EEGLAB-standard ASR: clean_drifts input high-pass + max_dims
+# ----------------------------------------------------------------------
+
+def _drift_fixture(drift_hz=0.2, drift_uv=300.0, duration_s=120.0, seed=5):
+    """32-channel 120-s fixture with a strong sub-transition (0.2 Hz) drift.
+
+    Filtered 0.1-45 Hz like the chain's step-3 output, so the 0.2 Hz drift is
+    still in the data when ASR runs: the EEGLAB-standard ``clean_drifts``
+    (0.25, 0.75) must remove it (an 80 dB stop-band high-pass), while ASR
+    alone (the pre-§12.6 path) barely touches it.
+    """
+    rng = np.random.default_rng(seed)
+    n = int(duration_s * SFREQ)
+    t = np.arange(n) / SFREQ
+    data = rng.standard_normal((len(CH_NAMES), n)) * 10e-6
+    data += (drift_uv * 1e-6) * np.sin(2 * np.pi * drift_hz * t)[None, :]
+    info = mne.create_info(CH_NAMES, SFREQ, "eeg")
+    raw = mne.io.RawArray(data, info, first_samp=1000, verbose=False)
+    raw.set_montage(mne.channels.make_standard_montage("standard_1020"),
+                    match_case=False, on_missing="ignore")
+    raw.filter(0.1, 45.0, verbose=False)
+    raw.info["bads"] = []
+    return raw
+
+
+def _band_power(data, sfreq, lo, hi, nperseg_s=20.0):
+    """Mean Welch PSD in [lo, hi) Hz over channels."""
+    from scipy.signal import welch
+
+    nperseg = min(int(nperseg_s * sfreq), data.shape[1])
+    freqs, psd = welch(data, sfreq, nperseg=nperseg, axis=1)
+    band = (freqs >= lo) & (freqs < hi)
+    return float(psd[:, band].mean())
+
+
+def test_drift_highpass_applied_to_asr_input(monkeypatch):
+    """§12.6: clean_drifts runs on the ASR input, before clean_asr.
+
+    The EEGLAB-standard path is ``clean_drifts(EEG, (0.25, 0.75))`` then ASR
+    (``clean_artifacts`` does exactly this; ``clean_asr`` requires high-passed
+    input). The data handed to ``clean_asr`` must be the drift-filtered data —
+    asserted by object identity, because ``clean_drifts`` mutates and returns
+    the same EEG dict.
+    """
+    import eegprep
+
+    calls = []
+    seen = {}
+    real_drifts = eegprep.clean_drifts
+    real_asr = eegprep.clean_asr
+
+    def spy_drifts(EEG, transition=(0.5, 1.0), **kwargs):
+        calls.append(("clean_drifts", tuple(transition)))
+        out = real_drifts(EEG, transition, **kwargs)
+        seen["drift_output"] = out
+        return out
+
+    def spy_asr(EEG, **kwargs):
+        calls.append(("clean_asr", kwargs.get("cutoff")))
+        seen["asr_input"] = EEG
+        return real_asr(EEG, **kwargs)
+
+    monkeypatch.setattr(eegprep, "clean_drifts", spy_drifts)
+    monkeypatch.setattr(eegprep, "clean_asr", spy_asr)
+
+    raw = _make_raw()
+    out, meta = ASRStep().process(raw, {})
+
+    assert [name for name, _ in calls] == ["clean_drifts", "clean_asr"], (
+        f"expected clean_drifts before clean_asr; got {calls}")
+    assert calls[0][1] == (0.25, 0.75)
+    assert seen["asr_input"] is seen["drift_output"], (
+        "clean_asr did not receive the clean_drifts output")
+    assert meta["drift_filter_applied"] is True
+    assert meta["drift_transition_hz"] == [0.25, 0.75]
+
+
+def test_drift_highpass_removes_sub_transition_content():
+    """§12.6: the write-back has the sub-transition band removed (band power).
+
+    The EEGLAB-standard path keeps the high-passed data (no add-back), so the
+    step output must have far less 0.1-0.4 Hz power than the input while the
+    8-45 Hz band is preserved (ASR repairs, it does not low-pass).
+    """
+    raw = _drift_fixture()
+    pre = raw.get_data(picks="eeg")
+    pre_low = _band_power(pre, SFREQ, 0.1, 0.4)
+    pre_high = _band_power(pre, SFREQ, 8.0, 45.0)
+    assert pre_low > 0, "fixture has no sub-transition power to remove"
+
+    out, meta = ASRStep().process(raw, {})
+    post = out.get_data(picks="eeg")
+
+    low_ratio = _band_power(post, SFREQ, 0.1, 0.4) / pre_low
+    high_ratio = _band_power(post, SFREQ, 8.0, 45.0) / pre_high
+    assert low_ratio < 0.1, (
+        f"0.1-0.4 Hz power ratio {low_ratio:.3g}: the clean_drifts high-pass "
+        "did not reach the write-back")
+    assert 0.5 < high_ratio < 2.0, (
+        f"8-45 Hz power ratio {high_ratio:.3g}: ASR changed the passband band "
+        "power far beyond repair expectations")
+    assert meta["drift_filter_modified_fraction"] > 0.0
+
+
+def test_drift_off_skips_filter_with_warning(monkeypatch):
+    """``None``/``'off'`` skips the high-pass, warns, and records it.
+
+    The non-EEGLAB regime (ASR on non-high-passed data) is still expressible,
+    but it must be loud: ``clean_drifts`` is not called, a RuntimeWarning is
+    emitted, and the metadata states ``drift_filter_applied: False`` so a
+    sidecar can never claim the EEGLAB path was run.
+    """
+    import eegprep
+
+    called = []
+    real_drifts = eegprep.clean_drifts
+    monkeypatch.setattr(
+        eegprep, "clean_drifts",
+        lambda EEG, *a, **k: (called.append(True), real_drifts(EEG, *a, **k))[1])
+
+    assert ASRStep(drift_transition_hz="off").drift_transition_hz is None
+    assert ASRStep(drift_transition_hz=None).drift_transition_hz is None
+
+    raw = _make_raw()
+    with pytest.warns(RuntimeWarning, match="drift_transition_hz is off"):
+        out, meta = ASRStep(drift_transition_hz=None).process(raw, {})
+
+    assert called == [], "clean_drifts ran although drift_transition_hz=None"
+    assert meta["drift_filter_applied"] is False
+    assert meta["drift_transition_hz"] is None
+    assert meta["drift_filter_modified_fraction"] is None
+    assert meta["max_dims"] == 0.66
+
+    # Malformed transition bands are refused at construction.
+    for bad in (0.5, (1.0, 0.5), (0.0, 0.75), (0.25, 0.75, 1.0), "nope"):
+        with pytest.raises(ValueError, match="drift_transition_hz"):
+            ASRStep(drift_transition_hz=bad)
+    for bad_dims in (0.0, -0.1, 1.5):
+        with pytest.raises(ValueError, match="max_dims"):
+            ASRStep(max_dims=bad_dims)
+
+
+def test_max_dims_reaches_clean_asr(monkeypatch):
+    """§12.6: the configured ``max_dims`` is the value clean_asr receives."""
+    import eegprep
+
+    seen = {}
+    real_asr = eegprep.clean_asr
+
+    def spy_asr(EEG, **kwargs):
+        seen.update(kwargs)
+        return real_asr(EEG, **kwargs)
+
+    monkeypatch.setattr(eegprep, "clean_asr", spy_asr)
+
+    raw = _make_raw()
+    _, meta = ASRStep().process(raw, {})
+    assert seen["max_dims"] == 0.66
+    assert meta["max_dims"] == 0.66
+
+    raw2 = _make_raw()
+    _, meta2 = ASRStep(max_dims=0.5).process(raw2, {})
+    assert seen["max_dims"] == 0.5
+    assert meta2["max_dims"] == 0.5
+
+    # Through the chain wrapper: the configured value is what the step runs.
+    raw3 = _make_raw()
+    _, meta3 = _ASRStepWrapper(max_dims=0.4).process(
+        raw3, {"channel_roles": {"reference_channel": "Cz"}})
+    assert seen["max_dims"] == 0.4
+    assert meta3["max_dims"] == 0.4
 
 
 # ----------------------------------------------------------------------
@@ -582,10 +815,25 @@ def test_wrapper_metadata_truthful():
     assert isinstance(meta["n_bad_windows"], int)       # int, not numpy
     assert "temp" not in out.info or not out.info["temp"], (
         "ASR wrote state into info['temp'] (it does not survive a FIF save)")
+    # Plan §12.6: the chain default runs the EEGLAB-standard path and the
+    # wrapper's metadata reports it.
+    assert meta["drift_filter_applied"] is True
+    assert meta["drift_transition_hz"] == [0.25, 0.75]
+    assert meta["max_dims"] == 0.66
 
-    # An unsupported calibration is refused instead of silently ignored.
+    # An unsupported calibration is refused instead of silently ignored ...
     with pytest.raises(ValueError, match="fixed_first_60s"):
-        _ASRStepWrapper(calibration_window="data_driven")
+        _ASRStepWrapper(calibration_window="not_a_calibration")
+
+    # ... while the per-dataset data-driven calibration (EEGLAB's automatic
+    # clean-window selection) is now supported and reported truthfully.
+    dd = _ASRStepWrapper(calibration_window="data_driven")
+    assert dd.validate_inputs(_make_raw()) is True
+    cfg = dd.get_config()
+    assert cfg["calibration_window"] == "data_driven"
+    assert cfg["calibration_reference"] == "eegprep_clean_windows_selection"
+    assert cfg["ref_maxbadchannels"] == 0.075
+    assert cfg["ref_tolerances"] == [-np.inf, 5.5]
 
 
 def test_metadata_is_json_native_and_complete():
@@ -902,11 +1150,15 @@ def test_asr_wrapper_config_matches_fixed_path_kwargs(monkeypatch):
     assert isinstance(ref, np.ndarray) and ref.ndim == 2
     assert ref.shape[1] == int(60.0 * SFREQ)
     assert "ref_tolerances" not in calls
+    # §12.6: the EEGLAB-standard path is what the wrapper actually runs.
+    assert calls["max_dims"] == 0.66
 
     cfg = wrapper.get_config()
     assert cfg["calibration_reference"] == "first_train_duration_s_of_data"
     assert cfg["ref_maxbadchannels"] == "calibration_array"
     assert cfg["ref_tolerances"] == "eegprep_default"
+    assert cfg["drift_transition_hz"] == [0.25, 0.75]
+    assert cfg["max_dims"] == 0.66
 
 
 def test_asr_degenerate_calibration_covariance_raises(monkeypatch):
@@ -929,3 +1181,219 @@ def test_asr_degenerate_calibration_covariance_raises(monkeypatch):
     step = ASRStep(calibration="fixed_first_60s", train_duration=60.0)
     with pytest.raises(RuntimeError, match="asr_calibration_covariance_degenerate"):
         step.process(raw, {})
+
+
+# ----------------------------------------------------------------------
+# R1 (ASR scoped audit, 2026-10-16): MATLAB-equivalent pinv tolerance
+# ----------------------------------------------------------------------
+
+def _pinv_reproducer_raw(sinusoid_uv=20.0, seed=11, duration_s=120.0):
+    """32-channel fixture whose ASR blow-up depends on the pinv tolerance.
+
+    The auditor's starting point (32 channels, calibration covariance
+    condition number ~8.7e3, a 10 Hz common sinusoid) reproduced
+    deterministically: cumulative-sum 1/f noise (10 µV) plus a 20 µV common
+    10 Hz sinusoid, 0.1-45 Hz filtered — measured calibration covariance
+    condition number 1.2e4 and a 38 µV input maximum. With eegprep's default
+    ``np.linalg.pinv`` (``rcond=1e-15``) ``clean_asr`` returns garbage at
+    ~1e13 µV (caught by the ``asr_output_magnitude_blowup`` guard); with
+    the MATLAB tolerance ``max(size) * eps(norm(A))`` the same call is clean
+    (ratio ~1). Probed 2026-10-16; this is the regression test for the R1 fix.
+    """
+    rng = np.random.default_rng(seed)
+    n = int(duration_s * SFREQ)
+    data = np.cumsum(rng.standard_normal((len(CH_NAMES), n)), axis=1)
+    data -= data.mean(axis=1, keepdims=True)
+    data *= 10e-6 / data.std(axis=1, keepdims=True)
+    t = np.arange(n) / SFREQ
+    data += (sinusoid_uv * 1e-6) * np.sin(2 * np.pi * 10.0 * t)[None, :]
+    info = mne.create_info(CH_NAMES, SFREQ, "eeg")
+    raw = mne.io.RawArray(data, info, first_samp=1000, verbose=False)
+    raw.set_montage(mne.channels.make_standard_montage("standard_1020"),
+                    match_case=False, on_missing="ignore")
+    raw.filter(0.1, 45.0, verbose=False)
+    raw.info["bads"] = []
+    return raw
+
+
+def test_matlab_pinv_tolerance_helper_matches_matlab_semantics():
+    """R1: the patched pinv truncates exactly what MATLAB's pinv truncates.
+
+    MATLAB's ``pinv`` zeroes singular values <= ``max(size(A)) * eps(norm(A))``
+    (an ABSOLUTE cutoff); numpy's default ``rcond=1e-15`` is relative. On a
+    64x64 matrix with a 3e-15 singular value (s_max = 1) numpy inverts it
+    (|pinv| ~ 4e13) while the MATLAB tolerance (64 * spacing(1) ~ 1.4e-14)
+    zeroes it. A well-conditioned matrix must come back identical.
+    """
+    from eegcpm.modules.preprocessing.steps.asr import (
+        _matlab_pinv_tolerance,
+        _pinv_with_matlab_tolerance,
+    )
+
+    rng = np.random.default_rng(0)
+    q1, _ = np.linalg.qr(rng.standard_normal((64, 64)))
+    q2, _ = np.linalg.qr(rng.standard_normal((64, 64)))
+    a = q1 @ np.diag(np.array([1.0, 3e-15] + [0.5] * 62)) @ q2.T
+
+    assert _matlab_pinv_tolerance(a) == pytest.approx(
+        float(np.spacing(1.0)) * 64, rel=1e-3)
+    assert np.abs(np.linalg.pinv(a)).max() > 1e12
+    assert np.abs(_pinv_with_matlab_tolerance(a)).max() < 1e3
+
+    b = rng.standard_normal((16, 16))
+    np.testing.assert_allclose(
+        _pinv_with_matlab_tolerance(b), np.linalg.pinv(b),
+        rtol=1e-9, atol=1e-12)
+
+
+def test_pinv_tolerance_is_the_blowup_fix(monkeypatch):
+    """R1: both directions on the deterministic reproducer.
+
+    Control (the real eegprep default ``np.linalg.pinv``): the step raises
+    ``asr_output_magnitude_blowup`` and writes nothing back. Fixed (the step's
+    MATLAB-tolerance patch): the same fixture is repaired cleanly.
+    """
+    from eegcpm.modules.preprocessing.steps import asr as asr_mod
+
+    kwargs = dict(calibration="fixed_first_60s", train_duration=60.0,
+                  drift_transition_hz=None)
+
+    with monkeypatch.context() as m:
+        m.setattr(asr_mod, "_MatlabPinvTolerancePatch", contextlib.nullcontext)
+        raw = _pinv_reproducer_raw()
+        input_max_uv = float(np.abs(raw.get_data()).max()) * 1e6
+        with pytest.raises(RuntimeError,
+                           match="asr_output_magnitude_blowup") as excinfo:
+            ASRStep(**kwargs).process(raw, {})
+        assert "ratio" in str(excinfo.value)
+        # The guard runs before the write-back: no garbage in the caller's data.
+        assert float(np.abs(raw.get_data()).max()) * 1e6 == pytest.approx(
+            input_max_uv)
+
+    raw2 = _pinv_reproducer_raw()
+    out, meta = ASRStep(**kwargs).process(raw2, {})
+    assert meta["pinv_tolerance"] == asr_mod.PINV_TOLERANCE_SPEC
+    assert meta["pinv_tolerance"] == "matlab_max_size_eps(norm)"
+    assert meta["output_magnitude_ratio"] < 2.0, (
+        "the MATLAB-tolerance pinv did not tame the reproducer "
+        f"(ratio {meta['output_magnitude_ratio']:.3g})")
+    assert np.isfinite(out.get_data()).all()
+
+
+def test_pinv_patch_is_scoped_and_guarded(monkeypatch):
+    """R1: the patch is restored after the call and refuses a changed call site.
+
+    The version guard is source-based: if the installed eegprep no longer calls
+    ``finite_pinv(Q)`` (or the module global is gone), the step must raise
+    ``eegprep_pinv_assumption_broken`` instead of silently reverting to the
+    default numpy tolerance.
+    """
+    import importlib
+
+    from eegcpm.modules.preprocessing.steps import asr as asr_mod
+
+    asr_module = importlib.import_module(
+        "eegprep.plugins.clean_rawdata.asr_process")
+    original = asr_module.finite_pinv
+
+    _, meta = ASRStep().process(_make_raw(), {})
+    assert asr_module.finite_pinv is original, (
+        "the pinv patch leaked out of the clean_asr call")
+    assert meta["pinv_tolerance"] == asr_mod.PINV_TOLERANCE_SPEC
+    assert meta["eegprep_version"]
+    assert (meta["eegprep_pinv_verified_version"]
+            == asr_mod.EEGPREP_PINV_VERIFIED_VERSION)
+
+    # A changed call site (source no longer calls finite_pinv(Q)) is refused.
+    def fake_asr_process(*args, **kwargs):  # noqa: ARG001 - never called
+        raise AssertionError("the guard must fire before clean_asr runs")
+
+    with monkeypatch.context() as m:
+        m.setattr(asr_module, "asr_process", fake_asr_process)
+        with pytest.raises(RuntimeError, match="eegprep_pinv_assumption_broken"):
+            ASRStep().process(_make_raw(), {})
+
+    # A missing module global is refused too.
+    with monkeypatch.context() as m:
+        m.delattr(asr_module, "finite_pinv")
+        with pytest.raises(RuntimeError, match="eegprep_pinv_assumption_broken"):
+            ASRStep().process(_make_raw(), {})
+
+
+# ----------------------------------------------------------------------
+# R4 (ASR scoped audit): truthful info['highpass']
+# ----------------------------------------------------------------------
+
+def test_info_highpass_updated_when_drift_filter_runs():
+    """R4: the FIF's info['highpass'] describes the high-passed write-back.
+
+    MNE's own ``filter`` records ``info['highpass'] = l_freq`` (the passband
+    edge); the equivalent edge for ``clean_drifts(0.25, 0.75)`` is 0.75 Hz.
+    Before R4 the FIF kept the chain's stale 0.1 Hz value.
+    """
+    raw = _make_raw()
+    assert raw.info["highpass"] == 0.5          # the fixture's own filter
+    out, meta = ASRStep().process(raw, {})
+    assert meta["drift_filter_applied"] is True
+    assert meta["info_highpass_hz"] == 0.75
+    assert out.info["highpass"] == 0.75
+    # The band stays fully recorded in the metadata.
+    assert meta["drift_transition_hz"] == [0.25, 0.75]
+
+    # A custom band records its own passband edge.
+    out2, meta2 = ASRStep(drift_transition_hz=(0.5, 1.0)).process(
+        _make_raw(), {})
+    assert meta2["info_highpass_hz"] == 1.0
+    assert out2.info["highpass"] == 1.0
+
+
+def test_info_highpass_untouched_when_drift_filter_off():
+    """R4: with the filter skipped the recording keeps its own value."""
+    raw = _make_raw()
+    with pytest.warns(RuntimeWarning, match="drift_transition_hz is off"):
+        out, meta = ASRStep(drift_transition_hz=None).process(raw, {})
+    assert meta["info_highpass_hz"] is None
+    assert out.info["highpass"] == 0.5
+
+
+# ----------------------------------------------------------------------
+# R6 (ASR scoped audit): runtime Nyquist bound on the drift band
+# ----------------------------------------------------------------------
+
+def test_drift_transition_above_nyquist_refused():
+    """R6: a drift transition band reaching Nyquist is refused at runtime.
+
+    The schema bound (<= 5 Hz) cannot see the recording's sampling rate, so the
+    step checks the upper edge against Nyquist in ``validate_inputs`` (the
+    executor's pre-flight) **and** at the start of the eegprep path (a direct
+    ``process()`` call must not bypass it).
+    """
+    rng = np.random.default_rng(0)
+    info = mne.create_info(CH_NAMES, 4.0, "eeg")
+    raw = mne.io.RawArray(
+        rng.standard_normal((len(CH_NAMES), 80)) * 1e-6, info, verbose=False)
+
+    step = ASRStep(drift_transition_hz=(0.5, 2.5), calibration="data_driven")
+    with pytest.raises(ValueError, match="Nyquist"):
+        step.validate_inputs(raw)
+    with pytest.raises(ValueError, match="Nyquist"):
+        step.process(raw, {})
+
+    # A band below Nyquist passes the check (data-driven calibration works on
+    # the short recording).
+    ok = ASRStep(drift_transition_hz=(0.25, 0.75), calibration="data_driven")
+    assert ok.validate_inputs(raw) is True
+
+
+def test_drift_filter_never_lowers_an_existing_highpass():
+    """N1 (scoped re-audit): explicit configs may already high-pass at 1 Hz;
+    the drift filter must report the effective edge (max), never under-report."""
+    raw = _make_raw()
+    raw.filter(1.0, 40.0, verbose=False)
+    assert raw.info["highpass"] == 1.0
+
+    step = ASRStep()
+    out, meta = step.process(raw, {})
+
+    assert out.info["highpass"] == 1.0
+    assert meta["info_highpass_hz"] == 1.0

@@ -20,6 +20,25 @@ from .steps import STEP_REGISTRY, ProcessingStep
 from .steps.base import RecordingExcluded
 
 
+class ResolvedChainSteps(list):
+    """A prebuilt named-chain step list carrying its recorded spec deviations.
+
+    ``PreprocessingPipeline`` accepts either a chain name (resolved through
+    ``_resolve_named_chain``) or a list of step instances. The named chain can
+    also be resolved **outside** the pipeline — ``PreprocessingSpec
+    .pipeline_steps()`` must forward per-dataset ``chain_params`` to
+    ``build_hbn_langer_chain`` — and the spec deviations are part of the
+    resolved config and its hash, so they travel with the list. Without this,
+    ``PreprocessingPipeline(spec.pipeline_steps())`` would silently drop the
+    deviations and hash differently from ``PreprocessingPipeline
+    ('hbn_langer')`` (the golden pin).
+    """
+
+    def __init__(self, steps, spec_deviations):
+        super().__init__(steps)
+        self.spec_deviations: List[str] = list(spec_deviations)
+
+
 def _resolve_named_chain(name: str):
     """Resolve a named canonical chain to prebuilt step instances.
 
@@ -64,14 +83,16 @@ class PreprocessingPipeline:
     >>> pipeline = PreprocessingPipeline(config['steps'])
     >>> result = pipeline.process(raw)
 
-    Create EEGLab-style three-stage ASR pipeline:
+    Create an EEGLab-style two-pass ASR pipeline (``mode`` is a label only;
+    the numerics are set by ``cutoff`` — EEGLAB: aggressive 3, default 5,
+    conservative 20):
     >>> config = {
     ...     'steps': [
     ...         {'name': 'filter', 'params': {'l_freq': 0.5, 'h_freq': 40.0}},
-    ...         {'name': 'asr', 'params': {'cutoff': 40, 'mode': 'mild'}},
+    ...         {'name': 'asr', 'params': {'cutoff': 20, 'mode': 'conservative'}},
     ...         {'name': 'ica', 'params': {'method': 'picard'}},
     ...         {'name': 'iclabel', 'params': {'threshold': 0.8}},
-    ...         {'name': 'asr', 'params': {'cutoff': 20, 'mode': 'aggressive'}},
+    ...         {'name': 'asr', 'params': {'cutoff': 5, 'mode': 'single'}},
     ...     ]
     ... }
     """
@@ -105,7 +126,12 @@ class PreprocessingPipeline:
         if isinstance(steps, str):
             steps, self.spec_deviations = _resolve_named_chain(steps)
         else:
-            self.spec_deviations: List[str] = []
+            # A prebuilt named chain (``ResolvedChainSteps``, e.g. from
+            # ``PreprocessingSpec.pipeline_steps()``) carries its spec
+            # deviations; a plain step list has none.
+            self.spec_deviations: List[str] = list(
+                getattr(steps, "spec_deviations", None) or []
+            )
         if not steps:
             raise ValueError("Preprocessing pipeline has no steps")
         self.step_configs = steps

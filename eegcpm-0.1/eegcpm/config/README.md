@@ -145,7 +145,8 @@ Use the **Pipeline Config** page in the Streamlit UI to create and edit configs 
 3. **Documentation**: Add comments explaining non-obvious parameters
    ```yaml
    asr:
-     cutoff: 20  # Standard threshold; lower = more aggressive
+     cutoff: 20  # EEGLAB: aggressive 3, default 5, conservative 20
+                 # (GUI default 20; lower = more aggressive)
    ```
 
 4. **Defaults**: Keep a `default.yaml` in each directory as a fallback

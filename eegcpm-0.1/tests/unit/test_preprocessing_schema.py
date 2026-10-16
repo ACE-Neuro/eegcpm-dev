@@ -79,14 +79,32 @@ def test_project_config_envelope_unwrapped():
 
 
 def test_named_chain_accepted():
+    """The named chain resolves to prebuilt steps + its spec deviations.
+
+    ``pipeline_steps()`` builds the chain itself (so ``chain_params`` can be
+    forwarded) and returns a ``ResolvedChainSteps`` — the deviations travel
+    with the list, otherwise ``PreprocessingPipeline(spec.pipeline_steps())``
+    would drop them and hash differently from
+    ``PreprocessingPipeline('hbn_langer')`` (the golden pin).
+    """
+    from eegcpm.modules.preprocessing.pipeline_builder import ResolvedChainSteps
+
     spec = load_preprocessing_spec({"steps": "hbn_langer"})
-    assert spec.pipeline_steps() == "hbn_langer"
-    pipeline = PreprocessingPipeline(spec.pipeline_steps())
+    steps = spec.pipeline_steps()
+    assert isinstance(steps, ResolvedChainSteps)
+    assert steps.spec_deviations  # P1-F2 deviation travels with the chain
+    pipeline = PreprocessingPipeline(steps)
+    assert pipeline.spec_deviations == steps.spec_deviations
     assert [s.name for s in pipeline.steps] == [
         "channel_roles", "zapline", "filter", "bad_channel_detection",
         "interpolate", "eog_regression", "asr",
         "block_rejection", "reference",
     ]
+    # The spec-resolved chain is the same resolved config as the string path.
+    from eegcpm.core.config_hash import resolved_config_hash
+
+    assert resolved_config_hash(pipeline) == resolved_config_hash(
+        PreprocessingPipeline("hbn_langer"))
 
 
 def test_unknown_named_chain_rejected():
@@ -121,7 +139,135 @@ def test_variant_hbn_langer_with_named_chain_accepted():
     """`variant: hbn_langer` + `steps: hbn_langer` is consistent."""
     spec = load_preprocessing_spec(
         {"variant": "hbn_langer", "steps": "hbn_langer"})
-    assert spec.pipeline_steps() == "hbn_langer"
+    steps = spec.pipeline_steps()
+    assert [s.name for s in steps][0] == "channel_roles"
+    assert len(steps) == 9
+
+
+# ---------------------------------------------------------------------------
+# chain_params (plan §12.6): per-dataset tuning of the named chain
+# ---------------------------------------------------------------------------
+
+def test_chain_params_unknown_key_rejected():
+    """`extra='forbid'`: a misspelled chain parameter is a hard error."""
+    with pytest.raises(ValidationError):
+        load_preprocessing_spec(
+            {"steps": "hbn_langer", "chain_params": {"asr_cutof": 20}})
+
+
+def test_chain_params_wrong_type_rejected():
+    with pytest.raises(ValidationError):
+        load_preprocessing_spec(
+            {"steps": "hbn_langer", "chain_params": {"asr_cutoff": "twenty"}})
+    with pytest.raises(ValidationError):
+        load_preprocessing_spec(
+            {"steps": "hbn_langer", "chain_params": {"asr_max_dims": 1.5}})
+    with pytest.raises(ValidationError):
+        load_preprocessing_spec(
+            {"steps": "hbn_langer",
+             "chain_params": {"asr_drift_transition_hz": [1.0, 0.5]}})
+    with pytest.raises(ValidationError):
+        load_preprocessing_spec(
+            {"steps": "hbn_langer", "chain_params": {"asr_calibration": "auto"}})
+
+
+def test_chain_params_r6_bounds_are_hard_errors():
+    """R6 (ASR scoped audit): cutoff and drift-band bounds, not silent no-ops.
+
+    ``asr_cutoff`` is bounded to [1, 200] and ``asr_drift_transition_hz`` must
+    satisfy ``0 < low < high`` with ``high <= 5`` Hz. The Nyquist half of the
+    drift bound is data-dependent and is enforced at runtime in ``ASRStep``
+    (see ``test_asr_timeline.py::test_drift_transition_above_nyquist_refused``).
+    """
+    for bad in (0.5, 0.0, -3.0, 500.0):
+        with pytest.raises(ValidationError, match="asr_cutoff"):
+            load_preprocessing_spec(
+                {"steps": "hbn_langer", "chain_params": {"asr_cutoff": bad}})
+    for ok in (1.0, 5.0, 20.0, 200.0):
+        spec = load_preprocessing_spec(
+            {"steps": "hbn_langer", "chain_params": {"asr_cutoff": ok}})
+        assert spec.chain_params.asr_cutoff == ok
+
+    for bad in ([0.0, 0.75], [1.0, 0.5], [0.25, 0.25], [0.5, 5.5], [0.5, 10.0]):
+        with pytest.raises(ValidationError, match="asr_drift_transition_hz"):
+            load_preprocessing_spec(
+                {"steps": "hbn_langer",
+                 "chain_params": {"asr_drift_transition_hz": bad}})
+    spec = load_preprocessing_spec(
+        {"steps": "hbn_langer",
+         "chain_params": {"asr_drift_transition_hz": [0.5, 5.0]}})
+    assert spec.chain_params.asr_drift_transition_hz == (0.5, 5.0)
+    assert load_preprocessing_spec(
+        {"steps": "hbn_langer",
+         "chain_params": {"asr_drift_transition_hz": None}}
+    ).chain_params.asr_drift_transition_hz is None
+
+
+def test_chain_params_with_explicit_step_list_rejected():
+    """chain_params next to an explicit step list would be silently ignored."""
+    with pytest.raises(ValidationError, match="chain_params"):
+        load_preprocessing_spec({
+            "steps": [{"name": "filter", "params": {"l_freq": 1.0}}],
+            "chain_params": {"asr_cutoff": 20},
+        })
+    # The schema default next to an explicit list is not "given" -> accepted.
+    spec = load_preprocessing_spec({
+        "steps": [{"name": "filter", "params": {"l_freq": 1.0}}]})
+    assert spec.chain_params.asr_cutoff == 20.0
+
+
+def test_chain_params_defaults_match_the_golden_chain():
+    """Omitting chain_params resolves to the pinned (golden) ASR settings."""
+    from eegcpm.modules.preprocessing.hbn_langer_chain import (
+        build_hbn_langer_chain,
+    )
+
+    spec = load_preprocessing_spec({"steps": "hbn_langer"})
+    assert spec.chain_params.asr_cutoff == 20.0
+    assert spec.chain_params.asr_drift_transition_hz == (0.25, 0.75)
+    assert spec.chain_params.asr_max_dims == 0.66
+    assert spec.chain_params.asr_calibration == "fixed_first_60s"
+
+    default_chain = build_hbn_langer_chain()
+    spec_chain = build_hbn_langer_chain(**spec.chain_params.model_dump())
+    assert [s.get_config() for s in spec_chain] == [
+        s.get_config() for s in default_chain
+    ]
+
+
+def test_chain_params_accepted_values_reach_the_wrapper():
+    """The per-dataset ASR values reach the built chain's ASR wrapper."""
+    spec = load_preprocessing_spec({
+        "steps": "hbn_langer",
+        "chain_params": {
+            "asr_cutoff": 30,
+            "asr_drift_transition_hz": [0.5, 1.0],
+            "asr_max_dims": 0.5,
+            "asr_calibration": "data_driven",
+        },
+    })
+    pipeline = PreprocessingPipeline(spec.pipeline_steps())
+    asr = pipeline.steps[6]
+    assert asr.name == "asr"
+    assert asr.cutoff == 30.0
+    assert asr.drift_transition_hz == (0.5, 1.0)
+    assert asr.max_dims == 0.5
+    assert asr.calibration_window == "data_driven"
+    cfg = asr.get_config()
+    assert cfg["cutoff"] == 30.0
+    assert cfg["drift_transition_hz"] == [0.5, 1.0]
+    assert cfg["max_dims"] == 0.5
+    # Truthful data-driven calibration description (not the fixed-path one).
+    assert cfg["calibration_reference"] == "eegprep_clean_windows_selection"
+    assert cfg["ref_maxbadchannels"] == 0.075
+
+    # A None transition (non-EEGLAB regime) is expressible per dataset too.
+    spec_none = load_preprocessing_spec({
+        "steps": "hbn_langer",
+        "chain_params": {"asr_drift_transition_hz": None},
+    })
+    asr_none = PreprocessingPipeline(spec_none.pipeline_steps()).steps[6]
+    assert asr_none.drift_transition_hz is None
 
 
 def test_envelope_with_top_level_steps_rejected():

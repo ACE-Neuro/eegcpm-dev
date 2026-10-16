@@ -10,6 +10,13 @@ recorded evidence, flag anything unmet, and state exactly what remains for the u
 > `forward.template` fsaverage-only, gate count corrected (19), QC display-copy annotations now
 > appended, target-N1 dominance asserted. Full evidence in `VERIFICATION_TODO.md`
 > §"Final-verification-audit fixes F1–F7".
+>
+> **Post-briefing change (2026-10-16, ASR §12.6 round):** the ASR high-pass decision was
+> resolved and implemented (EEGLAB-standard `clean_drifts(0.25, 0.75)` before ASR, no add-back,
+> configurable via `chain_params`), which **re-pinned the golden hash again**
+> `b47de382…` → `b07bfe39930a4525ef48d0d2ca053df2144bbd396e95388adcaf963edf82fb8f` and updated
+> the e2e bounds. The counts in this briefing are the F1–F7 state; see `VERIFICATION_TODO.md`
+> §"§12.6 ASR EEGLAB-standard path" for the current state.
 
 ## Test commands (all currently green except the documented P4 pair)
 
@@ -40,7 +47,8 @@ cd eegcpm-0.1
 - **C4 RPCA**: decision (a) recorded (plan §12.1); step removed from the chain (9 steps);
   `test_robust_pca_erp.py` xfail-strict documents the destruction; instrumentation + fixture.
 - **C5 schema + hash**: `test_preprocessing_schema.py`, `test_config_hash.py` (literal
-  `GOLDEN_RESOLVED_HASHES['hbn_langer'] = b47de382…`, per-step + algorithm-constant sensitivity
+  `GOLDEN_RESOLVED_HASHES['hbn_langer'] = b47de382…` — **re-pinned to `b07bfe39…` by the later
+  §12.6 ASR round, see the note above**; per-step + algorithm-constant sensitivity
   incl. F2/F3, library-version sensitivity, parity-harness 5-key path), sidecar + DB `config_hash`.
 - **C6 QC + gate + CI**: "Pipeline step status" metric (no false ok); no-silent-except gate
   (108 files, 0 offenders, no allow-list); `.github/workflows/pipeline-verification.yml`

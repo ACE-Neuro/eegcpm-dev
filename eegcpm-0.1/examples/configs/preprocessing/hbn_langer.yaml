@@ -11,6 +11,16 @@
 # eegcpm/core/config_hash.py::GOLDEN_RESOLVED_HASHES), not by this file's
 # bytes — a chain or step-parameter change breaks the golden-hash test;
 # editing comments here does not.
+#
+# Per-dataset tuning of the named chain (plan §12.6) goes through an optional
+# `chain_params:` block; omitting it resolves to the pinned defaults above.
+# Example (not enabled here — the defaults are the golden chain):
+#
+# chain_params:
+#   asr_cutoff: 20.0                    # EEGLAB conservative
+#   asr_drift_transition_hz: [0.25, 0.75]  # null disables the high-pass (non-EEGLAB)
+#   asr_max_dims: 0.66
+#   asr_calibration: fixed_first_60s    # or data_driven (EEGLAB auto calibration)
 stage: preprocessing
 variant: hbn_langer
 description: Deterministic Langer+ASR chain (code-defined; see build_hbn_langer_chain)
@@ -63,7 +73,20 @@ is_primary: true
 # asr:
 #   enabled: true
 #   window_criterion: 0.25         # eegprep WindowCriterion = rejection FRACTION
-#   fixed_first_60s: true
+#   cutoff: 20                     # EEGLAB: aggressive 3, default 5,
+#                                  # conservative 20 (GUI default 20;
+#                                  # Chang et al. 2019 optimal 20-30)
+#   drift_transition_hz: [0.25, 0.75]  # EEGLAB-standard clean_drifts high-pass
+#                                  # on the ASR INPUT (clean_asr requires
+#                                  # high-passed input); write-back is the
+#                                  # high-passed repaired data (no add-back)
+#                                  # and info['highpass'] is set to 0.75 Hz
+#   pinv_tolerance: matlab_max_size_eps(norm)   # eegprep ASR pseudo-inverse
+#                                  # runs under MATLAB's pinv tolerance (R1 —
+#                                  # the real-data blow-up fix; not tunable)
+#   max_dims: 0.66                 # max reconstructed dimensionality (EEGLAB default)
+#   fixed_first_60s: true          # calibration; 'data_driven' = EEGLAB's
+#                                  # automatic clean-window selection (opt-in)
 #   retain_burst_mask: true        # for the ASR-burden sensitivity covariate
 #
 # block_rejection:
