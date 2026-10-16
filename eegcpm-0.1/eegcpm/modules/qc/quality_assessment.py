@@ -65,7 +65,8 @@ def assess_quality_status(bad_pct: float, clustering: str) -> str:
     return quality
 
 
-def get_recommended_action(quality_status: str, ica_success: bool) -> str:
+def get_recommended_action(quality_status: str, ica_success: bool,
+                           gates_ok: Optional[bool] = None) -> str:
     """
     Get recommended action based on quality status and ICA success.
 
@@ -75,6 +76,13 @@ def get_recommended_action(quality_status: str, ica_success: bool) -> str:
         Quality status ('excellent', 'good', 'acceptable', 'poor')
     ica_success : bool
         Whether ICA completed successfully
+    gates_ok : bool, optional
+        Verdict of the per-recording QC gate(s) (e.g. the ocular
+        ``blink_residual_pass``). ``False`` vetoes an ``accept`` — the action
+        must not contradict the gate's evidence (2026-10-17: 25SusAttn
+        sub-007 stroopvis failed the ocular gate and still reported
+        ``accept``). ``None`` (no gate ran / not supplied) leaves the previous
+        behaviour unchanged.
 
     Returns
     -------
@@ -87,6 +95,8 @@ def get_recommended_action(quality_status: str, ica_success: bool) -> str:
         return 'review'
     elif quality_status == 'good' and not ica_success:
         return 'review'
+    elif gates_ok is False:
+        return 'review'
     else:
         return 'accept'
 
@@ -98,7 +108,8 @@ def extract_metrics_from_qc_result(
     task: str = "unknown",
     run: str = "1",
     pipeline: str = "standard",
-    qc_report_path: Optional[str] = None
+    qc_report_path: Optional[str] = None,
+    gates_ok: Optional[bool] = None
 ) -> Dict[str, Any]:
     """
     Extract standardized metrics from QCResult for JSON export.
@@ -119,6 +130,11 @@ def extract_metrics_from_qc_result(
         Pipeline name
     qc_report_path : str, optional
         Relative path to QC HTML report
+    gates_ok : bool, optional
+        Verdict of the per-recording QC gate(s) (e.g. the ocular
+        ``blink_residual_pass``). ``False`` vetoes an ``accept`` recommendation
+        (the action must not contradict the gate's evidence); ``None`` leaves
+        the previous behaviour unchanged.
 
     Returns
     -------
@@ -178,7 +194,7 @@ def extract_metrics_from_qc_result(
 
     # Assess quality
     quality_status = assess_quality_status(pct_bad_channels, clustering_severity)
-    recommended_action = get_recommended_action(quality_status, ica_success)
+    recommended_action = get_recommended_action(quality_status, ica_success, gates_ok)
 
     # Build output dictionary
     data = {
@@ -198,6 +214,7 @@ def extract_metrics_from_qc_result(
             'ica_success': ica_success,
             'n_ica_components': n_ica_components,
             'n_components_rejected': n_components_rejected,
+            'gates_ok': gates_ok,
             'recommended_action': recommended_action,
         },
         'qc_report_path': qc_report_path if qc_report_path else f"{subject_id}_ses-{session}_task-{task}_run-{run}_preprocessed_qc.html"

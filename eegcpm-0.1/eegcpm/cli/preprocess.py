@@ -504,6 +504,23 @@ def preprocess_command(args):
                                 qc.generate_html_report(
                                     qc_result, save_path=run_output / html_filename)
 
+                                # Per-recording chain QC row (P1-F10): duration,
+                                # line-noise/EMG proxies, blink-residual gate,
+                                # ASR burden, block-rejection fraction. Stored in
+                                # the same metrics JSON so the HBN QC table can be
+                                # built without re-reading the FIFs. Computed
+                                # before the standardized metrics so a failed gate
+                                # can veto the 'accept' recommendation (2026-10-17:
+                                # 25SusAttn sub-007 stroopvis failed the ocular
+                                # gate and still reported 'accept').
+                                recording_qc_row = recording_qc_metrics(
+                                    result.outputs['data'],
+                                    task,
+                                    subject_id,
+                                    chain_metadata=result.metadata,
+                                    raw_pre=raw,
+                                )
+
                                 # Save QC metrics as JSON (same directory)
                                 metrics_data = extract_metrics_from_qc_result(
                                     qc_result,
@@ -512,20 +529,10 @@ def preprocess_command(args):
                                     task=task,
                                     run=run_num,
                                     pipeline=args.pipeline,
-                                    qc_report_path=html_filename
+                                    qc_report_path=html_filename,
+                                    gates_ok=recording_qc_row.get("blink_residual_pass"),
                                 )
-                                # Per-recording chain QC row (P1-F10): duration,
-                                # line-noise/EMG proxies, blink-residual gate,
-                                # ASR burden, block-rejection fraction. Stored in
-                                # the same metrics JSON so the HBN QC table can be
-                                # built without re-reading the FIFs.
-                                metrics_data['recording_qc'] = recording_qc_metrics(
-                                    result.outputs['data'],
-                                    task,
-                                    subject_id,
-                                    chain_metadata=result.metadata,
-                                    raw_pre=raw,
-                                )
+                                metrics_data['recording_qc'] = recording_qc_row
                                 json_path = run_output / \
                                     f"{subject_id}_ses-{session}_task-{task}_run-{run_num}_qc_metrics.json"
                                 save_qc_metrics_json(metrics_data, json_path)

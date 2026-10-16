@@ -1007,6 +1007,45 @@ class TestBlinkResidualGate:
         assert row["blink_residual_reason"] == "raw_pre_missing"
 
 
+class TestRecommendedActionGateVeto:
+    """A failed QC gate must veto an 'accept' recommendation (2026-10-17).
+
+    The action heuristic only looked at bad-channel percentage and ICA success,
+    so 25SusAttn sub-007 stroopvis reported ``accept`` while its ocular gate
+    failed (blink_residual_pass=false). ``gates_ok=False`` now downgrades an
+    ``accept`` to ``review``; ``None`` keeps the previous behaviour.
+    """
+
+    def test_failed_gate_vetoes_accept(self):
+        from eegcpm.modules.qc.quality_assessment import get_recommended_action
+
+        assert get_recommended_action("excellent", True) == "accept"
+        assert get_recommended_action("excellent", True, gates_ok=False) == "review"
+
+    def test_passed_or_absent_gate_leaves_action_unchanged(self):
+        from eegcpm.modules.qc.quality_assessment import get_recommended_action
+
+        assert get_recommended_action("excellent", True, gates_ok=True) == "accept"
+        assert get_recommended_action("excellent", True, gates_ok=None) == "accept"
+
+    def test_veto_never_upgrades_a_stricter_action(self):
+        from eegcpm.modules.qc.quality_assessment import get_recommended_action
+
+        assert get_recommended_action("poor", True, gates_ok=False) == "reject"
+        assert get_recommended_action("acceptable", True, gates_ok=False) == "review"
+
+    def test_metrics_record_gates_ok(self):
+        from eegcpm.modules.qc.base import QCResult
+        from eegcpm.modules.qc.quality_assessment import extract_metrics_from_qc_result
+
+        qc_result = QCResult(subject_id="s1", metrics=[], notes=[])
+        data = extract_metrics_from_qc_result(
+            qc_result, subject_id="s1", task="cptvis", gates_ok=False
+        )
+        assert data["quality_metrics"]["gates_ok"] is False
+        assert data["quality_metrics"]["recommended_action"] == "review"
+
+
 class TestRecordingQCLineFrequency:
     """The line-noise metric measures the recording's declared line frequency.
 
