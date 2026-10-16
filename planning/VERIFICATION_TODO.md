@@ -1440,3 +1440,36 @@ config, `--force` is required to reprocess (observed on cptvis, 2026-10-17).
 
 **Batch (in progress):** subjects 002/003/007 × cptvis/stroopvis
 (preprocess + epochs), launched 2026-10-17 after the pilot checks passed.
+
+#### 2026-10-17 — Track B batch (4 subjects) + gate veto
+
+Batch `sub-001/002/003/007` × `cptvis`/`stroopvis` (preprocess + epochs), all 8
+runs completed:
+
+| subj | task | bad | ASR repaired | ICA rejected | 50 Hz residual | blink gate | epochs | action |
+|---|---|---|---|---|---|---|---|---|
+| 001 | cptvis | 6 | 20.5 % | 7 | 0.151 | Fp1, 326 (~30/min), 0.095 | 595 | accept |
+| 001 | stroopvis | 4 | 22.8 % | 3 | 0.131 | Fp1, 405, 0.179 | 321 | accept |
+| 002 | cptvis | 3 | 18.9 % | 4 | 0.210 | Fp1, 286, 0.122 | 585 | accept |
+| 002 | stroopvis | 4 | 28.2 % | 3 | 0.252 | Fp1, 390, 0.107 | 325 | review¹ |
+| 003 | cptvis | 2 | 10.6 % | 13 | 0.453 | Fp1, 255, 0.284 | 557 | accept |
+| 003 | stroopvis | 2 | 21.0 % | 15 | 0.483 | Fp1, 553, 0.279 | 324 | accept |
+| 007 | cptvis | 0 | 9.7 % | 17 | 0.257 | Fp1, 151, 0.247 | 594 | accept |
+| 007 | stroopvis | 3 | 11.4 % | 12 | 0.225 | Fp1, 351, **0.374 FAIL** | 324 | **review** |
+
+¹ pre-existing heuristic: `clustering=severe` → `quality_status='acceptable'`.
+
+**Gate-veto fix (commit `336f4e9`).** 007/stroopvis failed the ocular gate while
+`quality_metrics.recommended_action` still said `accept` — the action heuristic
+(bad-channel % + ICA success) ignored the gate. `gates_ok=False` now downgrades
+an `accept` to `review` (None keeps the old behaviour); `quality_metrics`
+records `gates_ok`. Tests: `test_qc.py::TestRecommendedActionGateVeto` (4).
+
+**Line-noise metric is relative — interpret with care.** 003's 48–52/20–40 Hz
+ratio is 0.45–0.48 (highest of the batch) but its absolute 50 Hz amplitude is
+**0.004 µV/√Hz, −40 dB below the 20–45 Hz broadband** (alpha at 10 Hz:
+0.79–1.23 µV/√Hz). The ratio reflects the recording's low broadband power, not
+residual line noise. No config change needed.
+
+**Artifacts** were force-regenerated for all 8 recordings after the veto fix so
+every QC JSON carries `gates_ok` and the corrected action.
