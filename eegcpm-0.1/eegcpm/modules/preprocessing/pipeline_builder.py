@@ -402,10 +402,7 @@ class PreprocessingPipeline:
                 # A saved FIF without its provenance sidecar is not a
                 # trustworthy output: delete it and re-raise.
                 for path in output_files:
-                    try:
-                        Path(path).unlink()
-                    except FileNotFoundError:
-                        pass
+                    Path(path).unlink(missing_ok=True)
                 raise
 
         if not success:
@@ -506,10 +503,7 @@ class PreprocessingPipeline:
         if self.output_dir is None:
             return
         for name in (f"{stem}_preprocessed_raw.fif", f"{stem}_ica.fif"):
-            try:
-                (self.output_dir / name).unlink()
-            except FileNotFoundError:
-                pass
+            (self.output_dir / name).unlink(missing_ok=True)
 
     def _save_outputs(
         self,

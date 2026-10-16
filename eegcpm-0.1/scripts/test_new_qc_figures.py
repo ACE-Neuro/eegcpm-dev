@@ -612,9 +612,9 @@ def test_source_crosstalk_matrix():
             # Check metadata
             if 'crosstalk_mean' in result.metadata:
                 mean_ct = result.metadata['crosstalk_mean']
-                n_high = result.metadata.get('crosstalk_high_pairs', 0)
+                n_high = result.metadata.get('n_directed_above_0.3', 0)
                 print(f"  Mean crosstalk: {mean_ct:.3f}")
-                print(f"  High-crosstalk pairs: {n_high}")
+                print(f"  High-crosstalk directed pairs: {n_high}")
         else:
             print("  ❌ Source crosstalk matrix figure NOT found!")
             print("  Available figures:", list(result.figures.keys()))

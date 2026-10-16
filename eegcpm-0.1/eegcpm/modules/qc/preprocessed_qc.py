@@ -14,6 +14,7 @@ Author: EEGCPM Development Team
 Created: 2025-01
 """
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 import yaml
@@ -39,6 +40,8 @@ _NEUROSCAN_CH_TO_MNE = {
 }
 NEUROSCAN_LOCS_CACHE: Optional[Dict[str, np.ndarray]] = None
 
+
+logger = logging.getLogger(__name__)
 
 def _load_neuroscan_locs() -> Dict[str, np.ndarray]:
     global NEUROSCAN_LOCS_CACHE
@@ -189,15 +192,45 @@ class PreprocessedQC(BaseQC):
         # Use provided removed_channels or empty dict
         channel_reasons = removed_channels if removed_channels else {}
 
+        # Chain metadata (executor sidecar payload; `metadata=` from the CLI).
+        # `preprocessing_metadata` (kwargs) is the legacy dialect; the canonical
+        # chain writes `bad_channel_detection` / `channel_roles` / `step_status`.
+        chain_metadata = metadata or {}
+
+        # P1-F10: the bad-channel detector's report is the only source of truth
+        # for how many channels the chain flagged (interpolation runs with
+        # `reset_bads=True`, so `info['bads']` is empty afterwards).
+        detector_meta = chain_metadata.get('bad_channel_detection') or {}
+        detected_channels = [str(ch) for ch in (detector_meta.get('detected') or [])]
+        n_detected_precap = detector_meta.get('n_detected_precap')
+
+        # P1-F10: `channel_roles` exclusions (neck/face dropped, EEG retyped to
+        # EOG) are intentional montage decisions, not bad channels — counted
+        # separately below and never inside the "Bad Channels" metric.
+        roles_meta = chain_metadata.get('channel_roles') or {}
+        role_excluded = [str(ch) for ch in (roles_meta.get('neck_face_dropped') or [])]
+        role_excluded += [str(ch) for ch in (roles_meta.get('eog_channels') or [])]
+
+        # B7 rev2 fix 9: only channels that were **EEG in the before set** can
+        # have been dropped from the EEG count; `eog_channels` lists every EOG
+        # channel the montage role assigned (including channels that were never
+        # EEG, e.g. native EOG electrodes), and subtracting those from
+        # `n_dropped` would under-count genuine drops. Without `raw_before` the
+        # before set is unknown, so the list is used as recorded.
+        before_eeg_names: Optional[set] = None
+        if raw_before is not None:
+            before_eeg_names = {
+                raw_before.ch_names[i]
+                for i in mne.pick_types(raw_before.info, eeg=True, exclude=[])
+            }
+            role_excluded = [ch for ch in role_excluded if ch in before_eeg_names]
+
         # Safety net: catch channels dropped/marked by any step not in removed_channels
         safety_net_channels = {}
         if raw_before is not None:
-            before_eeg = set(mne.pick_types(raw_before.info, eeg=True, exclude=[]))
-            before_eeg = {raw_before.ch_names[i] for i in before_eeg}
-            after_chs = set(raw.ch_names)
-            dropped = before_eeg - after_chs
+            dropped = before_eeg_names - set(raw.ch_names)
             for ch in dropped:
-                if ch not in channel_reasons:
+                if ch not in channel_reasons and ch not in role_excluded:
                     channel_reasons[ch] = 'dropped'
                     safety_net_channels[ch] = 'dropped'
             for ch in raw.info["bads"]:
@@ -296,6 +329,21 @@ class PreprocessedQC(BaseQC):
                         bad_str += f'... ({len(bad_list)} total)'
                     result.add_note(f"Preprocessing: {n_bad_detected} bad channel(s) interpolated: {bad_str}")
 
+        if detected_channels:
+            bad_str = ', '.join(detected_channels[:10])
+            if len(detected_channels) > 10:
+                bad_str += f'... ({len(detected_channels)} total)'
+            precap_note = (
+                f" ({n_detected_precap} before the budget cap)"
+                if n_detected_precap not in (None, len(detected_channels))
+                else ""
+            )
+            result.add_note(
+                f"Preprocessing: {len(detected_channels)} bad channel(s) "
+                f"detected{precap_note}: {bad_str}"
+            )
+
+        if preprocessing_metadata:
             artifact_meta = preprocessing_metadata.get('artifacts', {})
             if artifact_meta:
                 n_artifacts = artifact_meta.get('n_annotations_added', 0)
@@ -330,11 +378,48 @@ class PreprocessedQC(BaseQC):
         result.add_metric(QCMetric("Sampling Rate", raw.info["sfreq"], "Hz"))
         result.add_metric(QCMetric("N Channels", len(raw.ch_names), ""))
 
+        # 1b. Pipeline step status (P1-F10/C6): a required step that failed,
+        # was excluded (or never ran after an abort) must be visible in QC even
+        # if a FIF exists. `degraded` marks tolerated optional failures.
+        step_status = chain_metadata.get('step_status') or {}
+        failed_steps = sorted(
+            name for name, value in step_status.items()
+            if value in ('failed', 'excluded')
+        )
+        not_run_steps = sorted(
+            name for name, value in step_status.items() if value == 'not_run'
+        )
+        if not step_status:
+            # B7-A2: without the executor's `step_status` (legacy dialect or a
+            # standalone QC run) there is no evidence that the required steps
+            # ran — "all steps ok" would be a false clean bill, so this is a
+            # warning, never `ok`.
+            result.add_metric(QCMetric(
+                "Pipeline step status", 0, "no chain metadata", "warning"))
+        elif failed_steps:
+            result.add_metric(QCMetric(
+                "Pipeline step status",
+                len(failed_steps),
+                f"({', '.join(failed_steps)})",
+                "bad",
+            ))
+        elif chain_metadata.get('degraded') or not_run_steps:
+            detail = "degraded" if chain_metadata.get('degraded') else (
+                f"not run: {', '.join(not_run_steps)}"
+            )
+            result.add_metric(QCMetric("Pipeline step status", 0, f"({detail})", "warning"))
+        else:
+            result.add_metric(QCMetric(
+                "Pipeline step status", len(step_status), "(all steps ok)", "ok"))
+
         eeg_picks = mne.pick_types(raw.info, eeg=True, exclude=[])
         n_eeg = len(eeg_picks)
         result.add_metric(QCMetric("N EEG Channels", n_eeg, ""))
 
-        # Bad channels - count dropped AND marked bad
+        # Bad channels - count channels the detector flagged / interpolated, and
+        # channels genuinely dropped elsewhere. `channel_roles` exclusions
+        # (neck/face dropped, EEG retyped to EOG) are montage decisions, not bad
+        # channels, so they are subtracted from `n_dropped` (P1-F10).
         n_bad_marked = len(raw.info["bads"])
 
         # If raw_before is available, calculate n_dropped
@@ -344,13 +429,29 @@ class PreprocessedQC(BaseQC):
             n_channels_after = len(mne.pick_types(raw.info, eeg=True, exclude=[]))
             n_dropped = n_channels_before - n_channels_after
 
-        n_bad_total = n_bad_marked + n_dropped
+        n_role_excluded = len(role_excluded)
+        n_dropped_other = max(0, n_dropped - n_role_excluded)
+
+        # The detector's report is authoritative when present (the chain's
+        # interpolate step resets `info['bads']`); without chain metadata fall
+        # back to the channels marked bad in `info`.
+        n_bad_total = (
+            len(detected_channels) if detector_meta else n_bad_marked
+        ) + n_dropped_other
         bad_pct = 100 * n_bad_total / n_eeg if n_eeg > 0 else 0
         status = "ok" if bad_pct < 10 else ("warning" if bad_pct < 20 else "bad")
 
         # Unit field should only contain the description, not the value
-        bad_unit = f"({n_dropped} dropped)" if n_dropped > 0 else ""
+        bad_unit = f"({n_dropped_other} dropped)" if n_dropped_other > 0 else ""
         result.add_metric(QCMetric("Bad Channels", n_bad_total, bad_unit, status))
+
+        # Informational: intentional channel-role exclusions (never bad channels)
+        if n_role_excluded > 0:
+            names = ', '.join(role_excluded[:10])
+            if n_role_excluded > 10:
+                names += f'... ({n_role_excluded} total)'
+            result.add_metric(QCMetric(
+                "Channel-role exclusions", n_role_excluded, f"({names})"))
 
         # 2. Amplitude statistics (post-preprocessing should be cleaner)
         # Filter out dead channels for amplitude statistics
@@ -652,8 +753,10 @@ class PreprocessedQC(BaseQC):
                 plt.close(fig_erp)
                 result.add_note("ERP waveforms detected and plotted from annotations")
         except Exception as e:
-            # Silently skip if ERP plotting fails (expected for resting-state data)
-            pass
+            # ERP waveform plotting is best-effort (resting-state data has no
+            # trials to average) but the failure is recorded in the QC result
+            # instead of being swallowed (P1-F11).
+            result.add_note(f"ERP waveform plotting skipped: {e}")
 
         # 7. Full Event-Related Potential (ERP) QC Report
         # Generate ERP reports if events and event_id are provided (task-based data)
@@ -1297,8 +1400,12 @@ class PreprocessedQC(BaseQC):
                         else:
                             ax.set_title(new_title, fontsize=9)
 
-                except (ValueError, IndexError):
-                    pass
+                except (ValueError, IndexError) as exc:
+                    # Component index/label mismatch: the remaining components
+                    # are still annotated, and the failure is recorded (P1-F11).
+                    logger.debug(
+                        "ICA topography annotation skipped for one component: %s",
+                        exc)
 
     def _fix_ica_head_outlines(self, fig: plt.Figure, ica: mne.preprocessing.ICA) -> None:
         """Replace MNE's head outline + sensor spots with our EEGLAB-style versions."""
@@ -2187,8 +2294,12 @@ class PreprocessedQC(BaseQC):
 
                     return epochs_params
 
-                except Exception as e:
-                    print(f"Warning: Failed to load task config from {config_path}: {e}")
+                except Exception as exc:
+                    # Record the failure and try the next candidate config
+                    # (the caller falls back to defaults, which is reported
+                    # below) instead of swallowing it (P1-F11).
+                    logger.warning(
+                        "could not load task config from %s: %s", config_path, exc)
                     continue
 
         print(f"Warning: No task config found for '{task_name}', using defaults")
@@ -2308,8 +2419,9 @@ class PreprocessedQC(BaseQC):
 
                 print(f"  Created ERP for condition '{condition}': {len(epochs)} epochs from {len(event_codes_for_condition)} event code(s)")
 
-            except Exception as e:
-                print(f"Warning: Could not create epochs for condition '{condition}': {e}")
+            except Exception as exc:
+                logger.warning(
+                    "could not create epochs for condition %r: %s", condition, exc)
                 continue
 
         # Generate ERP QC report if we have at least one condition

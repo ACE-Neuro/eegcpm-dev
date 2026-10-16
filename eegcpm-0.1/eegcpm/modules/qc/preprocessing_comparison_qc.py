@@ -17,6 +17,8 @@ Author: EEGCPM Development Team
 Date: 2025-11-29
 """
 
+import logging
+
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -37,6 +39,8 @@ try:
 except ImportError:
     EEGPREP_AVAILABLE = False
 
+
+logger = logging.getLogger(__name__)
 
 class PreprocessingComparisonQC(BaseQC):
     """
@@ -242,7 +246,9 @@ class PreprocessingComparisonQC(BaseQC):
         info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types='eeg')
         raw_processed = mne.io.RawArray(data, info, verbose=False)
 
-        # Set montage
+        # Set montage. A montage failure changes every downstream topography,
+        # so it is recorded (and surfaces as a missing-position montage) rather
+        # than silently skipped (P1-F11).
         try:
             montage = mne.channels.make_dig_montage(
                 ch_pos={ch['labels']: [ch['X'], ch['Y'], ch['Z']]
@@ -250,8 +256,10 @@ class PreprocessingComparisonQC(BaseQC):
                 coord_frame='head'
             )
             raw_processed.set_montage(montage, on_missing='warn')
-        except Exception:
-            pass
+        except (ValueError, KeyError, RuntimeError) as exc:
+            logger.warning(
+                "preprocessing comparison: could not set montage from the "
+                "EEGLAB chanlocs (%s); topographies will be unavailable", exc)
 
         # Create annotated version
         final_channels = [ch['labels'] for ch in eeg_final['chanlocs']]

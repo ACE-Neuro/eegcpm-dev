@@ -115,6 +115,7 @@ class InterpolateBadChannelsStep(ProcessingStep):
             )
 
         # Interpolate
+        interpolated_channels = [str(ch) for ch in bad_channels]
         raw.interpolate_bads(
             reset_bads=self.reset_bads,
             mode=self.mode,
@@ -127,6 +128,14 @@ class InterpolateBadChannelsStep(ProcessingStep):
             'n_interpolated': n_bad,
             'pct_bad': pct_bad,
             'mode': self.mode,
+            # B7-N1: the names are recorded so downstream steps know which
+            # channels are now *exact linear combinations* of the others (a
+            # spherical-spline interpolated channel carries no independent
+            # information). The ASR step must exclude them from its covariance
+            # estimate: including them makes the calibration covariance exactly
+            # singular and eegprep's `clean_asr` then returns ~1e15 µV instead
+            # of repaired data (probed 2026-10-16, see ASRStep docstring).
+            'interpolated_channels': interpolated_channels,
         }
 
         return raw, step_metadata

@@ -352,3 +352,181 @@ https://mne.tools/stable/
 ### B6 rev2a — scoped-re-audit fix (2026-10-16)
 
 - **ASR wrapper `get_config` truthfulness (re-audit condition 1).** `_ASRStepWrapper.get_config()` reported the *data-driven* `ref_maxbadchannels=0.075` / `ref_tolerances=[-inf, 5.5]`, but the wrapper runs `calibration='fixed_first_60s'` (calibration reference = the first 60 s passed as an ndarray; `ref_tolerances` never passed). It now reports `calibration_reference: "first_train_duration_s_of_data"`, `ref_maxbadchannels: "calibration_array"`, `ref_tolerances: "eegprep_default"` (the data-driven constants are no longer claimed). New spy test `test_asr_wrapper_config_matches_fixed_path_kwargs` asserts the `clean_asr` kwargs (ndarray shape `(n_channels, 60*sfreq)`, no `ref_tolerances`, `cutoff=20`) and the wrapper config. **`GOLDEN_RESOLVED_HASHES['hbn_langer']` re-pinned to `72c394e7801d894edf7b39dc26e543e401b2d023f67b445b83d8a5460719b3dd`** (was `73175626…`). Suite: 2 failed (connectivity P4) / 729 passed / 2 skipped / 2 xfailed.
+
+## Remediation batch B7 — QC truthfulness, test-suite honesty, CI job (2026-10-16)
+
+Plan `plan/261013-2240-p1p2-remediation.md` §B7 tasks 1–15 + the B6-carried EOG-regressor guard. **P1-F10/F11/F12, P2-F14/F15/F16.**
+
+### QC truthfulness (tasks 1–3, P1-F10)
+
+- **`modules/qc/preprocessed_qc.py`** (tasks 1–2): new metric **"Pipeline step status"** built from `metadata['step_status']` — `bad` when any step is `failed`/`excluded` (the metric value is the count and the unit names the steps), `warning` when `metadata['degraded']` or a step is `not_run` (only reachable after an abort), `ok` otherwise. The bad-channel accounting now reads the **detector's report** (`metadata['bad_channel_detection']['detected']`/`n_detected_precap`) — authoritative because the chain's interpolate step runs `reset_bads=True`, so `info['bads']` is empty afterwards — and counts `channel_roles` exclusions (`neck_face_dropped` + EEG→EOG retyped) in a separate informational metric **"Channel-role exclusions"**, subtracting them from `n_dropped` (the safety-net note no longer labels them "Bad/removed channel(s)"). "Bad Channels" therefore counts detected/interpolated channels only; without chain metadata the old marked/dropped fallback is kept.
+- **`cli/preprocess.py`** (task 2): the `removed_channels` map is built from `metadata['bad_channel_detection']` (per-channel `reasons`, legacy `bad_channels` dialect kept as fallback); the success path stores the per-recording chain QC row under `recording_qc` in the run's `*_qc_metrics.json` (`recording_qc_metrics(post_raw, task, subject_id, chain_metadata=result.metadata, raw_pre=raw)`); **FAILED and EXCLUDED runs now write the same `*_qc_metrics.json`** with `status`/`reason` (+ the exclusion metrics / error list, no HTML), including the crashed-run path — a downstream QC table can distinguish "excluded for contamination" from "not processed".
+- **`modules/qc/hbn_recording_qc.py`** (task 3): block-rejection fields read the names the step emits (`rejected_fraction`, `n_blocks_rejected`); `bad_channels_n` comes from the detector report (`bad_channels_n_precap`, `bad_channels_detected` added; `info['bads']` fallback); the **vacuous in-sample `residual_ocular_maxcorr` gate is replaced** by `blink_residual_ratio` — blinks are found on the *pre-chain* recording via the first available EGI EOG name (or a synthetic frontal proxy), and the ratio of blink-locked frontal scalp ptp post/pre is gated at `OCULAR_GATE` (0.30); the old correlation survives only as the informational `residual_ocular_maxcorr_insample` (after the OLS EOG regression it is ~0 *by construction*). `blink_residual_ratio`/`_pass`/`_reason`, `blink_n` and `blink_channel` are `None`/recorded when `raw_pre` is missing — a gate that cannot run never reports a pass. The frontal set excludes EOG-typed channels (an EOG channel keeps its blink by definition, which would pin the ratio near 1).
+
+### Test-suite honesty (tasks 4–5, P1-F11/F12)
+
+- **`tests/unit/test_no_silent_continue.py`**: the gate resolved the repo root one level too high (`parents[1]` = `tests/`) and scanned **zero** files; it now uses `parents[2]` (the package root), asserts every `CORE_PATH` resolves and was scanned (>= 1 file each, **88 files** in total), adds `eegcpm/modules/source` and `eegcpm/modules/qc`, skips `_legacy` trees, and gains a companion test that no live module imports from `_legacy`. The AST rule was extended: a handler whose body is only `pass`, `continue` **or `print(...)`** is a silent swallow (a bare print is not a record — that is exactly why the B6-K9 legacy handlers were invisible). **All 18 offenders found by the widened gate were fixed with no allow-list** (14 in the original scope + 4 print-only handlers in `modules/qc`): `FileNotFoundError`-swallowing `unlink` calls became `unlink(missing_ok=True)`; `dua_paths` no longer swallows a missing `yaml` (hard dependency); the ICA auto-detection (`find_bads_eog`/`find_bads_ecg`) narrows to `(ValueError, RuntimeError)` and records `auto_detected['eog_error']`/`['ecg_error']`; the networkx graph metrics record why the columns are absent (`logger.warning`) and path length narrows to `NetworkXError`/`NetworkXPointlessConcept`; DTF counts and logs singular frequency bins; `roc_auc_score` failures record `auc=None` + `auc_error`; option discovery logs unreadable connectivity archives; `aggregate_reports`/`run_processor`/`epoch_combiner` log the state/JSON/combined-epoch/stdout failures; `preprocessed_qc` records the ERP-plot skip as a QC note and the ICA-topography mismatch in the log; `preprocessing_comparison_qc` records a failed montage; `metrics_io`/`raw_qc` log skipped files/recordings.
+- **Vacuous checks (task 5)**: `np.trapz` is gone from `modules/features/erp_features.py` (→ `np.trapezoid`), and the two B3-era QC tests in `test_preprocessing_chain.py` that asserted the *vacuous* in-sample ocular gate were rewritten to the new contract (schema keys, `raw_pre`-missing behaviour, and a non-vacuous blink-gate pass/fail pair).
+
+### End-to-end chain test + CI (tasks 6–7, C2/C6)
+
+- **`tests/unit/test_hbn_chain_e2e.py`** (`chain_e2e`, `slow`): synthetic GSN-HydroCel-129 recording (129 names incl. `Cz`, 250 Hz, 150 s, `first_samp=1000`, `meas_date` set, per-channel-scaled 1/f + 5 µV 60 Hz + blinks on the 9 EGI EOG channels + an N1/P2 ERP at every 2-s `stim`, `Cz` identically zero) through the **real** 9-step chain. Asserts: success, `step_status` all `ok`/`noop` (no `degraded`/`excluded`), `stim` event samples identical input↔output, every input annotation preserved (only `BAD_*` added), the FIF reloads with the same annotations + `meas_date`, the sidecar's `config_hash == GOLDEN_RESOLVED_HASHES['hbn_langer']` with the resolved 9-step list and the fixed-first-60 s ASR config, `var(Cz) > 0` after the average reference, zero bad blocks, the QC row reading the chain metadata, and ASR excluding the interpolated channels. Second variant (30 % contaminated blocks **inside the ASR calibration window**): `RecordingExcluded('block_rejection_fraction_exceeded')`, `*_preprocessing_EXCLUDED.json` (with `n_blocks_rejected`/`rejected_fraction`/`bad_block_onsets_s`, `reference: not_run`) and **no FIF**. The fixture is documented in-file (why the contamination is per-channel-scaled, EEG-only and calibration-window-placed: ASR repairs bursts outside its calibration window — measured 22/75 → 0/75 — so the gate only fires when the calibration itself is contaminated).
+- **`.github/workflows/pipeline-verification.yml`** (repo root, `working-directory: eegcpm-0.1`): Python 3.13, `pip install -e ".[pipeline]" pytest pytest-cov`, an explicit `import eegprep, pyzaplineplus, eeglabio, autoreject, mne_icalabel` step (a missing backend fails the job instead of silently degrading a step), a cached `~/mne_data` + `fetch_fsaverage()` prefetch (the only allowed download), the §0.1 standard command, `pytest -m chain_e2e`, and the no-silent-except gate with its scan report.
+- **`tests/unit/conftest.py`**: conditional `collect_ignore` for the two specparam test files when the optional backend is absent (they raise at import) — without it every pytest invocation except the one with two explicit `--ignore` flags died at collection, including the plan's `pytest -m chain_e2e`.
+
+### Source crosstalk + source QC (tasks 8–10, P2-F14/F15/F16)
+
+- **`modules/qc/source_qc.py`** (task 8): the invalid "simulate a delta at the label's middle vertex, correlate with a dSPM magnitude, `fill_diagonal(1.0)`" crosstalk code (and the `vertices[len//2]` "centre") is **deleted**. The new `compute_crosstalk_matrix(fwd, info, noise_cov, labels, method, lambda2, depth)` builds a QC-only fixed-orientation pair, `make_inverse_resolution_matrix` and `get_cross_talk(..., mode='mean', norm=False)` (one whole-source-space STC per label) and forms `C[i, j] = mean(|ctf_i in label j|) / mean(|ctf_i in label i|)` per pair. **Two documented deviations from the plan's literal recipe**, both probed (`/tmp/opencode/b7_probe_crosstalk2.py`, mne 1.13.2): (i) `make_inverse_operator(info, fwd_fixed, …, fixed=True, depth=0.8)` raises — mne's compatibility table requires a **surface-oriented, free-orientation** forward for fixed orientation + depth weighting, so the inverse is built from `convert_forward_solution(fwd, surf_ori=True, force_fixed=False)` (the operator is still fixed-orientation) while the `force_fixed` forward is used for the resolution matrix; (ii) `get_cross_talk`'s `idx` handling tests `type(idx[0]) is Label`, so a **`BiHemiLabel` (every midline CONN ROI) raises `IndexError`** — the per-label call uses explicit integer vertex lists (`label_vertex_indices`), verified numerically identical to the single-`Label` call (max |Δ| 0.0). `compute_crosstalk_matrix_numpy(..., align_signs=False)` is an independent numpy mirror (`apply_inverse` on the identity → `R = J @ G`, direct label-row means) used by the tests.
+- **`modules/source/__init__.py`**: when `cfg.output.compute_crosstalk` the matrix is computed once per (forward, noise-covariance digest, method, lambda2) — the cache key includes the **covariance digest** beyond the plan's "montage hash" because the inverse operator is whitened by it (two subjects must never share a matrix) — written as `{subject}_crosstalk.npz` (matrix + `roi_names` + method + definition string) with a `crosstalk` block in the provenance (definition, off-diagonal max/mean, pairs > 0.3, or `computed: False`), and passed into `qc_data` together with `labels` and `roi_min_vertices`. A crosstalk failure (e.g. eLORETA, which `make_inverse_resolution_matrix` does not support) is recorded as a warning and never fails an otherwise successful run.
+- **Note (caught by narrowing the crosstalk failure handler)**: the first version of the wiring caught `Exception` and recorded it as a warning; that silently swallowed a `TypeError` (`_forward_cache_key` needs `spacing` + `subjects_dir`), so the matrix was never computed while every test still passed. The handler is now `(ValueError, RuntimeError, np.linalg.LinAlgError)` (MemoryError deliberately not caught), the call is fixed, and `test_process_with_template_forward` asserts the written `{subject}_crosstalk.npz` (shape, unit diagonal, `roi_names`) plus the provenance summary.
+- **QC metrics (task 9)**: `SourceQC.compute` now marks the result `bad` when any `roi_vertex_counts < roi_min_vertices`, any ROI value is non-finite, or a condition has no `{cond}_times` axis (metrics "ROI Vertex Counts", "ROI Values Finite", "Condition Time Axes"), the **fabricated time axis and the `sfreq=500.0` default are gone** (the ERP plot uses only conditions that carry their own axis and is skipped otherwise), and labels without a matrix produce an explicit note instead of silently recomputing the deleted (invalid) matrix.
+- **`tests/unit/test_source.py`** (task 10): both `@pytest.mark.skip` tests are replaced by real fsaverage tests (`oct6`, nested config): the module's own template forward (signed outputs, 30 unique ROI names, cerebellar exclusion, provenance files + config hash) and a caller-forward sLORETA run; new `TestSourceCrosstalk` asserts (a) the dipole-fixture target ROI `SensoriMotor.Superior`'s strongest off-diagonal entry is finite and **< 1** (measured 0.597, strongest partner `DorsalAttention.IPS_R`), (b) permuting two label indices permutes C's rows/columns (and the permutation moves entries), and (c) the numpy mirror matches the library matrix exactly while the `label_sign_flip`-aligned variant does **not** (critic N-3, quantified: 34 % of vertices flipped on average, max |ΔC| 2.08 — the library's signed mean cancels across sulcal walls; the saved matrix keeps the library definition and the discrepancy is pinned by a test rather than silently "fixed"). New `tests/unit/test_source_qc_metrics.py` covers the task-9 metrics.
+
+### CLI, provenance and legacy fixes (tasks 11–15)
+
+- **Features CLI argparse validation (B4-K6, task 11)**: `validate_features_args(parser, args)` runs right after parsing in `cli/main.py` — `--input-dir` is **required** for every non-`source_erp` type and, for `source_erp`, either `--input-dir` or all of `--preprocessing`/`--task`/`--source` must be resolvable; violations exit **2** with a usage message instead of a runtime traceback.
+- **B5-A5 (task 12)**: `core/provenance.stale_output_patterns` now covers this subject's hidden atomic-writer leftovers (`.{subject}_*`, `.{subject}-*` — the SIGKILL case) plus `{subject}_crosstalk.npz`, and the module docstring records the single-writer assumption (two concurrent writers for the same subject are unsupported).
+- **B5-N4 (task 13)**: condition names containing `/` or `\` are rejected by `_validate_condition_names` with a clear `ValueError` before any file is written (they become `{subject}_{condition}_stc` names and used to fail the whole run deep inside `stc.save`).
+- **B5-N5 (task 14)**: the `source-reconstruct` CLI raises `SystemExit(1)` when an explicitly requested task config is missing or unreadable (no more warning + per-event fallback that silently changes the condition structure) and exits non-zero when any session failed.
+- **B6-K9 (task 15)**: the legacy `detect_and_interpolate_bad_channels` `except Exception: print(...)` + silent `drop_channels` handlers now re-raise (`RuntimeError`, "refusing to drop channels silently"); the deliberate zero-variance drop is logged and returned in `bad_channels`.
+
+### Carried B6 item — EOG regressor guard
+
+- **`steps/eog_regression.py` v5.0**: `_check_band_limited` enforces the NEW-1 contract instead of only documenting it — (1) `raw.info['lowpass']` must be finite and `<= 50 Hz` (the chain's filter sets 45; an unfiltered `RawArray` declares Nyquist and is refused outright), (2) the fraction of EOG power above 50 Hz (Welch; capped at 45 % of Nyquist) must be `<= 5 %` (catches a recording whose metadata claims a 45 Hz lowpass while the EOG data stayed unfiltered — the exact pre-NEW-1 chain behaviour). Both measurements and the check outcome (`eog_hf_power_fraction`, `eog_lowpass_hz`, `eog_band_limited_check`) are recorded; `allow_unfiltered_regressors=True` is the explicit, recorded opt-out. The guard constants are in `get_config()` (B6-NEW-4 principle). Tests: refusal on an unfiltered recording, refusal on EEG-only-filtered data (metadata lies), acceptance + recorded fraction for the chain contract, the explicit bypass, and the Nyquist-capped cutoff. **`GOLDEN_RESOLVED_HASHES['hbn_langer']` re-pinned to `ca91b7f280d62804a63d5bc18aa4acfb18a1e80a193a0cedb64f343b3d75cbb7`** (was `72c394e7…`; superseded by the B7 rev2 re-pin to `1ef8780d…`, see the B7 rev2 section).
+
+### New critical finding (B7-N1) — ASR degenerates on interpolated channels
+
+Found while building the task-6 e2e fixture and **fixed in the minimal, non-architectural way** (flag for approval; the alternative is a chain reorder):
+
+- **Evidence (probed 2026-10-16, `/tmp/opencode/b7_e2e_probe*.py`, mne 1.13.2 + eegprep 0.4.0).** Spherical-spline interpolation reconstructs a bad channel as an **exact** linear combination of the remaining channels, so including it in the ASR input makes the calibration covariance exactly singular: on the EGI-129 fixture with a **single** interpolated channel the condition number goes from 35 (0 interpolated) to **1.2e15** with 1 exact zero eigenvalue; `eegprep.clean_asr` then takes `sqrtm` of that matrix (`LinAlgWarning: Matrix is singular`) and returns **~1e15 µV** instead of repaired data (control without the interpolated channel: sane ~12 µV output). Every 2-s block then exceeds the 100 µV block-rejection threshold, so **any recording with >= 1 interpolated channel was excluded by the chain** — the detector flags 1–11 channels on real HBN pilot recordings (B6: 8/12 recordings within the 11-channel budget, i.e. *with* interpolations), so this was a real-data blocker for Checkpoint B. The B3 ASR tests never combined `interpolate` with ASR (they mark channels bad instead), which is why the audits did not see it.
+- **Fix.** `InterpolateBadChannelsStep` records `interpolated_channels`; `ASRStep._channel_exclusions` adds them to the exclusion set (they are synthetic, carry no independent information, stay in the recording and are re-mixed by the average reference — only the ASR *input* excludes them), reporting `interpolated_excluded_from_asr`. Verified: 0 zero eigenvalues, condition number 34.9, sane output; the e2e chain now succeeds on a recording with 2 interpolated channels. Tests: `test_asr_timeline.py::test_interpolated_channels_excluded_from_asr` + `::test_interpolated_channel_does_not_break_asr` (with the rank-deficiency control assertion). **Not applied** (recorded for approval): moving interpolation after ASR (the EEGLAB ordering) — it changes the chain composition and the golden resolved-config hash.
+
+### Validation (B7)
+
+- Focused suites: `test_hbn_chain_e2e.py` → **13 passed**; `pytest -m chain_e2e` → **13 passed**; `test_no_silent_continue.py -rA` → **16 passed** (88 files scanned, 0 offenders); `test_source.py` → **55 passed** (both former skips now real tests); `test_asr_timeline.py` → 23 passed; `test_qc.py` → 49 passed; `test_preprocessed_qc.py` → 31 passed; `test_source_hardening.py` → 33 passed; `test_preprocessing_steps_tier2.py` → 35 passed; `test_cli_arg_validation.py` → 12 passed (new); `test_source_qc_metrics.py` → 6 passed (new); `test_preprocess_status_persistence.py` → 18 passed.
+- **Full standard suite → 2 failed / 811 passed / 2 xfailed** (the two failures are exactly the documented `mne_connectivity` P4 baseline; **zero skips** — both `test_source.py` skips became real tests; the two `test_specparam_*` collection errors are now conditionally ignored by `conftest.collect_ignore` and are never counted as passes).
+- Greps: `info['temp']` → 0 hits; `np.trapz(` → 0 hits (comment only); `set_annotations(annots)` → 0; `mne.make_inverse_operator|mne.apply_inverse` → 0; the no-silent-except gate scans **88** files with **0** offenders.
+
+### B7 rev1 — K3 fixes (2026-10-16)
+
+Pre-audit findings B7-A1…A5 (Kimi K3), all applied on the uncommitted B7 working tree.
+
+- **B7-A1 (major) — no-silent-except gate widened and the 9 offenders fixed.** `CORE_PATHS` now also
+  covers `eegcpm/cli`, `eegcpm/workflow` and `eegcpm/data` (the `_legacy` exclusion and the
+  import-guard test are unchanged) — the gate scans **108** files (was 88) with **0 offenders and no
+  allow-list**. Fixes, all narrowed + recorded:
+  `cli/connectivity.py` — the auto-detect loop records unreadable / non-mapping task configs (log +
+  a "Task config problems" summary) instead of `except Exception: continue`, and the load failure is
+  narrowed to `(OSError, yaml.YAMLError, pydantic.ValidationError, TypeError)` + logged (this CLI
+  only prints the config, so it is recoverable); `cli/epochs.py` — the QC-report handler is narrowed
+  to `(OSError, ValueError, RuntimeError, KeyError, TypeError)`, logged and listed in the run
+  summary ("QC reports not generated for N run(s)"), and `discover-events`' `find_events` handler is
+  narrowed to `(RuntimeError, ValueError, TypeError)` + logged; `workflow/state.py` — the three
+  `except sqlite3.OperationalError: pass` migration handlers are replaced by one
+  `_add_column_if_missing()` helper that tolerates only a message-checked duplicate-column error
+  (anything else re-raises) and logs the no-op at debug; `data/hbn.py` — non-numeric phenotype
+  values are logged (debug per value, warning summary) instead of a bare `pass`; `data/conn_rois.py`
+  — `load_nifti_template` logs the missing-nibabel / missing-template no-op and only tolerates
+  `ImportError` (a corrupt template propagates).
+- **B7-A2 (minor) — no false "all steps ok".** `preprocessed_qc.py`: when `metadata['step_status']`
+  is absent (legacy dialect or standalone QC) the "Pipeline step status" metric is now
+  `warning` / unit `no chain metadata` (value 0) instead of `ok` / `(all steps ok)`; an explicitly
+  empty `step_status` is a warning too.
+- **B7-A3 (minor) — crosstalk pair count is directed.** `C[i, j]` is the leakage of source ROI i into
+  target ROI j, so the above-threshold count is now over directed off-diagonal entries
+  (`(C > 0.3) & ~eye`, reciprocal pairs count twice). The provenance key is renamed
+  `n_pairs_above_0.3` → **`n_directed_above_0.3`** and the definition string documents the
+  directionality; QC metadata `crosstalk_high_pairs` → **`n_directed_above_0.3`**, and the QC
+  figure statistics, the HTML caption/summary and the `scripts/test_new_qc_figures.py` consumer were
+  updated to the same definition (the old `triu` count silently halved reciprocal pairs).
+- **B7-A4 (evidence note, no code change).** The e2e EXCLUDED variant places the 30 % contamination
+  **inside the ASR calibration window by design**: ASR repairs post-calibration contamination
+  (measured 22/75 → 0/75 contaminated blocks), so the block-rejection gate can only fire when the
+  calibration itself is contaminated; at that amplitude the gate's *post-calibration* sensitivity is
+  untestable (there is no contamination left to detect). Recorded in `VERIFICATION_TODO.md` for the
+  final auditor to adjudicate the coverage caveat.
+- **B7-A5 (no code change).** Added to the B8 checklist: validate the EOG-regression HF guard
+  (`MAX_HF_POWER_FRACTION=0.05`) on the real Checkpoint B subject; if it false-fires, measure the HF
+  fraction on blink-free segments or raise the threshold — never silently bypass.
+- **Tests**: gate **19 passed** (16 before; 3 new scope cases incl. the two new dirs' parametrized
+  existence checks); `test_preprocessed_qc.py` **33** (rewrote `test_without_metadata_is_ok` →
+  `test_without_metadata_is_warning_not_ok` + legacy-metadata and empty-`step_status` cases);
+  `test_source_qc_metrics.py` **8** (directed-vs-`triu` count, symmetric-matrix double count);
+  `test_source.py` provenance assertion pins `n_directed_above_0.3` against the saved matrix;
+  `test_cli_arg_validation.py` **14** (unreadable auto-detect config reported, unloadable explicit
+  config reported); `test_conn_rois.py` **11** (template loads; missing template returns None and is
+  logged); new `tests/unit/test_hbn_data_utils.py` **8** (numeric/skip/requested-but-absent/
+  `score_columns`/NaN boundary); `test_preprocess_status_persistence.py` **21** (idempotent
+  migration, duplicate column tolerated + debug-logged, non-duplicate `OperationalError` propagates).
+- **Validation (rev1)**: full standard suite → **2 failed / 833 passed / 2 xfailed / 0 skipped**
+  (failures exactly the two documented `mne_connectivity` P4 baseline tests); `pytest -m chain_e2e`
+  → **13 passed**; focused B7 set (gate + preprocessed_qc + source_qc_metrics + cli_arg_validation +
+  conn_rois + hbn_data_utils + status persistence) → **113 passed**; the gate reports **108 files
+  scanned / 0 offenders**.
+
+### B7 rev2 — Opus final-audit fixes (2026-10-16)
+
+All nine conditions of the Opus B7 final audit applied on the uncommitted B7 working tree; B7
+stays `[~]` (awaiting re-audit). **Golden resolved hash re-pinned `ca91b7f2…` →
+`1ef8780d87f228609e8c55c233426e51778b5e2a0a8648ba42318e3433b8d421`** (`ASRStep` 2.0 → 2.1,
+`_ASRStepWrapper` 2.1 → 2.2).
+
+- **B7-N2 (critical) — ASR output blow-up guard.** `eegprep.clean_asr` at cutoff 20 on
+  0.1-Hz-high-passed data can return garbage at ~1e15–1e16 µV (probed: 4.6e15 µV from a 13 µV
+  input at calibration-covariance condition number 2.2e8). `ASRStep` now fails loudly with reason
+  **`asr_output_magnitude_blowup`** when `max|post| > 1e3 × max|pre|` — before the write-back, so
+  the caller's data are never corrupted and the block-rejection gate can never report a false
+  "block contamination" exclusion. The fixed-calibration covariance condition number / min
+  eigenvalue are recorded (`calibration_cov_cond`, `calibration_cov_min_eig`; exactly-singular →
+  `asr_calibration_covariance_degenerate`). The guard immediately caught a pre-existing test that
+  asserted the garbage path (flat Cz in the ASR covariance → 2.06e16 µV) as a success.
+- **e2e fidelity assertions (fix 1b).** `test_hbn_chain_e2e.py` bounds the clean fixture's ASR
+  burden (`repaired_fraction < 0.85`, **measured 0.762**; audit 0.76) and asserts ERP retention
+  (median evoked↔template correlation ≥ 0.5, **measured 0.88**, reversed-template non-vacuity
+  control). The retention fixture injects the N1/P2 template on the anterior EEG subset
+  (`erp_mode='anterior'`) because the average-reference step cancels a common-mode ERP exactly
+  (measured r = −0.98 on Cz).
+- **Fix 7 — interpolated channels after ASR.** The channels a previous interpolate step
+  reconstructed (excluded from the ASR filter, B7-N1) are now **re-interpolated from the
+  ASR-cleaned data** with the same mode, so the saved channel is the spline reconstruction of the
+  data it sits in (1.02/1.09 relative-norm divergence before; the e2e asserts < 0.05 now).
+  Recorded as `reinterpolated_after_asr` / `reinterpolation_mode` /
+  `reinterpolation_relative_norm`; `bads` restored in a `finally`.
+- **CI can go green (fix 2).** The two P4 `mne_connectivity` tests are deselected in
+  `pipeline-verification.yml` (`mne_connectivity` is not in `.[pipeline]`; documented P4
+  baseline) and a new step runs `pytest -m fsaverage` and **fails on any skip** (≥1 pass
+  required). Local dry run of the exact CI commands (final code): §0.1 (with the two deselects) →
+  853 passed / 2 deselected / 2 xfailed / 0 failed / 0 skipped; `-m fsaverage` → 43 passed /
+  0 skipped; `-m chain_e2e` → 18 passed; gate → 19 passed with the scan count printed. A real
+  green GitHub run requires pushing the branch.
+- **Blink gate (fixes 3–4).** `blink_residual_ratio` refuses to run on a mismatched timeline
+  (`sfreq`/`n_times`/`first_samp`; `reason='timeline_mismatch'` — a resampled post used to get a
+  bogus pass/fail verdict) and measures the pre/post peak-to-peak on **identically 1–15 Hz
+  band-passed copies**, so line noise in the pre recording can no longer bias the ratio toward
+  pass (100 µV 60 Hz fixture: 0.20 false pass before, 1.0 correct fail after).
+- **Crosstalk (fixes 5–6).** Direction convention corrected everywhere (verified against mne
+  1.13.2: rows are CTFs → `C[i, j]` is leakage **from ROI j into ROI i**; row = target, column =
+  source; axis labels, captions, provenance/npz definitions). The saved **primary** matrix is now
+  the **flip-aligned** estimator (matches `mean_flip`; rank agreement 0.76 vs 0.61 for the
+  library signed mean); the library matrix is kept as `crosstalk_unflipped` and the exact
+  numpy-vs-library cross-check still pins the unflipped path. Provenance records
+  `primary_matrix`, `n_directed_above_0.3` (on the primary), the unflipped summary and
+  `max_abs_delta_primary_vs_unflipped`; QC records `crosstalk_matrix_kind` and states it in the
+  figure/caption. `{"computed": false}` carries a `reason`.
+- **Test honesty + smaller gaps (fixes 8–9).** The contaminated e2e variant compares against the
+  events captured **before** the chain (the old check compared `raw_in` with itself);
+  `assert interpolated` added. The no-silent-except gate prints the scan count; line-noise
+  failures return **NaN + note** instead of 0.0 (RawQC and QualityControlModule);
+  `run_processor.load_processed_runs` records an unreadable preprocessed FIF (logged reason,
+  `unknown`/`review`, warning) instead of a silent 128-channel default and reads the canonical
+  `bad_channel_detection` key first; `preprocessed_qc` subtracts only role channels that were
+  **EEG in the before set** (a native EOG electrode no longer hides a genuine EEG drop).
+- **⛔ Recorded, not implemented — open user decision blocking B8:** ASR high-pass design
+  (plan §12 item 6, decisions log): (i) compute the ASR correction on a ≥0.5–1 Hz high-passed
+  copy and add it to the 0.1 Hz data, (ii) 1 Hz chain variant, (iii) keep as-is with the guard +
+  documented distortion. Evidence: 76 % (audit) / 0.63 repaired fraction, 94 %/<0.5 Hz + 52 %/
+  0.5–2 Hz power removed, the blow-up regime.
+- **Validation (rev2)**: full standard suite → **2 failed / 853 passed / 2 xfailed / 0 skipped**
+  (failures exactly the two `mne_connectivity` P4 baseline tests); `pytest -m chain_e2e` → 18
+  passed; `pytest -m fsaverage` → 43 passed / 0 skipped; gate → 19 passed / 108 files / 0
+  offenders. Probes: `/tmp/opencode/b7rev2_probe{1..8}.py`.

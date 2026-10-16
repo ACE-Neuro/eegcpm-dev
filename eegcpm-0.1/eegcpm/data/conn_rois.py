@@ -5,11 +5,14 @@ Source: CONN's ICA analyses of HCP dataset (497 subjects)
 Reference: https://web.conn-toolbox.org/
 """
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Midline ROIs (|x| <= MIDLINE_X_MM in MNI space) are extracted bilaterally with
 # a larger radius because their centres fall between the two hemispheres (P2-F3).
@@ -175,13 +178,24 @@ def load_nifti_template():
     Load CONN networks NIfTI template.
 
     Returns:
-        nibabel Nifti1Image or None if nibabel not available
+        nibabel Nifti1Image or None if nibabel is not available or the
+        template file is absent (both cases are logged).
+
+    Notes:
+        ``nibabel`` is optional; the missing-backend / missing-template no-op is
+        recorded at debug level instead of a bare ``except ImportError: pass``
+        (B7-A1). A *corrupt* template propagates — only the optional dependency
+        is tolerated.
     """
     try:
         import nibabel as nib
-        template_path = get_template_path() / "networks.nii"
-        if template_path.exists():
-            return nib.load(template_path)
-    except ImportError:
-        pass
-    return None
+    except ImportError as exc:
+        logger.debug(
+            "nibabel is not installed (%s); CONN NIfTI template unavailable", exc)
+        return None
+
+    template_path = get_template_path() / "networks.nii"
+    if not template_path.exists():
+        logger.debug("CONN NIfTI template not found: %s", template_path)
+        return None
+    return nib.load(template_path)

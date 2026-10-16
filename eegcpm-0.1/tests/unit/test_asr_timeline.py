@@ -49,7 +49,7 @@ CH_NAMES = [
     "FC5", "FC6", "CP1", "CP2", "CP5", "CP6", "TP9", "TP10",
 ]
 
-# Metadata keys ASRStep must report (plan §B3 task 2).
+# Metadata keys ASRStep must report (plan §B3 task 2; B7 rev2 additions).
 REQUIRED_METADATA_KEYS = [
     "applied", "implementation", "calibration", "n_calibration_samples",
     "cutoff", "window_criterion", "window_tolerances", "n_channels_asr",
@@ -57,6 +57,11 @@ REQUIRED_METADATA_KEYS = [
     "bad_window_intervals_s", "repaired_fraction", "repaired_intervals_s",
     "asr_burden", "n_samples_before", "n_samples_after",
     "montage_present", "data_roundtrip",
+    # B7 rev2 fix 7 (re-interpolation) + B7-N2 (magnitude guard provenance)
+    "reinterpolated_after_asr", "reinterpolation_mode",
+    "reinterpolation_relative_norm", "pre_max_uv", "post_max_uv",
+    "output_magnitude_ratio", "calibration_cov_cond",
+    "calibration_cov_min_eig",
 ]
 
 
@@ -284,18 +289,274 @@ def test_reference_channel_excluded():
         "the excluded reference channel was modified by ASR")
 
     # Without the channel_roles metadata the flat channel is not excluded
-    # (the exclusion is metadata-driven, not a hard-coded name).
+    # (the exclusion is metadata-driven, not a hard-coded name) — and feeding a
+    # flat, zero-variance channel into the ASR covariance is now caught by the
+    # B7-N2 magnitude guard instead of silently returning garbage: measured
+    # 2026-10-16, eegprep returns 2.06e16 µV from a 2006 µV input on this
+    # fixture. The old test asserted that garbage path as a success.
     raw2 = _make_raw()
     raw2._data[raw2.ch_names.index("Cz")] = 0.0
-    _, meta2 = ASRStep().process(raw2, {})
-    assert "Cz" not in meta2["excluded_from_asr"]
-    assert meta2["n_channels_asr"] == len(CH_NAMES) - 1
+    with pytest.raises(RuntimeError, match="asr_output_magnitude_blowup"):
+        ASRStep().process(raw2, {})
 
     # Explicit exclude_channels are honoured too (picks-level check);
     # the configured names are reported first, then the reference channel.
     _, excluded3 = ASRStep(exclude_channels=("Fz",))._asr_picks(
         raw, {"channel_roles": {"reference_channel": "Cz"}})
     assert excluded3 == ["Fz", "Cz"]
+
+
+# ----------------------------------------------------------------------
+# B7-N1: interpolated channels must not enter the ASR covariance
+# ----------------------------------------------------------------------
+
+def test_interpolated_channels_excluded_from_asr():
+    """B7-N1: a previous interpolate step's channels stay out of the ASR input.
+
+    Spherical-spline interpolation reconstructs a bad channel as an exact linear
+    combination of the remaining ones, so including it makes the ASR calibration
+    covariance exactly singular; eegprep's ``clean_asr`` then returns ~1e15 µV
+    (probed 2026-10-16) and the block gate rejects the recording. The step
+    excludes them via ``metadata['interpolate']['interpolated_channels']``.
+    """
+    raw = _make_raw()
+    # Interpolate a channel exactly as the chain does (bads -> interpolate).
+    raw.info["bads"] = ["Pz"]
+    raw.interpolate_bads(reset_bads=True, verbose=False)
+
+    metadata = {
+        "channel_roles": {"reference_channel": "Cz"},
+        "interpolate": {
+            "applied": True,
+            "interpolated_channels": ["Pz"],
+        },
+    }
+    step = ASRStep()
+    picks, excluded = step._asr_picks(raw, metadata)
+    assert excluded == ["Cz", "Pz"]
+    assert len(picks) == len(CH_NAMES) - 2
+
+    out, meta = step.process(raw, metadata)
+    assert meta["interpolated_excluded_from_asr"] == ["Pz"]
+    assert "Pz" in meta["excluded_from_asr"]
+    assert meta["n_channels_asr"] == len(CH_NAMES) - 2
+
+
+def test_interpolated_channel_does_not_break_asr():
+    """B7-N1 regression: one interpolated channel must not degenerate ASR.
+
+    Measured 2026-10-16 (probe under ``/tmp/opencode/``): with the interpolated
+    channel in the ASR input, the calibration covariance has 1 exact zero
+    eigenvalue (condition number 1.2e15) and the repaired data come back at
+    ~1e15 µV (``LinAlgWarning: Matrix is singular``); excluding it restores a
+    full-rank covariance and an output at the input's scale. This test pins the
+    *sane* behaviour, so a regression to the degenerate call fails loudly.
+    """
+    raw = _make_raw()
+    raw.info["bads"] = ["Pz"]
+    raw.interpolate_bads(reset_bads=True, verbose=False)
+    input_scale = float(np.std(raw.get_data(picks="eeg")))
+
+    metadata = {
+        "channel_roles": {"reference_channel": "Cz"},
+        "interpolate": {"applied": True, "interpolated_channels": ["Pz"],
+                        "mode": "accurate"},
+    }
+    out, meta = ASRStep().process(raw, metadata)
+    out_scale = float(np.std(out.get_data(picks="eeg")))
+    assert np.isfinite(out.get_data()).all()
+    assert out_scale < 10 * input_scale, (
+        f"ASR output scale {out_scale:.3g} is far above the input scale "
+        f"{input_scale:.3g}: the interpolated channel entered the covariance"
+    )
+
+    # Control: without the metadata the channel enters ASR and the calibration
+    # covariance is (near-)singular: the interpolated channel is an exact linear
+    # combination of the others, so the smallest eigenvalue collapses towards
+    # the float64 noise floor. On this 32-channel fixture the condition number
+    # degrades from ~17 to ~2e4; on the EGI-129 chain fixture it reaches 1.2e15
+    # and eegprep's `sqrtm` returns garbage (that is what B7-N1 fixed).
+    control = _make_raw()
+    control.info["bads"] = ["Pz"]
+    control.interpolate_bads(reset_bads=True, verbose=False)
+    import eegprep
+
+    picks, _ = ASRStep()._asr_picks(control, {"channel_roles": {"reference_channel": "Cz"}})
+    picks_without = [p for p in picks if control.ch_names[p] != "Pz"]
+
+    def _cond(pick_list):
+        eeg = eegprep.eeg_mne2eeg(control.copy().pick(pick_list))
+        eigvals = np.linalg.eigvalsh(np.cov(eeg["data"][:, : int(60.0 * SFREQ)]))
+        return float(eigvals[-1] / max(eigvals[0], 1e-300))
+
+    cond_with = _cond(picks)
+    cond_without = _cond(picks_without)
+    assert cond_with > 100 * cond_without, (
+        f"fixture no longer shows the rank deficiency: cond with the "
+        f"interpolated channel {cond_with:.3g} vs without {cond_without:.3g}"
+    )
+
+
+def test_interpolated_channels_reinterpolated_after_asr():
+    """B7 rev2 fix 7: the ASR-excluded interpolated channels are re-interpolated.
+
+    The excluded channel must equal a **fresh** re-interpolation of the
+    ASR-cleaned data (same mode), not its pre-ASR spline values. On the
+    EGI-129 chain fixture the pre-ASR values diverge from a fresh
+    re-interpolation by ~1.02/1.09 relative norm (probed 2026-10-16); on this
+    32-channel fixture the divergence is smaller but must still be non-zero
+    (ASR rewrites the neighbours).
+    """
+    raw = _make_raw()
+    raw.info["bads"] = ["Pz"]
+    raw.interpolate_bads(reset_bads=True, verbose=False)
+    pz = raw.ch_names.index("Pz")
+    pre_asr_pz = raw._data[pz].copy()
+
+    metadata = {
+        "channel_roles": {"reference_channel": "Cz"},
+        "interpolate": {"applied": True, "interpolated_channels": ["Pz"],
+                        "mode": "accurate"},
+    }
+    out, meta = ASRStep().process(raw, metadata)
+
+    # The fresh re-interpolation of the ASR output must reproduce the stored
+    # channel exactly (the step re-interpolates from the same repaired data).
+    fresh = out.copy()
+    fresh.info["bads"] = ["Pz"]
+    fresh.interpolate_bads(reset_bads=False, mode="accurate", verbose=False)
+    fresh_pz = fresh.get_data(picks=["Pz"])[0]
+    np.testing.assert_allclose(out._data[pz], fresh_pz, rtol=1e-9, atol=1e-12)
+
+    # ... and the pre-ASR values were NOT kept: the re-interpolation changed
+    # the channel (non-vacuous), and the metadata records how much.
+    assert meta["reinterpolated_after_asr"] == ["Pz"]
+    assert meta["reinterpolation_mode"] == "accurate"
+    rel = meta["reinterpolation_relative_norm"]["Pz"]
+    assert rel > 0, "re-interpolation was a no-op (the pre-ASR values were kept)"
+    assert rel == pytest.approx(
+        float(np.linalg.norm(pre_asr_pz - out._data[pz])
+              / np.linalg.norm(out._data[pz])), rel=1e-6)
+    # The bads list is restored (the synthetic channel is never left marked).
+    assert list(out.info["bads"]) == []
+
+
+# ----------------------------------------------------------------------
+# B7-N2: ASR output magnitude blow-up guard
+# ----------------------------------------------------------------------
+
+def _near_duplicate_hp_raw(seed=3, duration_s=120.0):
+    """32-channel 0.1 Hz high-passed fixture with near-duplicate channels.
+
+    Probed 2026-10-16: three near-duplicate pairs give a calibration covariance
+    condition number of 2.2e8 (not exactly singular — the audit's blow-up
+    regime) and ``eegprep.clean_asr`` returns **4.6e15 µV** from a ~13 µV
+    input. Without the B7-N2 guard the garbage flows into the block-rejection
+    gate, which then reports the recording as *excluded for block
+    contamination* — a misattributed backend failure.
+    """
+    rng = np.random.default_rng(seed)
+    n = int(duration_s * SFREQ)
+    data = np.cumsum(rng.standard_normal((len(CH_NAMES), n)), axis=1)
+    data -= data.mean(axis=1, keepdims=True)
+    data *= 10e-6 / data.std(axis=1, keepdims=True)
+    for dup, src in (("Pz", "P3"), ("P4", "P8"), ("C4", "C3")):
+        data[CH_NAMES.index(dup)] = (
+            data[CH_NAMES.index(src)] + 1e-9 * rng.standard_normal(n))
+    info = mne.create_info(CH_NAMES, SFREQ, "eeg")
+    raw = mne.io.RawArray(data, info, first_samp=1000, verbose=False)
+    raw.set_montage(mne.channels.make_standard_montage("standard_1020"),
+                    match_case=False, on_missing="ignore")
+    raw.filter(0.1, 45.0, verbose=False)
+    raw.info["bads"] = []
+    return raw
+
+
+def test_asr_blowup_guard_fires_on_real_eegprep_output():
+    """B7-N2: real eegprep garbage (4.6e15 µV) fails loudly in the ASR step.
+
+    The guard must fire *inside* the step (reason ``asr_output_magnitude_blowup``)
+    and must not have written the garbage back into the caller's recording, so
+    the block-rejection gate can never misattribute the blow-up to the data.
+    """
+    raw = _near_duplicate_hp_raw()
+    input_max_uv = float(np.abs(raw.get_data()).max()) * 1e6
+    assert input_max_uv < 1e3  # sanity: a µV-scale fixture
+
+    with pytest.raises(RuntimeError, match="asr_output_magnitude_blowup") as excinfo:
+        ASRStep(calibration="fixed_first_60s", train_duration=60.0).process(raw, {})
+
+    message = str(excinfo.value)
+    assert "input max" in message and "output max" in message
+    # The failed run must not leave the caller's data corrupted (the guard runs
+    # before the write-back).
+    assert float(np.abs(raw.get_data()).max()) * 1e6 == pytest.approx(input_max_uv)
+    # Attribution: the message names the eegprep failure mode, not the data.
+    assert "clean_asr" in message and "sqrtm" in message
+
+
+def test_asr_blowup_guard_reports_pre_and_post_maxima(monkeypatch):
+    """Deterministic guard test: a scaled-up output fails with the maxima.
+
+    Monkeypatching ``clean_asr`` keeps this independent of eegprep's numeric
+    behaviour, while the real-output test above pins the actual failure mode.
+    """
+    import eegprep
+
+    raw = _make_raw()
+    real = eegprep.clean_asr
+
+    def _scaled(EEG, **kwargs):
+        out = dict(real(EEG, **kwargs))
+        out["data"] = np.asarray(out["data"], dtype=float) * 1e9
+        return out
+
+    monkeypatch.setattr(eegprep, "clean_asr", _scaled)
+    with pytest.raises(RuntimeError, match="asr_output_magnitude_blowup") as excinfo:
+        ASRStep().process(raw, {})
+
+    message = str(excinfo.value)
+    assert "1000 x" in message
+    # Pre/post maxima are reported (µV), not just a boolean.
+    assert "µV" in message
+
+
+def test_asr_guard_does_not_fire_on_legitimate_repair():
+    """Non-vacuity: a legitimate ASR repair stays far below the guard factor."""
+    from eegcpm.modules.preprocessing.steps.asr import ASR_OUTPUT_BLOWUP_FACTOR
+
+    raw = _make_raw()
+    _, meta = ASRStep().process(raw, {})
+    assert meta["output_magnitude_ratio"] is not None
+    assert meta["output_magnitude_ratio"] < ASR_OUTPUT_BLOWUP_FACTOR
+    assert meta["pre_max_uv"] > 0 and meta["post_max_uv"] > 0
+
+
+def test_asr_blowup_is_never_reported_as_block_exclusion(tmp_path):
+    """B7-N2: a blow-up fails the ASR step, never the block-rejection gate.
+
+    The garbage output would make every 2-s block exceed the block gate's
+    100 µV threshold, so without the in-step guard the run would be reported as
+    ``excluded`` for *block contamination* — a backend failure blamed on the
+    data. Through the executor: ``asr`` is ``failed``, the run has no FIF and a
+    FAILED sidecar, and there is no ``excluded`` record.
+    """
+    raw = _near_duplicate_hp_raw()
+    pipeline = PreprocessingPipeline(
+        [{"name": "asr", "params": {"calibration": "fixed_first_60s"}}],
+        tmp_path,
+    )
+    result = pipeline.process(raw, subject_id="blowup")
+
+    assert result.success is False
+    assert result.metadata["step_status"]["asr"] == "failed"
+    assert "excluded" not in result.metadata
+    assert "asr_output_magnitude_blowup" in str(
+        result.metadata["asr"].get("error", ""))
+    assert list(tmp_path.glob("*_preprocessed_raw.fif")) == []
+    assert (tmp_path / "blowup_preprocessing_FAILED.json").exists()
+
+
 
 
 # ----------------------------------------------------------------------
@@ -646,3 +907,25 @@ def test_asr_wrapper_config_matches_fixed_path_kwargs(monkeypatch):
     assert cfg["calibration_reference"] == "first_train_duration_s_of_data"
     assert cfg["ref_maxbadchannels"] == "calibration_array"
     assert cfg["ref_tolerances"] == "eegprep_default"
+
+
+def test_asr_degenerate_calibration_covariance_raises(monkeypatch):
+    """The deterministic 'degenerate' branch must fire for a truly singular
+    calibration covariance.
+
+    The B7 validator found this branch practically unreachable: float rounding
+    of an exactly rank-deficient covariance yields a tiny positive eigenvalue,
+    so the magnitude guard is the operative defense. This test forces the
+    singular case (np.cov stubbed) so the error code itself stays pinned.
+    """
+    import numpy as _np
+
+    def singular_cov(data, *args, **kwargs):
+        return _np.array([[0.0, 0.0], [0.0, 1.0]])
+
+    monkeypatch.setattr(_np, "cov", singular_cov)
+
+    raw = _make_raw()
+    step = ASRStep(calibration="fixed_first_60s", train_duration=60.0)
+    with pytest.raises(RuntimeError, match="asr_calibration_covariance_degenerate"):
+        step.process(raw, {})

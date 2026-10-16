@@ -95,6 +95,7 @@ def source_reconstruct_command(args):
     # Load task config if available (for condition grouping)
     task_config = None
     task_config_name = getattr(args, 'task_config', None)
+    task_config_path: Optional[Path] = None
 
     # Determine which task config to use
     if task_config_name == "none":
@@ -156,6 +157,15 @@ def source_reconstruct_command(args):
             # Specific config requested
             print(f"   📋 Using specified task config: {task_config_name}.yaml")
             task_config_path = paths.get_configs_dir("tasks") / f"{task_config_name}.yaml"
+            # B5-N5: an *explicitly requested* task config that does not exist
+            # must fail the run (exit 1) — silently falling back to per-event
+            # processing would reconstruct different "conditions" than asked for.
+            if not task_config_path.exists():
+                print(
+                    f"❌ Requested task config not found: {task_config_path}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
 
         # Load the selected config
         if task_config_path and task_config_path.exists():
@@ -170,12 +180,20 @@ def source_reconstruct_command(args):
                 print(f"   ✓ Loaded task config: {task_config_path.name}")
                 print(f"   Conditions: {[c.name for c in task_config.conditions]}")
             except Exception as e:
-                print(f"   ⚠️  Could not load task config: {e}")
-                print(f"   Will process each event separately")
-                task_config = None
+                # B5-N5: an unreadable/auto-detected task config also fails the
+                # run instead of warning + per-event fallback — the fallback
+                # silently changes the condition structure of every output.
+                print(
+                    f"❌ Could not load task config {task_config_path}: {e}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
         elif task_config_path:
-            print(f"   ⚠️  Task config not found: {task_config_path}")
-            print(f"   Will process each event separately (no grouping by condition)")
+            print(
+                f"❌ Task config not found: {task_config_path}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 
     # Get epochs directory (root, without subject/session filters)
     epochs_dir = paths.derivatives_root / "epochs" / preprocessing / task
@@ -332,3 +350,8 @@ def source_reconstruct_command(args):
             print(f"  - {sub}")
 
     print()
+
+    # B5-N5: a batch with failed sessions must not exit 0 — scripts and CI would
+    # treat a partially reconstructed batch as success.
+    if n_failed > 0:
+        raise SystemExit(1)

@@ -1,5 +1,6 @@
 """Quality Control module for subject-level artifact assessment."""
 
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,8 @@ import numpy as np
 from eegcpm.pipeline.base import BaseModule, ModuleResult, RawDataModule
 from .base import BaseQC, QCMetric, QCResult
 from .html_report import HTMLReportBuilder, QCIndexBuilder
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -218,6 +221,12 @@ class QualityControlModule(RawDataModule):
 
             # Compute line noise
             metrics.line_noise_power = self._compute_line_noise(raw, eeg_picks)
+            if not np.isfinite(metrics.line_noise_power):
+                # NaN, never a false 0.0; the caller records why (B7 rev2 fix 9).
+                warnings.append(
+                    "Line noise power could not be computed (see log); "
+                    "reported as NaN instead of a false 0.0"
+                )
 
             # Assess usability
             metrics = self._assess_usability(metrics)
@@ -277,9 +286,14 @@ class QualityControlModule(RawDataModule):
         raw: mne.io.BaseRaw,
         picks: np.ndarray,
     ) -> float:
-        """Compute relative line noise power."""
+        """Compute relative line noise power.
+
+        Returns NaN (never a false 0.0) when the measurement cannot be taken
+        (no picks, PSD failure); the caller records a warning (B7 rev2 fix 9).
+        """
         if len(picks) == 0:
-            return 0.0
+            logger.warning("line-noise power: no channels to compute a PSD from")
+            return float("nan")
 
         try:
             # Compute PSD
@@ -304,8 +318,10 @@ class QualityControlModule(RawDataModule):
 
             return float(line_power / neighbor_power) if neighbor_power > 0 else 0
 
-        except Exception:
-            return 0.0
+        except Exception as exc:
+            # A failed measurement is not a clean recording (B7 rev2 fix 9).
+            logger.warning("line-noise power could not be computed: %s", exc)
+            return float("nan")
 
     def _assess_usability(self, metrics: QCMetrics) -> QCMetrics:
         """Assess overall usability based on thresholds."""

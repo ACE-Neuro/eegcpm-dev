@@ -4,6 +4,8 @@ This module handles processing multiple runs of the same task for a subject,
 including per-run preprocessing, QC, and preparation for epoch combination.
 """
 
+import logging
+
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, field
@@ -76,6 +78,9 @@ class RunProcessingResult:
     logs: Optional[List[str]] = None  # Processing logs for UI display
 
 
+logger = logging.getLogger(__name__)
+
+
 class RunProcessor:
     """Process multiple runs of a task for a single subject."""
 
@@ -114,8 +119,12 @@ class RunProcessor:
         if self.verbose:
             try:
                 print(*args, **kwargs)
-            except BrokenPipeError:
-                pass  # Ignore broken pipe errors in non-verbose contexts
+            except BrokenPipeError as exc:
+                # stdout was closed (piped into `head` etc.). Record it and
+                # stop printing instead of silently swallowing the condition
+                # (P1-F11).
+                logger.debug("stdout closed, dropping verbose output: %s", exc)
+                self.verbose = False
 
     def process_subject_task(
         self,
@@ -616,6 +625,12 @@ class RunProcessor:
     ) -> RunQualityMetrics:
         """Extract quality metrics from preprocessing metadata and QC JSON."""
 
+        # 0 (or negative) means the caller could not determine the original
+        # channel count (the preprocessed FIF was unreadable): record it and
+        # leave the bad-channel percentage unknown instead of inventing one
+        # (B7 rev2 fix 9).
+        unknown_original = n_original <= 0
+
         # Handle None or empty metadata
         if not metadata:
             return RunQualityMetrics(
@@ -650,13 +665,23 @@ class RunProcessor:
                 # Calculate pct_clustered from n_clustered and n_bad
                 n_bad = qm.get('n_bad_channels', 0)
                 pct_clustered = (n_clustered / n_bad * 100) if n_bad > 0 else 0.0
-            except Exception as e:
-                # QC JSON loading failed - continue with defaults
-                pass
+            except (OSError, ValueError, KeyError) as exc:
+                # QC JSON loading failed: keep the defaults but record which
+                # file/field failed instead of swallowing it (P1-F11).
+                # (`json.JSONDecodeError` is a ValueError subclass.)
+                logger.warning(
+                    "quality summary: unreadable QC metrics %s (%s)",
+                    qc_metrics_json, exc)
 
-        # Extract bad channels info from bad_channels step
-        bad_channels_step = metadata.get('bad_channels', {})
-        n_bad = bad_channels_step.get('n_bad_channels', 0)
+        # Extract bad channels info: the canonical chain's detector report first
+        # (`bad_channel_detection`, P1-F10), then the legacy `bad_channels`
+        # dialect (B7 rev2 fix 9).
+        detector_meta = metadata.get('bad_channel_detection') or {}
+        if detector_meta:
+            n_bad = len(detector_meta.get('detected') or [])
+        else:
+            bad_channels_step = metadata.get('bad_channels', {})
+            n_bad = bad_channels_step.get('n_bad_channels', 0)
         pct_bad = (n_bad / n_original * 100) if n_original > 0 else 0
 
         # Extract ICA info from ica step
@@ -681,6 +706,12 @@ class RunProcessor:
             quality_status = "excellent"
             recommended = "accept"
 
+        if unknown_original:
+            # The percentage is not computable — never report a false
+            # "excellent" (B7 rev2 fix 9).
+            quality_status = "unknown"
+            recommended = "review"
+
         # Adjust for clustering - only reject/review for severe clustering with high bad channels
         if severity == 'severe':
             if pct_bad > 15:
@@ -701,6 +732,11 @@ class RunProcessor:
 
         # Warnings
         warnings = []
+        if unknown_original:
+            warnings.append(
+                "Original channel count unknown (the preprocessed FIF could not "
+                "be read; see log): bad-channel percentage not computed"
+            )
         if pct_bad > 20:
             warnings.append(f"High bad channel percentage: {pct_bad:.1f}%")
         if severity in ['moderate', 'severe']:
@@ -793,19 +829,31 @@ class RunProcessor:
                         if step.step_name == "preprocessing" and step.metadata:
                             # Get original channel count (need to infer from current + dropped)
                             metadata = step.metadata
-                            if 'bad_channels' in metadata:
-                                bc_info = metadata['bad_channels']
-                                n_detected = len(bc_info.get('detected', []))
-
-                                # Load raw to get current channel count
+                            # P1-F10/B7 rev2: the canonical chain reports the
+                            # detector under `bad_channel_detection`; the legacy
+                            # dialect used `bad_channels`.
+                            detector = (
+                                metadata.get('bad_channel_detection')
+                                or metadata.get('bad_channels')
+                                or {}
+                            )
+                            if detector:
+                                n_original = 0  # 0 = unknown (recorded below)
                                 try:
                                     import mne
                                     raw = mne.io.read_raw_fif(preproc_file, preload=False, verbose=False)
                                     n_current = len(raw.ch_names)
-                                    n_original = n_current + len(bc_info.get('dropped', []))
-                                except:
-                                    n_original = 128  # Default assumption
-                                    n_current = len(bc_info.get('detected', [])) if bc_info.get('detected') else 0
+                                    n_original = n_current + len(detector.get('dropped') or [])
+                                except Exception as exc:
+                                    # Never a silent 128-channel assumption: the
+                                    # failure is recorded and the bad-channel
+                                    # percentage is left unknown (B7 rev2).
+                                    logger.warning(
+                                        "quality summary: could not read %s to "
+                                        "recover the original channel count (%s: %s); "
+                                        "the bad-channel percentage stays unknown",
+                                        preproc_file, type(exc).__name__, exc,
+                                    )
 
                                 # Try to find QC metrics JSON file
                                 qc_json_path = run_dir / f"{subject_id}_ses-{session}_task-{task}_run-{run_id}_qc_metrics.json"

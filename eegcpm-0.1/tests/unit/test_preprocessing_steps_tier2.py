@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 from eegcpm.modules.preprocessing.steps.eog_regression import (
+    MAX_HF_POWER_FRACTION,
     SPEC_DEVIATION,
     EOGRegressionStep,
 )
@@ -201,7 +202,14 @@ def test_zapline_validate_inputs():
 # EOG regression (P1-F13, plan task 10)
 # ---------------------------------------------------------------------------
 
-def _eog_raw(n_eeg=4, n_eog=3, n_times=2000, seed=0, sfreq=250.0):
+def _eog_raw(n_eeg=4, n_eog=3, n_times=2000, seed=0, sfreq=250.0, filtered=True):
+    """EEG + EOG fixture.
+
+    ``filtered=True`` (default) applies the step's documented input contract:
+    the regressors must be band-limited (the canonical chain filters the EEG
+    **and EOG** picks). ``filtered=False`` is the unfiltered case the
+    band-limited guard refuses (B7, carried B6 item).
+    """
     rng = np.random.RandomState(seed)
     eeg_names = [f"E{i}" for i in range(1, n_eeg + 1)]
     eog_names = [f"VEOG{i}" for i in range(1, n_eog + 1)]
@@ -212,7 +220,13 @@ def _eog_raw(n_eeg=4, n_eog=3, n_times=2000, seed=0, sfreq=250.0):
     data = np.vstack([eeg, eog_sources])
     info = mne.create_info(eeg_names + eog_names, sfreq,
                            ["eeg"] * n_eeg + ["eog"] * n_eog)
-    return mne.io.RawArray(data, info)
+    raw = mne.io.RawArray(data, info)
+    if filtered:
+        # 0.5 Hz (not 0.1) keeps the FIR length inside this short fixture; the
+        # guard only constrains the upper edge. Picks mirror the canonical
+        # chain: mne's default picks exclude EOG channels (B6 rev2 NEW-1).
+        raw.filter(0.5, 45.0, picks=("eeg", "eog"), verbose=False)
+    return raw
 
 
 def test_eog_regression_equals_per_channel_normal_equations():
@@ -408,14 +422,18 @@ def test_eog_regression_after_filter_does_not_inject_eog_noise():
     assert np.all(blink_ratio <= 0.5), blink_ratio
 
     # Contrast: EEG-only filtering (the pre-fix behaviour) re-injects the
-    # EOG's line noise and does not remove the blink.
+    # EOG's line noise and does not remove the blink. It is now refused by the
+    # band-limited guard (B7, carried B6 item); the old behaviour is reachable
+    # only through the explicit opt-out, which is what the contrast measures.
     raw_prefix, t_prefix, blink_prefix = _shared_component_raw()
     raw_prefix.filter(0.1, 45.0, picks="eeg", verbose=False)
+    with pytest.raises(ValueError, match="not band-limited"):
+        EOGRegressionStep().process(raw_prefix, {})
     line_before_prefix = _band_power(raw_prefix.get_data(picks=eeg_picks),
                                      band="line")
     blink_before_prefix = _blink_locked_ptp(
         raw_prefix.get_data(picks=eeg_picks), t_prefix, blink_prefix)
-    EOGRegressionStep().process(raw_prefix, {})
+    EOGRegressionStep(allow_unfiltered_regressors=True).process(raw_prefix, {})
     line_ratio_prefix = (
         _band_power(raw_prefix.get_data(picks=eeg_picks), band="line")
         / line_before_prefix
@@ -671,3 +689,134 @@ def test_prep_failure_raises_instead_of_zero_bads(monkeypatch):
     raw = _correlated_raw(seed=4)
     with pytest.raises(RuntimeError, match="PREP bad-channel detection failed"):
         BadChannelDetector(methods=["prep"]).detect(raw)
+
+
+# ---------------------------------------------------------------------------
+# Legacy detect_and_interpolate_bad_channels: no silent channel drops
+# (B6-K9 → plan §B7 task 15)
+# ---------------------------------------------------------------------------
+
+def test_legacy_interpolation_without_montage_raises_instead_of_dropping(monkeypatch):
+    """A montage-less recording fails loudly; no channel is dropped silently.
+
+    The legacy convenience function used to ``print`` the failure and return
+    the raw with the bad channels *dropped* — a silent change of the sensor set
+    (B6-K9/P1-F11). It now raises. ``set_montage(on_missing='warn')`` does not
+    raise for unknown channel names (probed), so the failure is injected at the
+    montage constructor, which is the only way that branch can fire.
+    """
+    import mne
+
+    from eegcpm.modules.preprocessing.bad_channels import (
+        detect_and_interpolate_bad_channels,
+    )
+
+    def _no_montage(*args, **kwargs):
+        raise ValueError("standard_1020 montage unavailable")
+
+    monkeypatch.setattr(mne.channels, "make_standard_montage", _no_montage)
+
+    raw = _raw(["Fp1", "Fp2", "F3", "F4", "Cz", "Pz", "O1", "O2"])  # no montage
+    with pytest.raises(RuntimeError, match="no montage"):
+        detect_and_interpolate_bad_channels(
+            raw,
+            {"manual_bads": ["Pz"], "auto_detect": False, "interpolate": True},
+            copy=True,
+        )
+
+
+def test_legacy_interpolation_failure_raises_instead_of_dropping(monkeypatch):
+    """An interpolation error propagates; the channels stay in the recording."""
+    from eegcpm.modules.preprocessing import bad_channels as legacy
+
+    raw = _montaged_raw(seed=11)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("interpolate_bads exploded")
+
+    monkeypatch.setattr(type(raw), "interpolate_bads", _boom)
+    with pytest.raises(RuntimeError, match="refusing to drop channels"):
+        legacy.detect_and_interpolate_bad_channels(
+            raw,
+            {"manual_bads": ["Pz"], "auto_detect": False, "interpolate": True},
+            copy=True,
+        )
+
+
+def test_legacy_zero_variance_drop_is_logged(caplog):
+    """Zero-variance channels are dropped, but the drop is recorded (log)."""
+    import logging
+
+    from eegcpm.modules.preprocessing import bad_channels as legacy
+
+    raw = _montaged_raw(seed=12)
+    raw._data[raw.ch_names.index("Pz")] = 0.0
+    with caplog.at_level(logging.WARNING, logger="eegcpm.modules.preprocessing.bad_channels"):
+        out, bads = legacy.detect_and_interpolate_bad_channels(
+            raw,
+            {"manual_bads": ["Pz"], "auto_detect": False, "interpolate": True},
+            copy=True,
+        )
+    assert "Pz" in bads
+    assert "Pz" not in out.ch_names
+    assert any("zero-variance" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# B7 (carried B6 item): EOGRegressionStep refuses unfiltered regressors
+# ---------------------------------------------------------------------------
+
+def test_eog_regression_refuses_unfiltered_regressors():
+    """Unfiltered EOG regressors re-inject line noise/drift → loud refusal."""
+    raw = _eog_raw(seed=5, filtered=False)
+    # Give the unfiltered EOG a line component (the real failure mode).
+    sfreq = raw.info["sfreq"]
+    t = np.arange(raw.n_times) / sfreq
+    eog_picks = mne.pick_types(raw.info, eog=True, exclude="bads")
+    raw._data[eog_picks] += 20e-6 * np.sin(2 * np.pi * 60.0 * t)[None, :]
+
+    # The metadata contract fires first for an unfiltered RawArray (its
+    # declared lowpass is Nyquist); the spectral check is exercised below.
+    with pytest.raises(ValueError, match="declares lowpass"):
+        EOGRegressionStep(eog_channels=["VEOG1", "VEOG2", "VEOG3"]).process(raw, {})
+
+    # EEG-only filtering (the pre-fix chain behaviour, B6 rev2 NEW-1): the
+    # metadata declares 45 Hz while the EOG data stay unfiltered — the
+    # spectral check catches it.
+    raw_eeg_only = _eog_raw(seed=5, filtered=False)
+    raw_eeg_only.filter(0.5, 45.0, picks="eeg", verbose=False)
+    assert raw_eeg_only.info["lowpass"] == pytest.approx(45.0)
+    with pytest.raises(ValueError, match="not band-limited"):
+        EOGRegressionStep(eog_channels=["VEOG1", "VEOG2", "VEOG3"]).process(
+            raw_eeg_only, {})
+
+
+def test_eog_regression_accepts_filtered_regressors_and_records_the_fraction():
+    raw = _eog_raw(seed=5)
+    _, meta = EOGRegressionStep(eog_channels=["VEOG1", "VEOG2", "VEOG3"]).process(raw, {})
+    assert meta["applied"] is True
+    assert meta["eog_band_limited_check"] == "passed"
+    assert meta["eog_hf_power_fraction"] < MAX_HF_POWER_FRACTION
+    assert meta["eog_hf_cutoff_hz"] == pytest.approx(50.0)
+    assert meta["eog_lowpass_hz"] == pytest.approx(45.0)
+
+
+def test_eog_regression_bypass_is_explicit_and_recorded():
+    raw = _eog_raw(seed=6, filtered=False)
+    _, meta = EOGRegressionStep(
+        eog_channels=["VEOG1", "VEOG2", "VEOG3"],
+        allow_unfiltered_regressors=True,
+    ).process(raw, {})
+    assert meta["applied"] is True
+    assert meta["eog_band_limited_check"] == "bypassed"
+    assert meta["eog_hf_power_fraction"] > MAX_HF_POWER_FRACTION
+
+
+def test_eog_guard_cutoff_follows_nyquist():
+    """A low-rate recording cannot be required to be clean above Nyquist."""
+    raw = _eog_raw(seed=7, sfreq=100.0, filtered=False)
+    _, meta = EOGRegressionStep(
+        eog_channels=["VEOG1", "VEOG2", "VEOG3"],
+        allow_unfiltered_regressors=True,
+    ).process(raw, {})
+    assert meta["eog_hf_cutoff_hz"] == pytest.approx(0.45 * 50.0)

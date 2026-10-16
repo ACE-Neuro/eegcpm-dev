@@ -90,15 +90,19 @@ def compute_classification_metrics(
     metrics["recall"] = recall_score(y_true, y_pred, average=average, zero_division=0)
     metrics["f1"] = f1_score(y_true, y_pred, average=average, zero_division=0)
 
-    # AUC if probabilities available
+    # AUC if probabilities available. roc_auc_score raises ValueError when the
+    # label set is degenerate (e.g. a single class in the fold); the metric is
+    # then *not computable* and that is recorded explicitly instead of leaving
+    # a silently missing key (P1-F11).
     if y_prob is not None:
         try:
             if len(unique_classes) == 2:
                 metrics["auc"] = roc_auc_score(y_true, y_prob[:, 1])
             else:
                 metrics["auc"] = roc_auc_score(y_true, y_prob, multi_class="ovr")
-        except ValueError:
-            pass
+        except ValueError as exc:
+            metrics["auc"] = None
+            metrics["auc_error"] = str(exc)
 
     # Confusion matrix
     cm = confusion_matrix(y_true, y_pred)

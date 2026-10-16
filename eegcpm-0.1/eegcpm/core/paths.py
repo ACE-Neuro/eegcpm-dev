@@ -759,10 +759,9 @@ def fail_run_outputs(
     Shared by the CLI and ``RunProcessor`` (audit condition N4/F2).
     """
     for out_file in output_files or []:
-        try:
-            Path(out_file).unlink()
-        except FileNotFoundError:
-            pass
+        # missing_ok=True: an already-deleted output is not an error, and no
+        # handler is needed (P1-F11 gate).
+        Path(out_file).unlink(missing_ok=True)
 
     stem = f"{subject_id}_ses-{session}_run-{run_num}"
     success_sidecar = Path(run_output) / f"{stem}_preprocessing.json"

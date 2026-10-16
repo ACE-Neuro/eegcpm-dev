@@ -7,8 +7,11 @@ Dataset: https://fcon_1000.projects.nitrc.org/indi/cmi_healthy_brain_network/
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import json
+import logging
 
 from eegcpm.core.models import Project, Subject, Session, Run
+
+logger = logging.getLogger(__name__)
 
 
 def scan_hbn_directory(
@@ -155,24 +158,48 @@ def add_behavioral_scores(
         project: Project to update
         phenotype: Phenotype data from load_hbn_phenotype
         score_columns: Specific columns to include (None = all numeric)
+
+    Notes:
+        Values that are not numeric (``ValueError``/``TypeError`` from
+        ``float``) are skipped; the skips are logged (debug per value, warning
+        summary) instead of being swallowed by a bare ``pass`` (B7-A1).
     """
-    import pandas as pd
+    skipped: Dict[str, List[str]] = {}
 
     for subject in project.subjects:
-        if subject.id in phenotype:
-            pheno = phenotype[subject.id]
+        if subject.id not in phenotype:
+            continue
+        pheno = phenotype[subject.id]
+        if score_columns:
+            columns = [col for col in score_columns if col in pheno]
+            missing = [col for col in score_columns if col not in pheno]
+            if missing:
+                # A requested score column the phenotype table does not have is
+                # a drop too — recorded, not silently ignored (B7-A1).
+                logger.debug(
+                    "HBN phenotype: %s has no column(s) %s; requested but absent",
+                    subject.id, ", ".join(missing),
+                )
+        else:
+            # Add all numeric values
+            columns = list(pheno.keys())
 
-            if score_columns:
-                for col in score_columns:
-                    if col in pheno:
-                        try:
-                            subject.behavioral_scores[col] = float(pheno[col])
-                        except (ValueError, TypeError):
-                            pass
-            else:
-                # Add all numeric values
-                for key, value in pheno.items():
-                    try:
-                        subject.behavioral_scores[key] = float(value)
-                    except (ValueError, TypeError):
-                        pass
+        for col in columns:
+            try:
+                subject.behavioral_scores[col] = float(pheno[col])
+            except (ValueError, TypeError) as exc:
+                skipped.setdefault(subject.id, []).append(col)
+                logger.debug(
+                    "HBN phenotype: %s.%s is not numeric (%s); skipped",
+                    subject.id, col, exc,
+                )
+
+    if skipped:
+        n_values = sum(len(cols) for cols in skipped.values())
+        detail = "; ".join(
+            f"{sub}: {', '.join(cols)}" for sub, cols in sorted(skipped.items())
+        )
+        logger.warning(
+            "HBN phenotype: skipped %d non-numeric score(s) for %d subject(s): %s",
+            n_values, len(skipped), detail,
+        )

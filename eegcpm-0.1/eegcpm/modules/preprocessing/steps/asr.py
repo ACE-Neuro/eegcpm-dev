@@ -35,6 +35,47 @@ skill's "verify, never trust memory" rule; probe under ``/tmp/opencode/``):
   of bad channels per window*; other values as an absolute channel count.
   The mask is used for annotations only; the data are never cut here.
 
+**B7-N1 (probed 2026-10-16) — interpolated channels must not enter ASR.**
+Spherical-spline interpolation (``InterpolateBadChannelsStep``, chain step 5)
+reconstructs each bad channel as an *exact* linear combination of the
+remaining channels, so a single interpolated channel makes the ASR calibration
+covariance exactly singular (measured condition number 1.2e15 on the EGI-129
+fixture with one interpolated channel; 0 interpolated → 35). ``eegprep``'s
+``clean_asr`` takes ``sqrtm`` of that matrix (``LinAlgWarning: Matrix is
+singular``) and returns ~1e15 µV instead of repaired data; the block-rejection
+gate then sees every 2-s block above its 100 µV threshold and the recording is
+excluded. This step therefore excludes the channels a previous ``interpolate``
+step reconstructed (``metadata['interpolate']['interpolated_channels']``) from
+the ASR **input** — they are synthetic, carry no independent information, and
+stay in the recording (the average reference re-mixes them). Excluding them
+restores a full-rank covariance (probed: 0 singular values, sane output).
+The alternative fix (moving interpolation after ASR) changes the chain
+composition and the golden resolved-config hash; it is recorded as a
+follow-up, not applied here. **rev2 (B7 rev2 fix 7):** after the repair, the
+excluded interpolated channels are **re-interpolated from the ASR-cleaned
+data** (same interpolation mode) so the recording stays internally consistent
+— their pre-ASR values are built from the pre-repair neighbours and would
+otherwise contradict the repaired data (measured 1.02 / 1.09 relative-norm
+divergence from a fresh re-interpolation on the EGI-129 chain fixture).
+
+**B7-N2 (probed 2026-10-16) — ASR output magnitude blow-up guard.**
+``eegprep.clean_asr`` at ``cutoff=20`` on 0.1-Hz-high-passed data can return
+garbage at a huge scale instead of repaired data: the audit measured
+2.6e16–5.7e16 µV with moderate spatial mixing (calibration covariance
+condition number 9e4–1.4e6, i.e. *not* exactly singular). Probed here on a
+32-channel 0.1-Hz fixture with three near-duplicate channel pairs
+(condition number 2.2e8): ``clean_asr`` returned **4.6e15 µV** from a 13 µV
+input. Without a guard this garbage flows into the block-rejection gate, which
+then sees every block above its 100 µV threshold and reports the recording as
+*excluded for block contamination* — a catastrophic misattribution of a
+backend failure to the data. This step therefore fails loudly
+(``RuntimeError``, reason ``asr_output_magnitude_blowup``) whenever the
+repaired output's maximum absolute amplitude exceeds
+:data:`ASR_OUTPUT_BLOWUP_FACTOR` × the input maximum, and records the
+calibration-covariance condition number (fixed calibration) in the metadata.
+The guard sits **inside** the ASR step, so a blow-up can never be reported as
+a block-rejection exclusion.
+
 Author: EEGCPM Development Team
 Created: 2025-12
 """
@@ -54,6 +95,14 @@ from .base import ProcessingStep
 # wrapper's constructor arguments.
 DATA_DRIVEN_REF_MAXBADCHANNELS: float = 0.075
 DATA_DRIVEN_REF_TOLERANCES: Tuple[float, float] = (-np.inf, 5.5)
+
+#: B7-N2: an ASR output whose maximum |amplitude| exceeds this factor times the
+#: input maximum is a backend blow-up (``sqrtm`` of a degenerate calibration
+#: covariance), not a repair — fail loudly instead of letting the block gate
+#: misattribute it to the data. Probed: 4.6e15 µV output from a 13 µV input on
+#: a near-duplicate-channel fixture (ratio 3.6e14), while legitimate ASR
+#: repairs never *increase* the maximum amplitude by even 2×.
+ASR_OUTPUT_BLOWUP_FACTOR: float = 1e3
 
 
 def _true_runs(mask: np.ndarray) -> list:
@@ -217,7 +266,9 @@ class ASRStep(ProcessingStep):
     """
 
     name = "asr"
-    version = "2.0"  # 2.0: full-length repair + BAD_asr_window + sidecar metadata
+    version = "2.1"  # 2.1: B7 rev2 fix 7 (re-interpolate the ASR-excluded
+    # interpolated channels from the repaired data) + B7-N2 output blow-up
+    # guard; 2.0: full-length repair + BAD_asr_window + sidecar metadata
 
     def __init__(
         self,
@@ -273,15 +324,36 @@ class ASRStep(ProcessingStep):
     ) -> list:
         """Names of EEG channels that must not enter ASR.
 
-        Explicit ``exclude_channels`` plus the recording's reference channel
-        (``metadata['channel_roles']['reference_channel']``): a flat
-        pre-referencing Cz must not drive the ASR covariance estimate.
+        Explicit ``exclude_channels`` plus:
+
+        - the recording's reference channel
+          (``metadata['channel_roles']['reference_channel']``): a flat
+          pre-referencing Cz must not drive the ASR covariance estimate;
+        - the channels a previous ``interpolate`` step reconstructed
+          (``metadata['interpolate']['interpolated_channels']``). **B7-N1
+          (probed 2026-10-16):** spherical-spline interpolation makes each
+          interpolated channel an exact linear combination of the remaining
+          ones, so the ASR calibration covariance becomes exactly singular
+          (measured condition number 1.2e15 with a *single* interpolated
+          channel on the EGI-129 fixture). eegprep's ``clean_asr`` then takes
+          ``sqrtm`` of that singular matrix (``LinAlgWarning``) and returns
+          ~1e15 µV instead of repaired data; every 2-s block then exceeds the
+          100 µV block-rejection threshold and the recording is excluded. The
+          interpolated channels are synthetic anyway, so leaving them out of
+          the ASR filter loses nothing — they must simply not be allowed to
+          make the filter degenerate. They stay in the recording (and are
+          re-mixed by the average reference), only the ASR *input* excludes
+          them.
         """
         roles = (metadata or {}).get("channel_roles") or {}
         reference = roles.get("reference_channel")
         names = list(self.exclude_channels)
         if reference and reference in raw.ch_names and reference not in names:
             names.append(reference)
+        interpolate_meta = (metadata or {}).get("interpolate") or {}
+        for name in interpolate_meta.get("interpolated_channels") or []:
+            if name in raw.ch_names and name not in names:
+                names.append(str(name))
         return names
 
     def _asr_picks(
@@ -363,6 +435,61 @@ class ASRStep(ProcessingStep):
             return self._apply_asrpy_asr(raw)
         return self._apply_eegprep_asr(raw, metadata)
 
+    def _reinterpolate_after_asr(
+        self,
+        raw: mne.io.BaseRaw,
+        metadata: Dict[str, Any],
+        excluded_from_asr: Sequence[str],
+    ) -> Tuple[list, Dict[str, float]]:
+        """Re-interpolate the ASR-excluded interpolated channels (B7 rev2 fix 7).
+
+        The channels a previous ``interpolate`` step reconstructed were excluded
+        from the ASR *filter* (B7-N1), so their data still reflect the pre-ASR
+        interpolation of the pre-repair neighbours — while every neighbour has
+        since been rewritten by ASR. That contradiction is invisible in a FIF
+        (the channel is a plausible-looking waveform) but breaks the invariant
+        that an interpolated channel is the spline reconstruction of the data
+        it sits in (measured 1.02/1.09 relative-norm divergence on the EGI-129
+        chain fixture). Re-interpolating them from the ASR-cleaned data with the
+        same mode as the original interpolation restores the invariant.
+
+        Returns ``(reinterpolated_names, relative_norms)`` where the relative
+        norms measure ``||old - new|| / ||new||`` per channel (recorded, so a
+        no-op regression is visible in the sidecar).
+        """
+        interpolate_meta = (metadata or {}).get("interpolate") or {}
+        candidates = [
+            str(name) for name in (interpolate_meta.get("interpolated_channels") or [])
+        ]
+        excluded = set(excluded_from_asr)
+        names = [
+            name for name in candidates
+            if name in excluded and name in raw.ch_names
+        ]
+        if not names:
+            return [], {}
+        mode = interpolate_meta.get("mode") or "accurate"
+        old = {name: raw.get_data(picks=[name])[0].copy() for name in names}
+        bads_before = list(raw.info["bads"])
+        try:
+            # `interpolate_bads` interpolates `info['bads']` and uses only the
+            # non-bad channels as sources (probed, mne 1.13.2), so the synthetic
+            # channels are not allowed to reconstruct each other.
+            raw.info["bads"] = names
+            raw.interpolate_bads(reset_bads=False, mode=mode, verbose=False)
+        finally:
+            # Never leave the recording with the synthetic channels marked bad.
+            raw.info["bads"] = bads_before
+        relative_norms = {}
+        for name in names:
+            new = raw.get_data(picks=[name])[0]
+            denom = float(np.linalg.norm(new))
+            relative_norms[name] = (
+                float(np.linalg.norm(old[name] - new) / denom)
+                if denom > 0 else 0.0
+            )
+        return names, relative_norms
+
     def _apply_eegprep_asr(
         self, raw: mne.io.BaseRaw, metadata: Dict[str, Any]
     ) -> Tuple[mne.io.BaseRaw, Dict]:
@@ -387,18 +514,45 @@ class ASRStep(ProcessingStep):
         eeg = eegprep.eeg_mne2eeg(raw.copy().pick(picks))
         sfreq = float(eeg["srate"])
         n_samples = int(np.asarray(eeg["data"]).shape[1])
+        pre_uv = np.asarray(eeg["data"], dtype=float)
+        pre_max_uv = float(np.max(np.abs(pre_uv))) if pre_uv.size else 0.0
 
         # --- calibration ---
         asr_kwargs: Dict[str, Any] = {}
         n_calibration_samples: Optional[int] = None
+        calibration_cov_cond: Optional[float] = None
+        calibration_cov_min_eig: Optional[float] = None
         if self.calibration == "fixed_first_60s":
             # The golden-chain wrapper rejects recordings shorter than
             # train_duration via validate_inputs (B3-K1); a direct process()
             # call on a short fixture stays usable by capping the reference,
             # and the real count is reported in `n_calibration_samples`.
             n_cal = min(int(round(self.train_duration * sfreq)), n_samples)
-            asr_kwargs["ref_maxbadchannels"] = np.asarray(eeg["data"])[:, :n_cal]
+            calibration = np.asarray(pre_uv)[:, :n_cal]
+            asr_kwargs["ref_maxbadchannels"] = calibration
             n_calibration_samples = n_cal
+            # B7-N2 (optional check): record the calibration covariance
+            # condition number. A rank-deficient calibration (interpolated
+            # channel left in the filter) makes `clean_asr` take `sqrtm` of a
+            # singular matrix and return garbage at ~1e15 µV — the magnitude
+            # guard below catches the garbage, this records the precursor.
+            cov = np.cov(calibration)
+            eigvals = np.linalg.eigvalsh(cov)
+            calibration_cov_min_eig = float(eigvals[0])
+            calibration_cov_cond = (
+                float(eigvals[-1] / eigvals[0]) if eigvals[0] > 0 else np.inf
+            )
+            if not np.isfinite(calibration_cov_cond):
+                raise RuntimeError(
+                    "asr_calibration_covariance_degenerate: the fixed ASR "
+                    "calibration covariance is exactly singular (condition "
+                    f"number {calibration_cov_cond}, min eigenvalue "
+                    f"{calibration_cov_min_eig:.3g}); eegprep's clean_asr would "
+                    "take sqrtm of it and return garbage instead of repaired "
+                    "data (B7-N1/B7-N2). Exclude the rank-deficient channels "
+                    "(e.g. a previous interpolate step's channels) from the "
+                    "ASR input."
+                )
         else:
             # Data-driven calibration: eegprep selects clean data internally.
             # The number of calibration samples it ends up with is not
@@ -422,8 +576,34 @@ class ASRStep(ProcessingStep):
                 f"ASR output contains {n_bad} non-finite values; refusing to "
                 "zero-fill them (they would silently corrupt the recording)")
 
+        # B7-N2 magnitude guard: a backend blow-up must fail HERE (reason
+        # `asr_output_magnitude_blowup`) and can never be misattributed to the
+        # block-rejection gate downstream (which would see every 2-s block above
+        # its 100 µV threshold and exclude the recording as contaminated).
+        post_max_uv = float(np.max(np.abs(post_uv))) if post_uv.size else 0.0
+        if pre_max_uv > 0:
+            magnitude_ratio = post_max_uv / pre_max_uv
+        else:
+            magnitude_ratio = np.inf if post_max_uv > 0 else 1.0
+        if post_max_uv > ASR_OUTPUT_BLOWUP_FACTOR * pre_max_uv:
+            raise RuntimeError(
+                "asr_output_magnitude_blowup: ASR output max |amplitude| "
+                f"{post_max_uv:.4g} µV exceeds {ASR_OUTPUT_BLOWUP_FACTOR:.0f} x "
+                f"the input max {pre_max_uv:.4g} µV (ratio {magnitude_ratio:.3g}). "
+                "This is eegprep clean_asr taking sqrtm of a degenerate "
+                "calibration covariance (B7-N1/B7-N2), not a repair; failing "
+                "here instead of letting the block-rejection gate report a "
+                "false 'block contamination' exclusion."
+            )
+
         post = post_uv * 1e-6                     # µV → V
         raw._data[picks] = post
+
+        # B7 rev2 fix 7: the excluded interpolated channels still hold their
+        # pre-ASR spline values; re-interpolate them from the repaired data.
+        reinterpolated, reinterpolation_norms = self._reinterpolate_after_asr(
+            raw, metadata, excluded_from_asr
+        )
 
         # --- rejected-window mask (annotation only, no cutting) ---
         _, sample_mask = eegprep.clean_windows(
@@ -482,6 +662,38 @@ class ASRStep(ProcessingStep):
             "window_length": self.window_length,
             "n_channels_asr": int(len(picks)),
             "excluded_from_asr": excluded_from_asr,
+            # B7-N1: which of the exclusions came from a previous interpolate
+            # step (their rank-deficient columns must not enter the covariance).
+            "interpolated_excluded_from_asr": [
+                name for name in excluded_from_asr
+                if name in (
+                    ((metadata or {}).get("interpolate") or {}).get(
+                        "interpolated_channels") or []
+                )
+            ],
+            # B7 rev2 fix 7: the excluded interpolated channels were
+            # re-interpolated from the ASR-cleaned data (same mode) so they
+            # stay consistent with their repaired neighbours; the relative
+            # norms measure how far the pre-ASR spline values were from the
+            # repaired reconstruction (0.0 would mean the re-interpolation was
+            # a no-op).
+            "reinterpolated_after_asr": reinterpolated,
+            "reinterpolation_mode": (
+                ((metadata or {}).get("interpolate") or {}).get("mode")
+                if reinterpolated else None
+            ),
+            "reinterpolation_relative_norm": reinterpolation_norms,
+            # B7-N2: input/output amplitude maxima (µV) and the calibration
+            # covariance condition number (fixed calibration only; the
+            # data-driven branch's internal calibration is not exposed by
+            # eegprep, so it is reported as None rather than invented).
+            "pre_max_uv": pre_max_uv,
+            "post_max_uv": post_max_uv,
+            "output_magnitude_ratio": (
+                float(magnitude_ratio) if np.isfinite(magnitude_ratio) else None
+            ),
+            "calibration_cov_cond": calibration_cov_cond,
+            "calibration_cov_min_eig": calibration_cov_min_eig,
             # Full-length guarantee: ASR must never change the timeline.
             "n_samples_before": n_samples_before,
             "n_samples_after": int(raw.n_times),
@@ -513,6 +725,13 @@ class ASRStep(ProcessingStep):
         report the eegprep burden fields. asrpy always fits on the first
         ``train_duration`` seconds, so its ``calibration`` metadata value is
         ``'asrpy_fit_first_train_duration'``, never the eegprep value.
+
+        **Recorded limitation (B7-N1):** this branch receives no ``metadata``,
+        so it does **not** exclude interpolated channels from the fit. asrpy
+        computes its own covariance with a different (regularized) estimator and
+        is not part of any golden chain, so the rank-deficiency failure mode of
+        the eegprep path was not observed here; if asrpy is ever promoted into a
+        chain, route ``metadata`` in and apply the same exclusion.
         """
         try:
             from asrpy import ASR

@@ -195,24 +195,6 @@ class TestSourceReconstructionModule:
         expected_lambda2 = 1.0 / 3.0 ** 2
         assert expected_lambda2 == pytest.approx(1.0 / 9.0)
 
-    @pytest.mark.skip(reason="Requires fsaverage dataset download")
-    def test_process_with_template_forward(self, sample_epochs, output_dir):
-        """Test full source reconstruction with template forward model.
-
-        This test requires fsaverage to be downloaded, so skip by default.
-        """
-        config = {
-            "method": "sLORETA",
-            "parcellation": "conn_networks",
-        }
-        module = SourceReconstructionModule(config, output_dir)
-
-        result = module.process(sample_epochs)
-
-        assert result.success
-        assert "stcs" in result.outputs
-        assert "roi_data" in result.outputs
-
     def test_process_with_mock_forward(self, epochs_with_montage, output_dir):
         """Test source reconstruction with mocked forward model."""
         config = {"method": "sLORETA"}
@@ -510,28 +492,153 @@ class TestSourceReconstructionIntegration:
         montage = epochs_with_montage.get_montage()
         assert montage is not None
 
-    @pytest.mark.skip(reason="Requires fsaverage download, slow test")
-    def test_full_source_reconstruction(self, epochs_with_montage, output_dir):
-        """Full integration test of source reconstruction pipeline.
+    @pytest.mark.fsaverage
+    @pytest.mark.slow
+    def test_process_with_template_forward(self, source_erp_forward, tmp_path):
+        """Full reconstruction through the real template forward (P2-F1/F2/F4).
 
-        Skip by default as it requires fsaverage download.
+        Replaces the old ``@pytest.mark.skip``: the fixture uses the cached
+        fsaverage (``fsaverage_subjects_dir`` skips when it is absent) and the
+        module builds its own oct6 template forward. Asserts the *content* the
+        plan's condition 4 requires: signed ROI time courses, unique ROI names,
+        cerebellar exclusion, and the provenance/config artifacts.
         """
-        config = {
-            "method": "sLORETA",
-            "parcellation": "conn_networks",
-            "inverse": {"snr": 3.0},
-            "forward": {"spacing": "oct5"},  # Coarser for speed
-        }
-        module = SourceReconstructionModule(config, output_dir)
+        import json
+
+        module = SourceReconstructionModule(
+            {"method": "dSPM", "subjects_dir": str(source_erp_forward["subjects_dir"])},
+            tmp_path,
+        )
+        class MockSubject:
+            id = "test_sub"
+            session = "01"
+
+        result = module.process(_condition_epochs(n_one=20, n_two=20), subject=MockSubject())
+        assert result.success, result.errors
+
+        npz = np.load(tmp_path / "test_sub_roi_tc.npz")
+        roi_names = [str(n) for n in npz["roi_names"]]
+        tc = np.stack([npz[name] for name in ("1", "2")])
+        # (a) signed output, not a magnitude (P2-F4)
+        assert tc.min() < 0
+        # (b) unique names, no cerebellum (P2-F2/F3)
+        assert len(set(roi_names)) == len(roi_names) == 30
+        excluded = [str(n) for n in npz["excluded_rois"]]
+        assert "Cerebellar.Anterior" in excluded and "Cerebellar.Posterior" in excluded
+        assert int(np.min(npz["roi_vertex_counts"])) >= 3
+        # (c) condition bookkeeping
+        assert int(npz["1_nave"]) == 20
+        assert npz["1_times"][0] == pytest.approx(-0.2)
+        # (d) provenance files (P2-F10) + config hash
+        for name in (
+            "test_sub_source_config.yaml",
+            "test_sub-cov.fif",
+            "test_sub-inv.fif",
+            "test_sub_provenance.json",
+            "test_sub_crosstalk.npz",
+        ):
+            assert (tmp_path / name).is_file(), name
+        provenance = json.loads((tmp_path / "test_sub_provenance.json").read_text())
+        assert provenance["config_hash"] == module.config_hash()
+        assert provenance["label_extraction_mode"] == "mean_flip"
+        assert provenance["pick_ori"] == "normal"
+        assert provenance["labels"]["excluded_rois"] == excluded
+        # (e) the crosstalk matrices (P2-F14) are written next to the data and the
+        # provenance summarises the primary one.
+        crosstalk = np.load(tmp_path / "test_sub_crosstalk.npz")
+        matrix = crosstalk["crosstalk"]
+        assert matrix.shape == (30, 30)
+        assert np.allclose(np.diag(matrix), 1.0)
+        assert [str(n) for n in crosstalk["roi_names"]] == roi_names
+        # B7 rev2 fix 6: the primary matrix is the flip-aligned estimator and
+        # the library `get_cross_talk(mode='mean')` matrix is kept alongside.
+        assert str(crosstalk["primary"][0]) == "crosstalk_flip_aligned"
+        unflipped = crosstalk["crosstalk_unflipped"]
+        assert unflipped.shape == (30, 30)
+        assert np.allclose(np.diag(unflipped), 1.0)
+        # Non-vacuity: the sign alignment really changes the matrix on this
+        # fixture (the library signed mean cancels across sulcal walls).
+        assert np.max(np.abs(matrix - unflipped)) > 1e-6
+        definition = str(crosstalk["definition"][0])
+        assert "flip-aligned" in definition and "crosstalk_unflipped" in definition
+        assert "FROM ROI j" in definition and "INTO ROI i" in definition
+        assert provenance["crosstalk"]["computed"] is True
+        assert provenance["crosstalk"]["primary_matrix"] == "crosstalk_flip_aligned"
+        assert provenance["crosstalk"]["n_rois"] == 30
+        assert np.isfinite(provenance["crosstalk"]["off_diagonal_max"])
+        # (f) B7-A3/B7 rev2: the pair count is over *directed* entries of the
+        # PRIMARY flip-aligned matrix (C[i, j] is the leakage from ROI j
+        # (source, column) into ROI i (target, row)), not over unique pairs.
+        directed = int(
+            np.sum((matrix > 0.3) & ~np.eye(matrix.shape[0], dtype=bool))
+        )
+        assert provenance["crosstalk"]["n_directed_above_0.3"] == directed
+        assert "n_pairs_above_0.3" not in provenance["crosstalk"]
+        # The unflipped library matrix is summarised too (same statistic shape).
+        assert provenance["crosstalk"]["unflipped"]["n_directed_above_0.3"] >= 0
+        assert provenance["crosstalk"]["max_abs_delta_primary_vs_unflipped"] > 0
+
+    @pytest.mark.fsaverage
+    @pytest.mark.slow
+    def test_crosstalk_disabled_provenance_carries_reason(
+        self, source_erp_forward, tmp_path
+    ):
+        """B7 rev2 fix 9: ``{"computed": false}`` states *why* (config vs error).
+
+        The disabled path must record the reason and write no crosstalk npz; the
+        error path is covered by the module's warning + the same reason field.
+        """
+        import json
+
+        module = SourceReconstructionModule(
+            {
+                "method": "dSPM",
+                "subjects_dir": str(source_erp_forward["subjects_dir"]),
+                "output": {"compute_crosstalk": False, "generate_qc": False},
+            },
+            tmp_path,
+        )
 
         class MockSubject:
             id = "test_sub"
 
-        result = module.process(epochs_with_montage, subject=MockSubject())
+        result = module.process(
+            _condition_epochs(n_one=20, n_two=20), subject=MockSubject())
+        assert result.success, result.errors
 
-        assert result.success
-        assert len(result.outputs["stcs"]) > 0
+        provenance = json.loads(
+            (tmp_path / "test_sub_provenance.json").read_text())
+        assert provenance["crosstalk"]["computed"] is False
+        assert "compute_crosstalk disabled" in provenance["crosstalk"]["reason"]
+        assert not (tmp_path / "test_sub_crosstalk.npz").exists()
+
+    @pytest.mark.fsaverage
+    @pytest.mark.slow
+    def test_full_source_reconstruction(self, source_erp_forward, tmp_path):
+        """sLORETA end-to-end with a caller-supplied forward (oct6, nested config)."""
+        config = {
+            "method": "sLORETA",
+            "parcellation": "conn_networks",
+            "inverse": {"snr": 3.0},
+            "forward": {"spacing": "oct6"},
+            "output": {"generate_qc": False},
+        }
+        module = SourceReconstructionModule(config, tmp_path)
+
+        class MockSubject:
+            id = "test_sub"
+
+        result = module.process(
+            _condition_epochs(n_one=20, n_two=20),
+            subject=MockSubject(),
+            forward=source_erp_forward["fwd"],
+        )
+
+        assert result.success, result.errors
+        assert len(result.outputs["stcs"]) == 2
         assert len(result.output_files) > 0
+        assert result.metadata["n_rois"] == 30
+        assert result.metadata["method"] == "sLORETA"
 
 
 class TestSourceReconstructionErrorHandling:
@@ -607,7 +714,7 @@ def source_erp_forward(fsaverage_subjects_dir):
     fwd = mne.make_forward_solution(
         info, "fsaverage", src, bem_sol, eeg=True, meg=False, mindist=5.0, verbose=False
     )
-    return {"fwd": fwd, "info": info}
+    return {"fwd": fwd, "info": info, "subjects_dir": subjects_dir}
 
 
 def _condition_epochs(n_one, n_two, sfreq=250.0, tmin=-0.2, tmax=0.4, seed=0):
@@ -892,3 +999,210 @@ class TestSourceConditionSelection:
         assert result.success, result.errors
         htmls = list(tmp_path.glob("*_source_qc.html"))
         assert htmls, "QC HTML was not generated"
+
+
+# ---------------------------------------------------------------------------
+# P2-F14/F16: crosstalk matrix (plan §B7 tasks 8 + 10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def crosstalk_inputs(source_erp_forward):
+    """(fwd, info, noise_cov, labels) for the crosstalk matrix (module-scoped)."""
+    from eegcpm.modules.source.labels import build_conn_labels
+
+    epochs = _condition_epochs(n_one=20, n_two=20)
+    noise_cov = mne.compute_covariance(
+        epochs, tmin=None, tmax=0.0, method="shrunk", rank=None,
+        keep_sample_mean=True, verbose=False,
+    )
+    labels, label_info = build_conn_labels(
+        source_erp_forward["fwd"]["src"], source_erp_forward["subjects_dir"]
+    )
+    return {
+        "fwd": source_erp_forward["fwd"],
+        # The crosstalk pair needs the average-reference projector (mne requires
+        # it for inverse modelling); `_condition_epochs` sets it on the epochs.
+        "info": epochs.info.copy(),
+        "noise_cov": noise_cov,
+        "labels": labels,
+        "roi_names": [str(name) for name in label_info["roi_names"]],
+    }
+
+
+@pytest.mark.fsaverage
+@pytest.mark.slow
+class TestSourceCrosstalk:
+    """The crosstalk matrix must be a per-label leakage measure (P2-F14)."""
+
+    def test_target_roi_off_diagonal_leakage_below_one(self, crosstalk_inputs):
+        """(a) The dipole-fixture target ROI's strongest off-diagonal entry < 1.
+
+        The diagonal is 1.0 by construction (the ratio's own denominator), so
+        only the off-diagonal entries say anything. If this ever fails, the
+        measured value must be reported to the auditor — never loosened.
+
+        B7 rev2 fix 6: the physical property is asserted for **both** the
+        library matrix and the saved primary (flip-aligned) matrix, so the
+        artifact the pipeline actually writes is covered by the non-vacuous
+        check, not only the library path.
+        """
+        from eegcpm.modules.qc.source_qc import (
+            compute_crosstalk_matrix, compute_crosstalk_matrix_numpy,
+        )
+
+        matrix = compute_crosstalk_matrix(
+            crosstalk_inputs["fwd"],
+            crosstalk_inputs["info"],
+            crosstalk_inputs["noise_cov"],
+            crosstalk_inputs["labels"],
+            method="dSPM",
+            lambda2=1.0 / 9.0,
+        )
+        primary = compute_crosstalk_matrix_numpy(
+            crosstalk_inputs["fwd"],
+            crosstalk_inputs["info"],
+            crosstalk_inputs["noise_cov"],
+            crosstalk_inputs["labels"],
+            method="dSPM",
+            lambda2=1.0 / 9.0,
+            align_signs=True,
+        )
+        target = crosstalk_inputs["roi_names"].index("SensoriMotor.Superior")
+        for name, candidate in (("library", matrix), ("flip-aligned", primary)):
+            assert candidate.shape == (30, 30)
+            assert np.all(np.isfinite(candidate))
+            assert np.allclose(np.diag(candidate), 1.0)
+            off = candidate[target].copy()
+            off[target] = -np.inf
+            strongest = float(np.max(off))
+            assert np.isfinite(strongest)
+            assert strongest < 1.0, (
+                f"SensoriMotor.Superior strongest off-diagonal crosstalk is "
+                f"{strongest:.4f} (>= 1) for the {name} matrix: report this "
+                "value to the auditor"
+            )
+
+    def test_permuting_labels_permutes_rows_and_columns(self, crosstalk_inputs):
+        """(b) Permuting two label indices permutes C's rows/columns.
+
+        This is what proves the matrix is indexed per label: a whole-brain
+        average (the old implementation) or a mis-mapped vertex list would be
+        invariant to the permutation.
+        """
+        from eegcpm.modules.qc.source_qc import compute_crosstalk_matrix
+
+        base = compute_crosstalk_matrix(
+            crosstalk_inputs["fwd"],
+            crosstalk_inputs["info"],
+            crosstalk_inputs["noise_cov"],
+            crosstalk_inputs["labels"],
+            method="dSPM",
+            lambda2=1.0 / 9.0,
+        )
+        perm = list(range(len(crosstalk_inputs["labels"])))
+        perm[0], perm[1] = perm[1], perm[0]
+        permuted_labels = [crosstalk_inputs["labels"][i] for i in perm]
+        permuted = compute_crosstalk_matrix(
+            crosstalk_inputs["fwd"],
+            crosstalk_inputs["info"],
+            crosstalk_inputs["noise_cov"],
+            permuted_labels,
+            method="dSPM",
+            lambda2=1.0 / 9.0,
+        )
+        assert np.allclose(permuted, base[np.ix_(perm, perm)])
+        # Non-vacuous: the permutation actually moves entries.
+        assert not np.allclose(permuted, base)
+
+    def test_numpy_crosscheck_matches_library_and_flags_sign_cancellation(
+        self, crosstalk_inputs
+    ):
+        """Numpy mirror of the library summary + the measured sign-cancellation.
+
+        ``compute_crosstalk_matrix_numpy`` rebuilds the resolution matrix with
+        plain numpy (no ``get_cross_talk`` / ``in_label``) and averages the
+        label's CTF rows directly. Two assertions:
+
+        - the plain (signed) mean reproduces the library matrix **exactly** —
+          this is the cross-check that our two-step per-pair recipe and the
+          label vertex indexing are right, and it pins the **unflipped** path
+          (the saved ``crosstalk_unflipped`` matrix, B7 rev2 fix 6);
+        - the ``label_sign_flip``-aligned mean does **not** reproduce it. That
+          is critic N-3's finding, quantified here: ``get_cross_talk(mode='mean')``
+          averages signed surface-normal values, so it cancels across sulcal
+          walls (measured 2026-10-16 on oct6: 34 % of vertices flipped on
+          average, max |ΔC| 2.08). The **saved primary matrix** is the
+          flip-aligned variant (it matches the pipeline's ``mean_flip`` ROI
+          extraction, B7 rev2 fix 6); the library variant stays available as
+          ``crosstalk_unflipped`` and this test keeps the two distinguishable,
+          so a future change to either side is noticed.
+        """
+        from eegcpm.modules.qc.source_qc import (
+            compute_crosstalk_matrix,
+            compute_crosstalk_matrix_numpy,
+        )
+
+        library = compute_crosstalk_matrix(
+            crosstalk_inputs["fwd"],
+            crosstalk_inputs["info"],
+            crosstalk_inputs["noise_cov"],
+            crosstalk_inputs["labels"],
+            method="dSPM",
+            lambda2=1.0 / 9.0,
+        )
+        numpy_plain = compute_crosstalk_matrix_numpy(
+            crosstalk_inputs["fwd"],
+            crosstalk_inputs["info"],
+            crosstalk_inputs["noise_cov"],
+            crosstalk_inputs["labels"],
+            method="dSPM",
+            lambda2=1.0 / 9.0,
+        )
+        np.testing.assert_allclose(numpy_plain, library, rtol=1e-9, atol=1e-12)
+
+        numpy_flip = compute_crosstalk_matrix_numpy(
+            crosstalk_inputs["fwd"],
+            crosstalk_inputs["info"],
+            crosstalk_inputs["noise_cov"],
+            crosstalk_inputs["labels"],
+            method="dSPM",
+            lambda2=1.0 / 9.0,
+            align_signs=True,
+        )
+        max_delta = float(np.max(np.abs(numpy_flip - library)))
+        assert max_delta > 1e-3, (
+            "the sign-flip-aligned summary now matches the library: re-check "
+            "whether mne changed get_cross_talk(mode='mean')"
+        )
+
+
+class TestConditionNamePathSeparators:
+    """B5-N4: condition names become file names; separators are rejected loudly."""
+
+    @pytest.mark.parametrize("name", ["a/b", "a\\b", "cond/sub"])
+    def test_path_separator_names_raise(self, name, tmp_path):
+        task_config = {"conditions": [{"name": name, "event_codes": [1]}]}
+        module = SourceReconstructionModule({}, tmp_path, task_config=task_config)
+        with pytest.raises(ValueError, match="path separator"):
+            module._select_condition_epochs(_condition_epochs(n_one=20, n_two=20))
+
+    def test_save_stc_atomic_would_escape_without_the_guard(self, tmp_path):
+        """Regression context: the guard exists because stc.save cannot handle `/`.
+
+        Documented here so the guard's purpose is testable without depending on
+        mne's exact failure mode: the condition name is used verbatim in the
+        output file name ``{subject}_{condition}_stc``.
+        """
+        module = SourceReconstructionModule({}, tmp_path)
+        with pytest.raises(FileNotFoundError):
+            module._save_stc_atomic(
+                "sub-01", "a/b",
+                mne.SourceEstimate(
+                    np.zeros((2, 2)),
+                    vertices=[np.array([0]), np.array([0])],
+                    tmin=0.0, tstep=0.1,
+                ),
+            )
+        # No partial artifact escaped into the output directory.
+        assert list(tmp_path.iterdir()) == []

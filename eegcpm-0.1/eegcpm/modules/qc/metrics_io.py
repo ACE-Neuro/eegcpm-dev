@@ -5,10 +5,13 @@ enabling workflow state-independent sharing between CLI and UI.
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 from .quality_assessment import extract_metrics_from_qc_result
+
+logger = logging.getLogger(__name__)
 
 
 def save_qc_metrics_json(data: Dict[str, Any], path: Path) -> None:
@@ -127,12 +130,14 @@ def load_qc_metrics_from_directory(
             for json_file in json_files:
                 try:
                     metrics = load_qc_metrics_json(json_file)
-                    # Add file path for reference
-                    metrics['_json_path'] = str(json_file)
-                    results.append(metrics)
-                except Exception as e:
-                    # Skip malformed JSON files
-                    print(f"Warning: Could not load {json_file}: {e}")
+                except (OSError, ValueError) as exc:
+                    # A malformed metrics file is skipped, but recorded: a
+                    # silent skip hides a broken run from the QC table (P1-F11).
+                    logger.warning(
+                        "skipping unreadable QC metrics file %s: %s", json_file, exc)
                     continue
+                # Add file path for reference
+                metrics['_json_path'] = str(json_file)
+                results.append(metrics)
 
     return results

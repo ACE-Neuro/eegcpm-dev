@@ -64,7 +64,11 @@ from eegcpm.core.provenance import (
 )
 from eegcpm.pipeline.base import ModuleResult, EpochsModule
 from eegcpm.modules.source.labels import build_conn_labels
-from eegcpm.modules.qc.source_qc import SourceQC
+from eegcpm.modules.qc.source_qc import (
+    SourceQC,
+    compute_crosstalk_matrix,
+    compute_crosstalk_matrix_numpy,
+)
 
 
 # Output npz keys a condition name must never collide with (B4-K2/N2): the label
@@ -141,6 +145,17 @@ class SourceReconstructionModule(EpochsModule):
     #: a possible double build under GIL-free concurrency (two threads miss the same
     #: key and both build) — wasteful, never incorrect.
     _FORWARD_CACHE: Dict[str, Tuple[mne.SourceSpaces, mne.Forward]] = {}
+
+    #: Class-level ROI x ROI crosstalk cache (P2-F14/B7 task 8). Keyed by the
+    #: forward cache key **plus** the noise-covariance digest, method and lambda2:
+    #: the resolution matrix is built from the inverse operator, which is
+    #: whitened by the noise covariance, so two subjects with the same montage
+    #: must not share a matrix (the plan's "per montage hash" would silently
+    #: reuse subject 1's covariance). The cached value is the small
+    #: ``(n_rois, n_rois)`` matrices — the primary flip-aligned ``crosstalk``
+    #: and the library ``crosstalk_unflipped`` (B7 rev2 fix 6) — not the
+    #: ~0.5 GB resolution matrix.
+    _CROSSTALK_CACHE: Dict[str, Dict[str, np.ndarray]] = {}
 
     def __init__(self, config: Dict[str, Any], output_dir: Path, task_config: Optional[Dict[str, Any]] = None):
         super().__init__(config, output_dir)
@@ -364,6 +379,51 @@ class SourceReconstructionModule(EpochsModule):
             # Save results
             subject_id = subject.id if subject else "unknown"
 
+            # Crosstalk matrices (P2-F14/B7 task 8, B7 rev2 fix 6): a QC-only
+            # fixed-orientation forward/inverse pair gives the ROI x ROI
+            # relative leakage that the connectivity/ERP interpretation needs.
+            # Two matrices are produced per (forward, noise covariance, method,
+            # lambda2) and cached:
+            #   * `crosstalk` — the PRIMARY flip-aligned estimator
+            #     (`compute_crosstalk_matrix_numpy(align_signs=True)`), matching
+            #     the `mean_flip` ROI extraction;
+            #   * `crosstalk_unflipped` — the mne library `get_cross_talk(mode=
+            #     'mean')` matrix, kept for continuity/cross-check.
+            # Written as `{subject}_crosstalk.npz` next to the other artifacts.
+            crosstalk_matrices: Optional[Dict[str, np.ndarray]] = None
+            crosstalk_reason: Optional[str] = None
+            if self.cfg.output.compute_crosstalk:
+                try:
+                    crosstalk_matrices = self._get_crosstalk_matrices(
+                        forward=forward,
+                        info=epochs.info,
+                        noise_cov=noise_cov,
+                        labels=labels,
+                        lambda2=lambda2_evoked,
+                    )
+                except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+                    # QC-only artifact: recorded, never allowed to invalidate an
+                    # otherwise successful reconstruction (the matrix is
+                    # diagnostic; the ROI time courses are the product). The
+                    # broad-but-explicit tuple covers the known failure modes:
+                    # `ValueError` for methods without a resolution matrix
+                    # (eLORETA), numeric failures, and mne's runtime errors. A
+                    # `MemoryError` is deliberately NOT caught — it must
+                    # propagate.
+                    crosstalk_reason = f"{type(exc).__name__}: {exc}"
+                    warnings.append(f"Crosstalk matrix not computed: {exc}")
+            else:
+                crosstalk_reason = (
+                    "compute_crosstalk disabled by config "
+                    "(output.compute_crosstalk=false)"
+                )
+            crosstalk_matrix = (
+                crosstalk_matrices["crosstalk"] if crosstalk_matrices else None
+            )
+            crosstalk_unflipped = (
+                crosstalk_matrices["crosstalk_unflipped"] if crosstalk_matrices else None
+            )
+
             # Artifact writes (B5 task 8): atomic (temp + rename) and stale-safe
             # (a previous run's outputs for this subject are removed first), so a
             # failed write cannot leave partial artifacts behind success=False.
@@ -387,6 +447,9 @@ class SourceReconstructionModule(EpochsModule):
                     montage_check=montage_check,
                     epochs_path=epochs_path,
                     forward_source=forward_source,
+                    crosstalk_matrix=crosstalk_matrix,
+                    crosstalk_unflipped=crosstalk_unflipped,
+                    crosstalk_reason=crosstalk_reason,
                 )
                 output_files.extend(
                     self._write_source_artifacts(
@@ -397,6 +460,8 @@ class SourceReconstructionModule(EpochsModule):
                         noise_cov=noise_cov,
                         inverse_operator=inverse_operator,
                         provenance=provenance,
+                        crosstalk_matrix=crosstalk_matrix,
+                        crosstalk_unflipped=crosstalk_unflipped,
                     )
                 )
 
@@ -416,14 +481,22 @@ class SourceReconstructionModule(EpochsModule):
                         'roi_data': qc_roi_data,
                         'method': self.method,
                         'parcellation': self.parcellation,
+                        'labels': labels,
+                        'roi_min_vertices': self.roi_min_vertices,
                     }
+                    if crosstalk_matrix is not None:
+                        qc_data['crosstalk_matrix'] = crosstalk_matrix
+                        # State which matrix the QC statistics are computed on
+                        # (B7 rev2 fix 6).
+                        qc_data['crosstalk_matrix_kind'] = 'crosstalk_flip_aligned'
 
                     # Compute QC
                     qc_result = qc.compute(
                         data=qc_data,
                         subject_id=subject_id,
                         session_id=session_id,
-                        sfreq=epochs.info['sfreq']
+                        sfreq=epochs.info['sfreq'],
+                        roi_min_vertices=self.roi_min_vertices,
                     )
 
                     # Generate HTML report (atomic: temp + rename, B5 task 8)
@@ -512,7 +585,10 @@ class SourceReconstructionModule(EpochsModule):
           ``excluded_reasons`` (and any ``roi_*`` key) are label-metadata keys
           written into the same npz;
         - **``*_times`` / ``*_nave``**: per-condition companion keys written by
-          ``_process_evoked``/``_process_trial_level``.
+          ``_process_evoked``/``_process_trial_level``;
+        - **path separators** (``/``, ``\\``): condition names become file names
+          (``{subject}_{condition}_stc``), so a ``/`` used to fail the whole run
+          with a ``FileNotFoundError`` deep inside ``stc.save`` (B5-N4).
         """
         seen: Dict[str, int] = {}
         for name in names:
@@ -531,6 +607,13 @@ class SourceReconstructionModule(EpochsModule):
                 raise ValueError(
                     f"condition name {name!r} must not end in '_times'/'_nave': "
                     f"it collides with the per-condition companion keys"
+                )
+            if "/" in name or "\\" in name:
+                raise ValueError(
+                    f"condition name {name!r} contains a path separator: it would "
+                    f"be used as part of an output file name "
+                    f"({{subject}}_{{condition}}_stc) and escape the output "
+                    f"directory; rename the condition"
                 )
 
     def _select_condition_epochs(
@@ -934,6 +1017,9 @@ class SourceReconstructionModule(EpochsModule):
         montage_check: Dict[str, Any],
         epochs_path: Optional[Union[str, Path]],
         forward_source: str = "template",
+        crosstalk_matrix: Optional[np.ndarray] = None,
+        crosstalk_unflipped: Optional[np.ndarray] = None,
+        crosstalk_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Assemble the ``{subject}_provenance.json`` payload (P2-F10, B5 task 5).
 
@@ -1014,6 +1100,95 @@ class SourceReconstructionModule(EpochsModule):
             "roi_flip_summary": self._roi_flip_summary(
                 labels, inverse_operator["src"], list(label_info["roi_names"])
             ),
+            # P2-F14: the crosstalk matrices themselves are written to
+            # `{subject}_crosstalk.npz`; the provenance records how they were
+            # built and the leakage summary of the PRIMARY matrix (the matrices
+            # are not duplicated here). B7 rev2 fix 6: the primary matrix is the
+            # flip-aligned estimator (`mean_flip`-compatible); the library
+            # `get_cross_talk(mode='mean')` matrix is kept as
+            # `crosstalk_unflipped` and summarised alongside.
+            "crosstalk": (
+                {
+                    "computed": True,
+                    "primary_matrix": "crosstalk_flip_aligned",
+                    "definition": (
+                        "C[i,j] = mean(|CTF_i in ROI j|) / mean(|CTF_i in ROI i|) "
+                        "on a QC-only fixed-orientation operator pair "
+                        f"(fixed=True, depth={self.depth}, lambda2=lambda2_evoked); "
+                        "documented approximation of the production loose=0.2 "
+                        "operator. The resolution matrix's rows are cross-talk "
+                        "functions (mne 1.13.2: 'the columns ... are the PSFs and "
+                        "the rows are the CTFs'), so C[i, j] is the leakage FROM "
+                        "ROI j (source, column) INTO ROI i (target, row); "
+                        "C[i, i] == 1. The PRIMARY `crosstalk` matrix is the "
+                        "flip-aligned estimator "
+                        "(compute_crosstalk_matrix_numpy(align_signs=True), the "
+                        "sign alignment matching the pipeline's mean_flip ROI "
+                        "extraction); `crosstalk_unflipped` is the mne "
+                        "get_cross_talk(mode='mean') library matrix, whose signed "
+                        "mean cancels across sulcal walls. C is directional "
+                        "(C[i, j] != C[j, i] in general) and "
+                        "`n_directed_above_0.3` counts directed entries > 0.3 "
+                        "(i != j) of the PRIMARY flip-aligned matrix — a "
+                        "reciprocal pair above the threshold counts twice "
+                        "(B7-A3/B7 rev2)."
+                    ),
+                    "n_rois": int(crosstalk_matrix.shape[0]),
+                    "off_diagonal_max": float(
+                        np.max(
+                            crosstalk_matrix[
+                                ~np.eye(crosstalk_matrix.shape[0], dtype=bool)
+                            ]
+                        )
+                    ),
+                    "off_diagonal_mean": float(
+                        np.mean(
+                            crosstalk_matrix[
+                                ~np.eye(crosstalk_matrix.shape[0], dtype=bool)
+                            ]
+                        )
+                    ),
+                    "n_directed_above_0.3": int(
+                        np.sum(
+                            (crosstalk_matrix > 0.3)
+                            & ~np.eye(crosstalk_matrix.shape[0], dtype=bool)
+                        )
+                    ),
+                    "unflipped": (
+                        {
+                            "off_diagonal_max": float(
+                                np.max(
+                                    crosstalk_unflipped[
+                                        ~np.eye(crosstalk_unflipped.shape[0], dtype=bool)
+                                    ]
+                                )
+                            ),
+                            "off_diagonal_mean": float(
+                                np.mean(
+                                    crosstalk_unflipped[
+                                        ~np.eye(crosstalk_unflipped.shape[0], dtype=bool)
+                                    ]
+                                )
+                            ),
+                            "n_directed_above_0.3": int(
+                                np.sum(
+                                    (crosstalk_unflipped > 0.3)
+                                    & ~np.eye(crosstalk_unflipped.shape[0], dtype=bool)
+                                )
+                            ),
+                        }
+                        if crosstalk_unflipped is not None
+                        else None
+                    ),
+                    "max_abs_delta_primary_vs_unflipped": (
+                        float(np.max(np.abs(crosstalk_matrix - crosstalk_unflipped)))
+                        if crosstalk_unflipped is not None
+                        else None
+                    ),
+                }
+                if crosstalk_matrix is not None
+                else {"computed": False, "reason": crosstalk_reason}
+            ),
             "montage_check": montage_check,
             "epochs_path": str(epochs_path) if epochs_path is not None else None,
             "epochs_sha256": (
@@ -1022,6 +1197,73 @@ class SourceReconstructionModule(EpochsModule):
             "config_hash": self.config_hash(),
             "config": self.cfg.model_dump(mode="json"),
         }
+
+    def _get_crosstalk_matrices(
+        self,
+        *,
+        forward: mne.Forward,
+        info: mne.Info,
+        noise_cov: mne.Covariance,
+        labels: List[Any],
+        lambda2: float,
+    ) -> Dict[str, np.ndarray]:
+        """ROI x ROI crosstalk matrices, cached per forward+covariance+method+lambda2.
+
+        Returns ``{"crosstalk": <flip-aligned primary>,
+        "crosstalk_unflipped": <mne get_cross_talk(mode='mean') library>}``
+        (B7 rev2 fix 6). The resolution matrix (``n_dipoles x n_dipoles`` at
+        oct6 ≈ 0.5 GB) is never cached — only the resulting ``(n_rois, n_rois)``
+        matrices are. The cache key contains a digest of the noise covariance
+        because the inverse operator (and therefore the whitened resolution
+        matrix) depends on it: caching "per montage hash" alone would hand
+        subject 2 a matrix computed from subject 1's covariance (documented
+        deviation from the plan wording; the forward cache key already covers
+        montage/spacing/BEM/trans/mne version/subjects_dir).
+        """
+        fwd_key = self._forward_cache_key(info, self.spacing, self.subjects_dir)
+        cov_digest = hashlib.sha256(
+            np.ascontiguousarray(noise_cov["data"]).tobytes()
+        ).hexdigest()
+        key = sha256_json({
+            "forward": fwd_key,
+            "noise_cov": cov_digest,
+            "method": self.method,
+            "lambda2": float(lambda2),
+            "labels": [str(label.name) for label in labels],
+        })
+        cached = self._CROSSTALK_CACHE.get(key)
+        if cached is not None:
+            return cached
+        # The primary matrix is the flip-aligned numpy estimator: it matches the
+        # `mean_flip` sign alignment the pipeline uses to extract ROI time
+        # courses (rank agreement 0.76 vs 0.61 for the library's signed mean).
+        # The library matrix stays available as `crosstalk_unflipped` and is the
+        # exact cross-check target of the numpy mirror (test_source.py).
+        matrix = compute_crosstalk_matrix_numpy(
+            forward,
+            info,
+            noise_cov,
+            labels,
+            method=self.method,
+            lambda2=lambda2,
+            depth=self.depth,
+            align_signs=True,
+        )
+        matrix_unflipped = compute_crosstalk_matrix(
+            forward,
+            info,
+            noise_cov,
+            labels,
+            method=self.method,
+            lambda2=lambda2,
+            depth=self.depth,
+        )
+        matrices = {
+            "crosstalk": matrix,
+            "crosstalk_unflipped": matrix_unflipped,
+        }
+        self._CROSSTALK_CACHE[key] = matrices
+        return matrices
 
     def _remove_stale_outputs(self, subject_id: str) -> List[Path]:
         """Delete this subject's artifacts from a previous run before writing (B5 task 8).
@@ -1081,6 +1323,8 @@ class SourceReconstructionModule(EpochsModule):
         noise_cov: mne.Covariance,
         inverse_operator: Any,
         provenance: Dict[str, Any],
+        crosstalk_matrix: Optional[np.ndarray] = None,
+        crosstalk_unflipped: Optional[np.ndarray] = None,
     ) -> List[Path]:
         """Write every artifact atomically, stale-safe, provenance last (B5 task 8).
 
@@ -1111,6 +1355,44 @@ class SourceReconstructionModule(EpochsModule):
                     atomic_write_npz(path, data, compressed=compressed)
                     written.append(path)
                     artifacts[name] = sha256_file(path)
+
+            if crosstalk_matrix is not None:
+                # P2-F14: the ROI x ROI crosstalk matrices travel with the run so
+                # downstream connectivity/ERP interpretation can flag leakage
+                # pairs without recomputing the (expensive) resolution matrix.
+                # B7 rev2 fix 6: `crosstalk` is the primary flip-aligned matrix
+                # (matches the mean_flip ROI extraction); `crosstalk_unflipped`
+                # is the mne get_cross_talk(mode='mean') library matrix.
+                crosstalk_path = self.output_dir / f"{subject_id}_crosstalk.npz"
+                payload = {
+                    "crosstalk": np.asarray(crosstalk_matrix, dtype=float),
+                    "roi_names": np.array(
+                        [str(name) for name in provenance["labels"]["roi_names"]],
+                        dtype=str,
+                    ),
+                    "method": np.array([str(self.method)]),
+                    "primary": np.array(["crosstalk_flip_aligned"]),
+                    "definition": np.array([
+                        "crosstalk: primary flip-aligned estimator "
+                        "(compute_crosstalk_matrix_numpy(align_signs=True), "
+                        "label_sign_flip-aligned CTF rows; matches mean_flip). "
+                        "crosstalk_unflipped: mne get_cross_talk(mode='mean') "
+                        "library matrix. Both: C[i,j] = mean(|CTF_i in ROI j|) / "
+                        "mean(|CTF_i in ROI i|) on a fixed-orientation QC "
+                        "operator pair (depth=%.2f, lambda2=lambda2_evoked); "
+                        "rows are cross-talk functions, so C[i, j] is the "
+                        "leakage FROM ROI j (source, column) INTO ROI i "
+                        "(target, row); C[i, i] == 1 (B7 rev2 fixes 5/6)."
+                        % self.depth
+                    ]),
+                }
+                if crosstalk_unflipped is not None:
+                    payload["crosstalk_unflipped"] = np.asarray(
+                        crosstalk_unflipped, dtype=float
+                    )
+                atomic_write_npz(crosstalk_path, payload)
+                written.append(crosstalk_path)
+                artifacts[crosstalk_path.name] = sha256_file(crosstalk_path)
 
             config_path = self.output_dir / f"{subject_id}_source_config.yaml"
             atomic_write_text(

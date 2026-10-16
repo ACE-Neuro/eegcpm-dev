@@ -843,3 +843,42 @@ def test_features_cli_requested_subject_absent_raises(tmp_path):
     with pytest.raises(FileNotFoundError, match="sub-99"):
         features_command(args)
     assert not (tmp_path / "features_out" / "source_erp_resting_ec.parquet").exists()
+
+
+# ---------------------------------------------------------------------------
+# B5-A5 / B7 task 12: stale-output sweep must remove hidden temp leftovers
+# ---------------------------------------------------------------------------
+
+def test_stale_patterns_include_hidden_atomic_temps(tmp_path):
+    """A SIGKILL mid-write leaves `.{subject}_...tmp*`; the sweep removes them.
+
+    The atomic writers rename `tmp` onto the target, so a killed process leaves
+    only hidden temp files behind — nothing else would ever clean them. The
+    patterns are scoped to this subject's prefix, so another subject's in-flight
+    temp file is never touched.
+    """
+    from eegcpm.core.provenance import stale_output_patterns
+
+    leftovers = [
+        ".sub-01_stim_stc.tmp-lh.stc",
+        ".sub-01_stim_stc.tmp-rh.stc",
+        ".sub-01_roi_tc.tmp.npz",
+        ".sub-01_source_config.yaml.tmp",
+        ".sub-01-cov.tmp-cov.fif",
+        ".sub-01-inv.tmp-inv.fif",
+        ".sub-01_provenance.json.tmp",
+    ]
+    for name in leftovers:
+        (tmp_path / name).write_bytes(b"partial")
+    (tmp_path / ".sub-02_roi_tc.tmp.npz").write_bytes(b"other subject")
+    (tmp_path / "sub-01_roi_tc.npz").write_bytes(b"stale artifact")
+
+    matched = []
+    for pattern in stale_output_patterns("sub-01"):
+        for path in sorted(tmp_path.glob(pattern)):
+            matched.append(path.name)
+
+    for name in leftovers:
+        assert name in matched, f"{name} is not covered by the stale patterns"
+    assert "sub-01_roi_tc.npz" in matched
+    assert ".sub-02_roi_tc.tmp.npz" not in matched

@@ -7,6 +7,7 @@ enabling resume functionality, progress monitoring, and workflow coordination.
 import sqlite3
 import json
 import copy
+import logging
 import math
 import numpy as np
 from dataclasses import dataclass, field, asdict
@@ -14,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 def _finite_float(value: float) -> Any:
@@ -28,6 +31,25 @@ def _finite_float(value: float) -> Any:
     if math.isnan(value):
         return "nan"
     return "inf" if value > 0 else "-inf"
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, ddl: str
+) -> None:
+    """``ALTER TABLE ... ADD COLUMN`` that tolerates an already-existing column.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS`` and ``_init_db`` runs on every
+    connect, so the duplicate-column error is the expected no-op. The only
+    tolerated error is that ``OperationalError`` (message-checked) — a locked
+    database or a malformed schema propagates. The no-op is logged at debug
+    level instead of a bare ``pass`` (B7-A1).
+    """
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+        logger.debug("%s.%s already exists: %s", table, column, exc)
 
 
 def _make_json_serializable(obj: Any) -> Any:
@@ -253,22 +275,12 @@ class WorkflowStateManager:
             """)
 
             # Migration: Add new columns to existing tables if they don't exist
-            try:
-                conn.execute("ALTER TABLE workflows ADD COLUMN current_stage TEXT DEFAULT 'preprocessing'")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
-
-            try:
-                conn.execute("ALTER TABLE workflows ADD COLUMN metadata TEXT")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
-
+            _add_column_if_missing(
+                conn, "workflows", "current_stage", "TEXT DEFAULT 'preprocessing'")
+            _add_column_if_missing(conn, "workflows", "metadata", "TEXT")
             for col, ddl in (("condition", "TEXT NOT NULL DEFAULT ''"),
                              ("run_id", "TEXT NOT NULL DEFAULT ''")):
-                try:
-                    conn.execute(f"ALTER TABLE workflows ADD COLUMN {col} {ddl}")
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
+                _add_column_if_missing(conn, "workflows", col, ddl)
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS steps (

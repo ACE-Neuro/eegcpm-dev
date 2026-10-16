@@ -64,12 +64,27 @@ class PoisonBadChannelsStep(ProcessingStep):
         return raw, {"applied": True, "bad_channels": 42}
 
 
+class FakeDetectorStep(ProcessingStep):
+    """Emits the canonical chain's detector metadata key (B7 rev2 fix 9 test)."""
+
+    name = "bad_channel_detection"
+    version = "0.1"
+
+    def process(self, raw, metadata):
+        return raw, {
+            "applied": True,
+            "detected": ["E1"],
+            "n_detected_precap": 1,
+        }
+
+
 @pytest.fixture
 def registered_steps(monkeypatch):
     """Register throwaway failing/excluding/poison steps for this test only."""
     monkeypatch.setitem(STEP_REGISTRY, "injected_failure", InjectedFailureStep)
     monkeypatch.setitem(STEP_REGISTRY, "injected_exclusion", InjectedExclusionStep)
     monkeypatch.setitem(STEP_REGISTRY, "bad_channels", PoisonBadChannelsStep)
+    monkeypatch.setitem(STEP_REGISTRY, "bad_channel_detection", FakeDetectorStep)
 
 
 @pytest.fixture
@@ -487,6 +502,90 @@ def test_cli_load_failure_does_not_stop_later_runs(tmp_path, monkeypatch):
     assert len(list(run2_dir.glob("*_preprocessed_raw.fif"))) == 1
 
 
+def test_extract_quality_metrics_reads_canonical_detector_key(tmp_path):
+    """B7 rev2 fix 9: the canonical `bad_channel_detection` key is authoritative.
+
+    The chain's detector writes ``detected``/``n_detected_precap`` under
+    ``bad_channel_detection``; the legacy ``bad_channels`` key (with
+    ``n_bad_channels``) is still honoured when present.
+    """
+    processor = RunProcessor(
+        bids_root=tmp_path, output_root=tmp_path,
+        config=_config_dict([]), verbose=False,
+    )
+    canonical = processor._extract_quality_metrics(
+        "1", 109,
+        {"bad_channel_detection": {"detected": ["E1", "E2"], "n_detected_precap": 3}},
+    )
+    assert canonical.n_bad_channels == 2
+    assert canonical.pct_bad_channels == pytest.approx(2 / 109 * 100)
+
+    legacy = processor._extract_quality_metrics(
+        "1", 128, {"bad_channels": {"n_bad_channels": 4}},
+    )
+    assert legacy.n_bad_channels == 4
+
+
+def test_extract_quality_metrics_unknown_original_is_recorded(tmp_path):
+    """B7 rev2 fix 9: an unknown original channel count is never a clean bill.
+
+    ``n_original <= 0`` (the preprocessed FIF could not be read) must produce
+    ``unknown``/``review`` plus a recorded warning — the old code invented
+    ``n_original=128`` and then reported a 0 % bad-channel percentage.
+    """
+    processor = RunProcessor(
+        bids_root=tmp_path, output_root=tmp_path,
+        config=_config_dict([]), verbose=False,
+    )
+    metrics = processor._extract_quality_metrics(
+        "1", 0, {"bad_channel_detection": {"detected": ["E1"]}},
+    )
+    assert metrics.n_original_channels == 0
+    assert metrics.n_bad_channels == 1
+    assert metrics.pct_bad_channels == 0.0
+    assert metrics.quality_status == "unknown"
+    assert metrics.recommended_action == "review"
+    assert any("Original channel count unknown" in w for w in metrics.warnings)
+
+
+def test_load_processed_runs_records_unreadable_fif(
+        bids_tree, registered_steps, tmp_path, caplog):
+    """B7 rev2 fix 9 (integration): a corrupt FIF is logged, not defaulted.
+
+    The old handler was a bare ``except:`` that silently assumed 128 original
+    channels and read the legacy ``bad_channels`` metadata key. The run must
+    now be reported with an unknown channel count, a recorded warning and a
+    logged reason, from the canonical ``bad_channel_detection`` key.
+    """
+    db_root = tmp_path / "rp_state"
+    manager = WorkflowStateManager(db_root / ".eegcpm" / "state.db")
+    processor = RunProcessor(
+        bids_root=bids_tree,
+        output_root=bids_tree / "derivatives" / "preprocessing" / PIPELINE,
+        config=_config_dict([{"name": "bad_channel_detection", "params": {}}]),
+        state_manager=manager,
+        verbose=False,
+    )
+    results = processor.process_subject_task(
+        subject_id="01", task="T", session="01", pipeline=PIPELINE)
+    assert len(results) == 1 and results[0].success
+
+    # Corrupt the saved FIF: it still exists (so the run is discovered) but can
+    # no longer be read for the channel count.
+    fif = next(_run_dir(bids_tree).glob("*_preprocessed_raw.fif"))
+    fif.write_bytes(b"this is not a FIF file")
+
+    with caplog.at_level("WARNING", logger="eegcpm.pipeline.run_processor"):
+        loaded = processor.load_processed_runs("01", "T", pipeline=PIPELINE)
+    assert len(loaded) == 1
+    qm = loaded[0].quality_metrics
+    assert qm is not None
+    assert qm.n_original_channels == 0
+    assert qm.quality_status == "unknown"
+    assert any("Original channel count unknown" in w for w in qm.warnings)
+    assert any("could not read" in rec.message for rec in caplog.records)
+
+
 def test_run_processor_exception_after_success_cleans_outputs(
         bids_tree, registered_steps, tmp_path, monkeypatch):
     """A run_processor run that succeeds and then crashes (post-process)
@@ -522,3 +621,109 @@ def test_run_processor_exception_after_success_cleans_outputs(
     assert "quality-metrics failure" in str(ps.get("error"))
 
     assert processor.load_processed_runs("01", "T", pipeline=PIPELINE) == []
+
+
+# ------------------------------------------- B7: QC records for non-success
+# (plan §B7 task 2 — P1-F10)
+
+def test_cli_writes_qc_metrics_for_failed_run(
+        bids_tree, registered_steps, tmp_path):
+    """A FAILED run leaves a `*_qc_metrics.json` with status + reason."""
+    config = _write_config(tmp_path / "fail_qc.yaml",
+                           [{"name": "injected_failure", "params": {}}])
+    preprocess_command(_cli_args(config, bids_tree))
+
+    records = list(_run_dir(bids_tree).glob("*_qc_metrics.json"))
+    assert len(records) == 1, "failed run left no QC metrics record"
+    payload = json.loads(records[0].read_text())
+    assert payload["status"] == "failed"
+    assert "injected_failure" in payload["reason"]
+    assert payload["subject_id"] == "01"
+    assert payload["session"] == "01"
+    assert payload["task"] == "T"
+    assert payload["run"] == "1"
+    assert payload["errors"]
+
+
+def test_cli_writes_qc_metrics_for_excluded_run(
+        bids_tree, registered_steps, tmp_path):
+    """An EXCLUDED run leaves the same record with the exclusion reason."""
+    config = _write_config(tmp_path / "exclude_qc.yaml",
+                           [{"name": "injected_exclusion", "params": {}}])
+    preprocess_command(_cli_args(config, bids_tree))
+
+    records = list(_run_dir(bids_tree).glob("*_qc_metrics.json"))
+    assert len(records) == 1, "excluded run left no QC metrics record"
+    payload = json.loads(records[0].read_text())
+    assert payload["status"] == "excluded"
+    assert payload["reason"] == "excluded: injected_exclusion_reason"
+    assert payload["excluded"]["reason"] == "injected_exclusion_reason"
+    assert payload["excluded"]["n_bad"] == 7
+
+
+def test_cli_successful_run_records_recording_qc(bids_tree, tmp_path):
+    """A successful run's metrics JSON carries the per-recording QC row."""
+    config = _write_config(tmp_path / "ok_qc.yaml", [])
+    rc = preprocess_command(_cli_args(config, bids_tree))
+    assert rc is None
+
+    records = list(_run_dir(bids_tree).glob("*_qc_metrics.json"))
+    assert len(records) == 1
+    payload = json.loads(records[0].read_text())
+    assert "recording_qc" in payload, "the recording QC row was not stored"
+    row = payload["recording_qc"]
+    # The row is computed from the post-chain raw + the chain metadata; the
+    # test config has no ASR/block-rejection step, so those fields are None
+    # while the spectral/blink fields are always present.
+    assert row["task"] == "T"
+    assert row["subject_id"] == "01"
+    assert row["duration_post_s"] > 0
+    assert "line_noise_residual_ratio" in row
+    assert "blink_residual_ratio" in row
+    assert row["asr_burden"] is None
+
+
+class TestWorkflowMigrationHelper:
+    """B7-A1: the SQLite migration tolerates *only* the duplicate column.
+
+    The three ``except sqlite3.OperationalError: pass`` handlers are gone; the
+    shared helper re-raises anything that is not a duplicate-column error (a
+    locked DB or a malformed schema must not look like "already migrated") and
+    logs the tolerated no-op at debug level.
+    """
+
+    def test_repeated_init_is_idempotent(self, tmp_path):
+        import sqlite3
+
+        db = tmp_path / "state.db"
+        WorkflowStateManager(db)  # creates the schema
+        WorkflowStateManager(db)  # re-runs the ALTER TABLE migrations
+        with sqlite3.connect(db) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(workflows)")}
+        assert {"current_stage", "metadata", "condition", "run_id"} <= columns
+
+    def test_duplicate_column_is_tolerated(self, tmp_path, caplog):
+        import logging
+        import sqlite3
+
+        from eegcpm.workflow.state import _add_column_if_missing
+
+        db = tmp_path / "state.db"
+        WorkflowStateManager(db)
+        with sqlite3.connect(db) as conn:
+            with caplog.at_level(logging.DEBUG, logger="eegcpm.workflow.state"):
+                _add_column_if_missing(
+                    conn, "workflows", "current_stage", "TEXT DEFAULT 'preprocessing'"
+                )
+        assert any("already exists" in r.getMessage() for r in caplog.records)
+
+    def test_non_duplicate_operational_error_propagates(self, tmp_path):
+        import sqlite3
+
+        from eegcpm.workflow.state import _add_column_if_missing
+
+        db = tmp_path / "state.db"
+        WorkflowStateManager(db)
+        with sqlite3.connect(db) as conn:
+            with pytest.raises(sqlite3.OperationalError, match="no such table"):
+                _add_column_if_missing(conn, "not_a_table", "col", "TEXT")

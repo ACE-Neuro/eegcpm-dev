@@ -4,6 +4,7 @@ This module generates index pages and summary reports for browsing
 QC results across an entire dataset.
 """
 
+import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
@@ -11,6 +12,8 @@ import json
 from datetime import datetime
 from ..core.paths import find_preprocessed_raw
 from ..workflow.state import WorkflowStateManager
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -164,8 +167,14 @@ class AggregateReportGenerator:
                                         summary.n_runs_rejected += 1
                                     break
 
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # A broken state row or unexpected metadata must not
+                        # silently drop the run from the quality summary —
+                        # record it (P1-F11).
+                        logger.warning(
+                            "quality summary: state/quality lookup failed for "
+                            "sub-%s ses-%s task-%s run-%s (%s)",
+                            subject_id, session, task, run_id, exc)
 
         summary.quality_summary = quality_counts
 
@@ -179,8 +188,12 @@ class AggregateReportGenerator:
                     import mne
                     epochs = mne.read_epochs(combined_epo, preload=False, verbose=False)
                     summary.combined_epochs = len(epochs)
-                except Exception:
-                    pass
+                except (OSError, ValueError, RuntimeError) as exc:
+                    # An unreadable combined epoch file is reported, not
+                    # silently rendered as "0 epochs" (P1-F11).
+                    logger.warning(
+                        "combined epochs unreadable for sub-%s ses-%s task-%s: %s",
+                        subject_id, session, task, exc)
 
             # Check for combined QC
             combined_qc = combined_dir / f"{subject_id}_ses-{session}_task-{task}_combined_qc.html"

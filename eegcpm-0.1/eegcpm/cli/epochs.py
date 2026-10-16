@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import List, Optional
+import logging
 import mne
 import numpy as np
 
@@ -11,6 +12,8 @@ from eegcpm.core.paths import EEGCPMPaths, find_preprocessed_raw
 from eegcpm.modules.epochs import EpochExtractionModule
 from eegcpm.modules.qc.epochs_qc import generate_epochs_qc_report
 from eegcpm.data.event_mapping import translate_event_codes, get_event_mapping_for_run, load_events_from_bids_tsv, find_events_tsv
+
+logger = logging.getLogger(__name__)
 
 
 def epochs_command(args):
@@ -147,6 +150,9 @@ def epochs_command(args):
     n_success = 0
     n_failed = 0
     failed_subjects = []
+    # B7-A1: QC reports are side artifacts — a failure must not fail the run,
+    # but it must be recorded (log + summary) instead of printed and forgotten.
+    qc_failures: List[str] = []
 
     for subject_dir in subject_dirs:
         subject_id = subject_dir.name.replace("sub-", "")
@@ -413,8 +419,18 @@ def epochs_command(args):
                                 task=task,
                             )
                             print(f"   📊 QC Report: {qc_report_path.name}")
-                        except Exception as qc_error:
+                        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as qc_error:
+                            # Narrowed from `Exception`; the QC HTML is a side
+                            # artifact (a broken report must not fail a good
+                            # epochs run) but the failure is logged and listed
+                            # in the run summary (B7-A1).
+                            logger.warning(
+                                "QC report generation failed for sub-%s/ses-%s: %s",
+                                subject_id, session_id, qc_error,
+                            )
                             print(f"   ⚠️  QC report generation failed: {qc_error}")
+                            qc_failures.append(
+                                f"{subject_id}/ses-{session_id}: {qc_error}")
 
                     if result.output_files:
                         print(f"   📄 Files: {len(result.output_files)}")
@@ -442,6 +458,11 @@ def epochs_command(args):
         print(f"\nFailed subjects:")
         for subj in failed_subjects:
             print(f"  - {subj}")
+
+    if qc_failures:
+        print(f"\n⚠️  QC reports not generated for {len(qc_failures)} run(s):")
+        for item in qc_failures:
+            print(f"  - {item}")
 
     print()
 
@@ -543,8 +564,13 @@ def discover_events_command(args):
                     for code in unique_codes:
                         count = np.sum(events[:, 2] == code)
                         print(f"     Code {code:>4d}: {count:5d} occurrences")
-                except Exception as e:
-                    print(f"  Error reading events: {e}")
+                except (RuntimeError, ValueError, TypeError) as exc:
+                    # Diagnostic command: `mne.find_events` raises RuntimeError
+                    # when there is no stim channel and ValueError/TypeError for
+                    # unusable event data. Record it (log) and show it (B7-A1).
+                    logger.warning(
+                        "discover-events: find_events failed for %s: %s", fif_path, exc)
+                    print(f"  Error reading events: {exc}")
 
             # Also check for BIDS events.tsv
             bids_events_path = (

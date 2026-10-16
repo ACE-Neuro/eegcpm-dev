@@ -11,7 +11,7 @@ from .import_qc import import_qc_command
 from .epochs import epochs_command, discover_events_command
 from .source_reconstruct import source_reconstruct_command
 from .connectivity import connectivity_command
-from .features import features_command, add_features_parser
+from .features import features_command, add_features_parser, validate_features_args
 from .predict import predict_command, add_predict_parser
 
 
@@ -400,7 +400,7 @@ For more information: https://github.com/clivehywong/eegcpm-dev
 
     # Features and predict commands (R-002: CLI wiring for L2,
     # primary-config validator, and DUA path enforcement)
-    add_features_parser(subparsers)
+    features_parser = add_features_parser(subparsers)
     add_predict_parser(subparsers)
     connectivity_parser.add_argument(
         '--subjects',
@@ -422,6 +422,11 @@ For more information: https://github.com/clivehywong/eegcpm-dev
 
     # Parse arguments
     args = parser.parse_args()
+
+    # B4-K6: per-feature-type argument combinations are validated in the argparse
+    # layer, so a bad combination exits 2 with a usage message (not a traceback).
+    if args.command == 'features':
+        validate_features_args(features_parser, args)
 
     if args.command is None:
         parser.print_help()

@@ -410,6 +410,60 @@ class TestRawQC:
             assert "N Channels" in metric_names
             assert "N EEG Channels" in metric_names
 
+    def test_line_noise_failure_is_nan_not_zero(self, monkeypatch):
+        """B7 rev2 fix 9: a failed line-noise measurement is NaN with a note.
+
+        The old handler returned 0.0 — indistinguishable from a clean
+        recording — and the metric then reported status ``ok``.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            qc = RawQC(Path(tmpdir), line_freq=60.0)
+            raw = mne.io.RawArray(
+                np.random.default_rng(0).standard_normal((4, 1000)) * 10e-6,
+                mne.create_info(["A", "B", "C", "D"], 250.0, "eeg"),
+            )
+
+            def _boom(*args, **kwargs):
+                raise RuntimeError("injected PSD failure")
+
+            monkeypatch.setattr(raw, "compute_psd", _boom)
+            value = qc._compute_line_noise_ratio(raw, np.arange(4))
+            assert np.isnan(value)
+
+            result = qc.compute(raw, "test_subject")
+            metric = next(m for m in result.metrics if m.name == "Line Noise Ratio")
+            assert np.isnan(metric.value)
+            assert metric.status == "warning"
+            assert any("Line noise ratio could not be computed" in n
+                       for n in result.notes)
+
+    def test_quality_control_module_line_noise_failure_is_nan(self, monkeypatch):
+        """B7 rev2 fix 9: QualityControlModule records NaN + a warning too."""
+        from eegcpm.modules.qc import QualityControlModule
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module = QualityControlModule({"line_freq": 60.0}, Path(tmpdir))
+            raw = mne.io.RawArray(
+                np.random.default_rng(0).standard_normal((4, 2500)) * 10e-6,
+                mne.create_info(["A", "B", "C", "D"], 250.0, "eeg"),
+            )
+
+            def _boom(*args, **kwargs):
+                raise RuntimeError("injected PSD failure")
+
+            monkeypatch.setattr(raw, "compute_psd", _boom)
+            value = module._compute_line_noise(raw, np.arange(4))
+            assert np.isnan(value)
+
+            class _Subject:
+                id = "s1"
+
+            result = module.process(raw, subject=_Subject())
+            assert result.success
+            assert np.isnan(result.metadata["line_noise_power"])
+            assert any("Line noise power could not be computed" in w
+                       for w in result.warnings)
+
     def test_compute_with_bad_channels(self, sample_raw_with_artifacts):
         """Test QC with bad channels marked."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -625,3 +679,237 @@ class TestEdgeCases:
 
             # Should generate correlation without errors
             assert "correlation" in result.figures
+
+
+# ---------------------------------------------------------------------------
+# P1-F10 (plan §B7 task 3): per-recording chain QC (hbn_recording_qc)
+# ---------------------------------------------------------------------------
+
+
+def _eog_raw(blink_scale=1.0, leak=0.0, sfreq=250.0, seconds=60.0, seed=0,
+             line_uv=0.0):
+    """Raw with 9 EGI EOG channels, blinks, and optional frontal leakage.
+
+    ``leak`` adds a fraction of the blink waveform to the frontal EEG channels
+    (volume conduction); an EOG regression can then remove it. ``line_uv`` adds
+    60 Hz line noise to the frontal channels (B7 rev2 fix 4 fixture: the bias
+    probe).
+    """
+    from eegcpm.modules.qc.hbn_recording_qc import EOG_HYDROCEL_NAMES
+
+    ch_names = ["Fp1", "Fp2", "F3", "F4", "F7", "F8", "Fz", "Cz"] + list(EOG_HYDROCEL_NAMES)
+    ch_types = ["eeg"] * 8 + ["eog"] * len(EOG_HYDROCEL_NAMES)
+    rng = np.random.default_rng(seed)
+    n_times = int(sfreq * seconds)
+    data = rng.standard_normal((len(ch_names), n_times)) * 5e-6
+    if line_uv:
+        t = np.arange(n_times) / sfreq
+        frontal_all = [ch_names.index(ch) for ch in
+                       ("Fp1", "Fp2", "F3", "F4", "F7", "F8", "Fz")]
+        data[frontal_all] += line_uv * 1e-6 * np.sin(2 * np.pi * 60.0 * t)[None, :]
+    blink = np.exp(-0.5 * ((np.arange(int(0.3 * sfreq)) / sfreq - 0.15) / 0.06) ** 2)
+    blink_onsets = np.arange(5.0, seconds - 5.0, 4.0)
+    eog_idx = [ch_names.index(ch) for ch in EOG_HYDROCEL_NAMES]
+    frontal_idx = [ch_names.index(ch) for ch in ("Fp1", "Fp2", "F3", "F4", "F7", "F8", "Fz")]
+    for onset in blink_onsets:
+        start = int(onset * sfreq)
+        stop = start + blink.size
+        data[eog_idx, start:stop] += (250e-6 * blink_scale * blink)[None, :]
+        if leak:
+            data[frontal_idx, start:stop] += (250e-6 * blink_scale * leak * blink)[None, :]
+    info = mne.create_info(ch_names, sfreq, ch_types)
+    return mne.io.RawArray(data, info, verbose=False)
+
+
+class TestBlinkResidualGate:
+    """`blink_residual_ratio` replaces the vacuous in-sample corr gate (P1-F10)."""
+
+    def test_blinks_removed_pass(self):
+        """A recording whose frontal blinks were removed passes the gate."""
+        from eegcpm.modules.qc.hbn_recording_qc import (
+            OCULAR_GATE, blink_residual_ratio,
+        )
+
+        raw_pre = _eog_raw(leak=1.0)
+        # Simulate the EOG regression: subtract the EOG-derived blink from the
+        # frontal channels (what a real OLS regression does).
+        raw_post = raw_pre.copy()
+        eog_data = raw_pre.get_data(picks=["E8"])
+        frontal = raw_pre.get_data(picks=["Fp1", "Fp2", "F3", "F4", "F7", "F8", "Fz"])
+        coeffs = np.linalg.lstsq(eog_data.T, frontal.T, rcond=None)[0]
+        raw_post._data[[raw_post.ch_names.index(ch) for ch in
+                        ("Fp1", "Fp2", "F3", "F4", "F7", "F8", "Fz")]] = (
+            frontal - (eog_data.T @ coeffs).T
+        )
+
+        result = blink_residual_ratio(raw_pre, raw_post)
+        assert result["n_blinks"] > 0
+        assert result["blink_channel"] == "E8"
+        assert result["ratio"] is not None
+        assert result["ratio"] < OCULAR_GATE
+        assert result["pass"] is True
+
+    def test_blinks_kept_fail(self):
+        """Unremoved frontal blinks must fail the gate (no vacuous pass)."""
+        from eegcpm.modules.qc.hbn_recording_qc import OCULAR_GATE, blink_residual_ratio
+
+        raw = _eog_raw(leak=0.8)
+        result = blink_residual_ratio(raw, raw)
+        assert result["ratio"] is not None
+        assert result["ratio"] >= OCULAR_GATE
+        assert result["pass"] is False
+
+    def test_missing_raw_pre_is_not_a_pass(self):
+        """No pre-chain recording → ratio/pass are None, with a reason."""
+        from eegcpm.modules.qc.hbn_recording_qc import blink_residual_ratio
+
+        raw = _eog_raw()
+        result = blink_residual_ratio(None, raw)
+        assert result["ratio"] is None
+        assert result["pass"] is None
+        assert result["reason"] == "raw_pre_missing"
+
+    def test_synthetic_frontal_proxy_without_eog(self):
+        """Without EGI EOG names the blinks are found on a frontal proxy channel."""
+        from eegcpm.modules.qc.hbn_recording_qc import blink_residual_ratio
+
+        ch_names = ["Fp1", "Fp2", "F3", "F4", "F7", "F8", "Fz", "Cz", "Pz", "Oz"]
+        rng = np.random.default_rng(1)
+        sfreq, seconds = 250.0, 60.0
+        data = rng.standard_normal((len(ch_names), int(sfreq * seconds))) * 10e-6
+        blink = np.exp(-0.5 * ((np.arange(int(0.3 * sfreq)) / sfreq - 0.15) / 0.06) ** 2)
+        frontal = [ch_names.index(ch) for ch in ("Fp1", "Fp2", "F7", "F8")]
+        for onset in np.arange(5.0, seconds - 5.0, 4.0):
+            start = int(onset * sfreq)
+            data[frontal, start:start + blink.size] += (200e-6 * blink)[None, :]
+        raw = mne.io.RawArray(
+            data, mne.create_info(ch_names, sfreq, "eeg"), verbose=False)
+
+        result = blink_residual_ratio(raw, raw)
+        assert result["blink_channel"] in ("Fp1", "Fp2")
+        assert result["n_blinks"] > 0
+        assert result["frontal_channels"]
+
+    def test_resampled_post_is_timeline_mismatch(self):
+        """B7 rev2 fix 3: blink indices from raw_pre are not usable on a resampled post.
+
+        Before the guard, a resampled post (different ``sfreq``/``n_times``) was
+        indexed with the pre recording's sample numbers and still produced a
+        pass/fail verdict (probed: ratio 0.50 on a 250→200 Hz resample; the
+        audit measured 0.149/pass=True on its own probe). The gate must refuse
+        to run instead: ratio/pass ``None``, reason ``timeline_mismatch``.
+        """
+        from eegcpm.modules.qc.hbn_recording_qc import blink_residual_ratio
+
+        raw_pre = _eog_raw(leak=0.8)
+        raw_post = raw_pre.copy().resample(200.0, verbose=False)
+        assert raw_post.info["sfreq"] != raw_pre.info["sfreq"]
+
+        result = blink_residual_ratio(raw_pre, raw_post)
+        assert result["ratio"] is None
+        assert result["pass"] is None
+        assert result["reason"] == "timeline_mismatch"
+        # The mismatch is recorded, not just asserted.
+        assert result["timeline"]["pre"]["sfreq"] == raw_pre.info["sfreq"]
+        assert result["timeline"]["post"]["n_times"] == raw_post.n_times
+
+    def test_timeline_guard_accepts_matching_frames(self):
+        """A post recording with the identical frame still runs the gate."""
+        from eegcpm.modules.qc.hbn_recording_qc import blink_residual_ratio
+
+        raw = _eog_raw(leak=0.8)
+        result = blink_residual_ratio(raw, raw)
+        assert result["reason"] is None
+        assert result["ratio"] is not None
+
+    def test_line_noise_in_pre_does_not_bias_ratio_toward_pass(self):
+        """B7 rev2 fix 4: identical band-pass on pre and post before the ptp.
+
+        The pre amplitude used to be measured on unfiltered data while the post
+        was filtered, so 60 Hz line noise in the *pre* recording inflated
+        ``ptp_pre`` and pushed the ratio toward the 0.30 gate even with the
+        blinks fully retained (probed: a false pass at 100 µV 60 Hz, leak 0.2).
+        Both sides are now band-passed 1-15 Hz, so retained blinks fail the gate
+        at any line-noise level.
+        """
+        from eegcpm.modules.qc.hbn_recording_qc import (
+            OCULAR_GATE, blink_residual_ratio,
+        )
+
+        raw_pre = _eog_raw(leak=0.2, line_uv=100.0)
+        # Simulate a real chain: the 0.1-45 Hz filter removed the line noise
+        # from the post recording, but the blinks were NOT removed (regression
+        # failed).
+        raw_post = raw_pre.copy()
+        frontal = [raw_post.ch_names.index(ch) for ch in
+                   ("Fp1", "Fp2", "F3", "F4", "F7", "F8", "Fz")]
+        t = np.arange(raw_post.n_times) / raw_post.info["sfreq"]
+        raw_post._data[frontal] -= (
+            100e-6 * np.sin(2 * np.pi * 60.0 * t)[None, :])
+
+        result = blink_residual_ratio(raw_pre, raw_post)
+        assert result["ratio"] is not None
+        # Blinks retained -> the gate must FAIL (ratio ~1), not pass on the
+        # line-noise-inflated pre amplitude.
+        assert result["ratio"] >= OCULAR_GATE
+        assert result["pass"] is False
+        assert result["ratio"] > 0.9, (
+            f"band-pass did not remove the line-noise bias: ratio "
+            f"{result['ratio']:.3f}"
+        )
+
+        # Non-vacuity: the OLD measurement (unfiltered ptp) on the same data is
+        # a false pass — this is the bias the fix removes.
+        from eegcpm.modules.qc.hbn_recording_qc import (
+            _blink_events, _blink_locked_ptp, _frontal_channels,
+        )
+        events = _blink_events(raw_pre, "E8")
+        names = _frontal_channels(raw_pre)
+        unfiltered_ratio = (
+            _blink_locked_ptp(raw_post, events, names)
+            / _blink_locked_ptp(raw_pre, events, names)
+        )
+        assert unfiltered_ratio < OCULAR_GATE, (
+            "fixture no longer reproduces the pre-fix false pass "
+            f"(unfiltered ratio {unfiltered_ratio:.3f})"
+        )
+
+    def test_metrics_row_fields(self):
+        """`recording_qc_metrics` reads the chain metadata (task 3)."""
+        from eegcpm.modules.qc.hbn_recording_qc import recording_qc_metrics
+
+        raw = _eog_raw()
+        chain_metadata = {
+            "asr": {"asr_burden": 0.25, "window_rejected_fraction": 0.1,
+                    "repaired_fraction": 0.2},
+            "bad_channel_detection": {"detected": ["E1", "E2"], "n_detected_precap": 5},
+            "block_rejection": {"rejected_fraction": 0.12, "n_blocks_rejected": 4},
+        }
+        row = recording_qc_metrics(raw, "RestingState", "s1",
+                                   chain_metadata=chain_metadata, raw_pre=raw)
+        assert row["asr_burden"] == 0.25
+        assert row["asr_rejected_fraction"] == 0.1
+        assert row["asr_repaired_fraction"] == 0.2
+        assert row["bad_channels_n"] == 2
+        assert row["bad_channels_n_precap"] == 5
+        assert row["bad_channels_detected"] == ["E1", "E2"]
+        # The block keys are the ones the block-rejection step emits.
+        assert row["block_rejected_fraction"] == 0.12
+        assert row["block_n_rejected"] == 4
+        # The old in-sample corr survives as an informational field only.
+        assert "residual_ocular_maxcorr_insample" in row
+        assert "residual_ocular_maxcorr" not in row
+        assert "residual_ocular_pass" not in row
+        assert row["blink_n"] > 0
+
+    def test_metrics_row_without_metadata(self):
+        """Without chain metadata the ASR/block fields are None, bads come from info."""
+        from eegcpm.modules.qc.hbn_recording_qc import recording_qc_metrics
+
+        raw = _eog_raw()
+        raw.info["bads"] = ["Fp1"]
+        row = recording_qc_metrics(raw, "RestingState", "s1")
+        assert row["asr_burden"] is None
+        assert row["bad_channels_n"] == 1
+        assert row["blink_residual_pass"] is None
+        assert row["blink_residual_reason"] == "raw_pre_missing"

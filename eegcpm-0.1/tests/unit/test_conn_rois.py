@@ -100,3 +100,32 @@ class TestConnROIs:
         for idx_list in indices.values():
             all_indices.extend(idx_list)
         assert sorted(all_indices) == list(range(32))
+
+
+class TestNiftiTemplateLoading:
+    """B7-A1: the optional nibabel dependency / missing template is recorded.
+
+    The old handler was ``except ImportError: pass`` followed by ``return
+    None`` — a silent swallow. Both no-op paths are now logged and a corrupt
+    template propagates instead of looking like "not installed".
+    """
+
+    def test_loads_template_when_present(self):
+        from eegcpm.data.conn_rois import load_nifti_template
+
+        img = load_nifti_template()
+        assert img is not None, "the packaged CONN template must load"
+        # (91, 109, 91) MNI volume with one map per CONN network.
+        assert img.shape[:3] == (91, 109, 91)
+
+    def test_missing_template_returns_none_and_logs(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        import eegcpm.data.conn_rois as conn_rois
+
+        monkeypatch.setattr(conn_rois, "get_template_path", lambda: tmp_path)
+        with caplog.at_level(logging.DEBUG, logger="eegcpm.data.conn_rois"):
+            assert conn_rois.load_nifti_template() is None
+        assert any(
+            "template not found" in record.getMessage() for record in caplog.records
+        ), "the missing-template no-op must be logged (B7-A1)"

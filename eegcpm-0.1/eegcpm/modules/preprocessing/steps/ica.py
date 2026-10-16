@@ -218,8 +218,12 @@ class ICAStep(ProcessingStep):
                     eog_indices, _ = ica.find_bads_eog(raw, verbose=False)
                     auto_detected['eog'] = eog_indices
                     exclude_indices.extend(eog_indices)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError) as exc:
+                    # mne raises ValueError/RuntimeError when the detection
+                    # cannot run (no usable EOG channel / no significant
+                    # events). Record it: a silently empty auto-detection
+                    # would look like "no ocular components found" (P1-F11).
+                    auto_detected['eog_error'] = str(exc)
 
             # ECG
             ecg_picks = mne.pick_types(raw.info, ecg=True)
@@ -228,8 +232,8 @@ class ICAStep(ProcessingStep):
                     ecg_indices, _ = ica.find_bads_ecg(raw, verbose=False)
                     auto_detected['ecg'] = ecg_indices
                     exclude_indices.extend(ecg_indices)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError) as exc:
+                    auto_detected['ecg_error'] = str(exc)
 
         # Apply exclusions
         ica.exclude = sorted(list(set(exclude_indices)))
@@ -328,8 +332,10 @@ class ICAStep(ProcessingStep):
                     eog_indices, eog_scores = ica.find_bads_eog(raw, verbose=False)
                     auto_detected['eog'] = eog_indices
                     exclude_indices.extend(eog_indices)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError) as exc:
+                    # Record a failed auto-detection (P1-F11) instead of
+                    # reporting an empty (and therefore "clean") result.
+                    auto_detected['eog_error'] = str(exc)
 
             # ECG artifacts
             ecg_picks = mne.pick_types(raw.info, ecg=True)
@@ -338,8 +344,8 @@ class ICAStep(ProcessingStep):
                     ecg_indices, ecg_scores = ica.find_bads_ecg(raw, verbose=False)
                     auto_detected['ecg'] = ecg_indices
                     exclude_indices.extend(ecg_indices)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError) as exc:
+                    auto_detected['ecg_error'] = str(exc)
 
         # Remove duplicates
         ica.exclude = sorted(list(set(exclude_indices)))

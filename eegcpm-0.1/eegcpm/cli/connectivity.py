@@ -1,12 +1,16 @@
 """CLI command for connectivity analysis."""
 
+import logging
 from pathlib import Path
 from typing import List, Optional
 import numpy as np
+from pydantic import ValidationError
 
 from eegcpm.core.paths import EEGCPMPaths
 from eegcpm.core.task_config import TaskConfig
 from eegcpm.modules.connectivity import ConnectivityModule
+
+logger = logging.getLogger(__name__)
 
 
 def connectivity_command(args):
@@ -90,6 +94,9 @@ def connectivity_command(args):
     # Load task config if available
     task_config = None
     task_config_name = getattr(args, 'task_config', None)
+    # B7-A1: configs this command could not read are recorded (log + run
+    # summary) instead of being dropped silently.
+    task_config_warnings: List[str] = []
 
     if task_config_name != "none":
         # Auto-detect or use specified
@@ -103,10 +110,21 @@ def connectivity_command(args):
                     try:
                         with open(config_file) as f:
                             cfg = yaml.safe_load(f)
-                        if cfg.get('task_name') == task:
-                            matching_configs.append(config_file)
-                    except Exception:
+                    except (OSError, yaml.YAMLError) as exc:
+                        # An unreadable config could be the matching one: record
+                        # the drop (log + summary), never a silent `continue`.
+                        logger.warning("Task config %s skipped: %s", config_file, exc)
+                        task_config_warnings.append(
+                            f"{config_file.name}: unreadable ({exc})")
                         continue
+                    if not isinstance(cfg, dict):
+                        logger.warning(
+                            "Task config %s skipped: not a YAML mapping", config_file)
+                        task_config_warnings.append(
+                            f"{config_file.name}: not a YAML mapping")
+                        continue
+                    if cfg.get('task_name') == task:
+                        matching_configs.append(config_file)
 
             if matching_configs:
                 exact_match = [c for c in matching_configs if c.stem == task]
@@ -124,8 +142,18 @@ def connectivity_command(args):
                 task_config = TaskConfig.from_yaml(task_config_path)
                 print(f"   ✓ Loaded task config")
                 print(f"   Conditions: {[c.name for c in task_config.conditions]}")
-            except Exception as e:
-                print(f"   ⚠️  Could not load task config: {e}")
+            except (OSError, yaml.YAMLError, ValidationError, TypeError) as exc:
+                # This command does not use the config beyond the printout, so
+                # the failure is recoverable — but it must be recorded, not
+                # swallowed (B7-A1).
+                logger.warning("Could not load task config %s: %s", task_config_path, exc)
+                print(f"   ⚠️  Could not load task config: {exc}")
+                task_config_warnings.append(f"{task_config_path.name}: {exc}")
+
+        if task_config_warnings:
+            print(f"\n⚠️  Task config problems ({len(task_config_warnings)}):")
+            for message in task_config_warnings:
+                print(f"  - {message}")
 
     # Get source directory (add variant- prefix if not present)
     source_variant_dir = source_variant if source_variant.startswith("variant-") else f"variant-{source_variant}"

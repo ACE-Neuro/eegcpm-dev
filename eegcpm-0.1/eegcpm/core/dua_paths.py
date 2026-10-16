@@ -96,23 +96,23 @@ class EEGCPMPaths:
         # the current run identity.
         manifest = dua / "manifest.yaml"
         if manifest.exists() and self._current_run_config_hash is not None:
-            try:
-                import yaml
-                with open(manifest) as f:
-                    existing = yaml.safe_load(f)
-                existing_hash = (existing or {}).get("config_hash")
-                if existing_hash and existing_hash != self._current_run_config_hash:
-                    raise PermissionError(
-                        f"Prediction dir {dua} contains artifacts from "
-                        f"a different run (existing config_hash "
-                        f"{existing_hash}, current "
-                        f"{self._current_run_config_hash}). Refusing to "
-                        f"overwrite; rename the existing dir or use a "
-                        f"new model_name."
-                    )
-            except ImportError:
-                # yaml not available; skip content validation
-                pass
+            # `yaml` is a hard dependency of eegcpm (pyproject); an ImportError
+            # here must fail loudly rather than silently skip the content
+            # validation that protects the DUA-gated directory (P1-F11).
+            import yaml
+
+            with open(manifest) as f:
+                existing = yaml.safe_load(f)
+            existing_hash = (existing or {}).get("config_hash")
+            if existing_hash and existing_hash != self._current_run_config_hash:
+                raise PermissionError(
+                    f"Prediction dir {dua} contains artifacts from "
+                    f"a different run (existing config_hash "
+                    f"{existing_hash}, current "
+                    f"{self._current_run_config_hash}). Refusing to "
+                    f"overwrite; rename the existing dir or use a "
+                    f"new model_name."
+                )
         return dua
 
     def get_aggregates_dir(self, model_name: str) -> Path:

@@ -1,5 +1,6 @@
 """Feature extraction module for predictive modeling."""
 
+import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,6 +13,8 @@ from eegcpm.data.conn_rois import get_network_indices, CONN_NETWORKS
 # Import ERP feature extraction modules
 from .erp_features import ERPFeatureModule
 from .source_erp_features import SourceERPFeatureModule
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "FeatureExtractionModule",
@@ -211,26 +214,35 @@ class FeatureExtractionModule(BaseModule):
 
         try:
             import networkx as nx
+        except ImportError as exc:
+            # networkx is an optional extra (``all``). Record why the graph
+            # metrics are absent instead of silently omitting the columns
+            # (P1-F11).
+            logger.warning(
+                "graph metrics (%s_*) skipped: networkx is not installed "
+                "(%s); install with `pip install networkx`", prefix, exc)
+            return features, names
 
-            # Create graph
-            G = nx.from_numpy_array(binary)
+        # Create graph
+        G = nx.from_numpy_array(binary)
 
-            # Clustering coefficient
-            clustering = nx.average_clustering(G)
-            features[f"{prefix}_clustering"] = clustering
-            names.append(f"{prefix}_clustering")
+        # Clustering coefficient
+        clustering = nx.average_clustering(G)
+        features[f"{prefix}_clustering"] = clustering
+        names.append(f"{prefix}_clustering")
 
-            # Try to compute path length (may fail for disconnected graphs)
+        # Path length is undefined for disconnected graphs (and for graphs with
+        # fewer than two nodes); record the reason instead of dropping it
+        # silently (P1-F11).
+        if nx.is_connected(G):
             try:
-                if nx.is_connected(G):
-                    path_length = nx.average_shortest_path_length(G)
-                    features[f"{prefix}_path_length"] = path_length
-                    names.append(f"{prefix}_path_length")
-            except:
-                pass
-
-        except ImportError:
-            pass
+                path_length = nx.average_shortest_path_length(G)
+            except (nx.NetworkXError, nx.NetworkXPointlessConcept) as exc:
+                logger.warning(
+                    "graph metric %s_path_length unavailable: %s", prefix, exc)
+            else:
+                features[f"{prefix}_path_length"] = path_length
+                names.append(f"{prefix}_path_length")
 
         return features, names
 

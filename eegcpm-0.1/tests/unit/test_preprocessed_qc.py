@@ -461,3 +461,204 @@ class TestPreprocessedQCEdgeCases:
             result = qc.compute(raw, "sub-001", ica=ica)
 
             assert "ica_components" in result.figures
+
+
+# ---------------------------------------------------------------------------
+# P1-F10 (plan §B7 tasks 1-2): chain-aware QC metrics
+# ---------------------------------------------------------------------------
+
+
+def _chain_raw(n_channels=12, sfreq=250.0, seconds=30.0, seed=0, eog=None):
+    """Raw with optional EOG channels and a `Cz`-like reference channel."""
+    ch_names = [f"E{i+1}" for i in range(n_channels)] + ["Cz"] + list(eog or [])
+    ch_types = ["eeg"] * (n_channels + 1) + ["eog"] * len(eog or [])
+    rng = np.random.default_rng(seed)
+    data = rng.standard_normal((len(ch_names), int(sfreq * seconds))) * 15e-6
+    info = mne.create_info(ch_names, sfreq, ch_types)
+    return mne.io.RawArray(data, info, verbose=False)
+
+
+class TestPipelineStepStatusMetric:
+    """The 'Pipeline step status' metric must surface step failures (C6)."""
+
+    @staticmethod
+    def _metric(result, name="Pipeline step status"):
+        return next(m for m in result.metrics if m.name == name)
+
+    def test_all_ok_is_ok(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw()
+            metadata = {"step_status": {"filter": "ok", "asr": "ok"}}
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1", metadata=metadata)
+            metric = self._metric(result)
+            assert metric.status == "ok"
+            assert metric.value == 2
+
+    def test_noop_is_ok(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw()
+            metadata = {"step_status": {"filter": "ok", "interpolate": "noop"}}
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1", metadata=metadata)
+            assert self._metric(result).status == "ok"
+
+    def test_failed_step_is_bad(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw()
+            metadata = {"step_status": {"filter": "ok", "asr": "failed"}}
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1", metadata=metadata)
+            metric = self._metric(result)
+            assert metric.status == "bad"
+            assert "asr" in metric.unit
+
+    def test_excluded_step_is_bad(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw()
+            metadata = {"step_status": {"block_rejection": "excluded"}}
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1", metadata=metadata)
+            assert self._metric(result).status == "bad"
+
+    def test_degraded_is_warning(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw()
+            metadata = {
+                "step_status": {"filter": "ok", "ica": "failed_tolerated"},
+                "degraded": True,
+            }
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1", metadata=metadata)
+            metric = self._metric(result)
+            assert metric.status == "warning"
+            assert "degraded" in metric.unit
+
+    def test_not_run_after_abort_is_warning(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw()
+            metadata = {
+                "step_status": {"filter": "ok", "reference": "not_run"},
+            }
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1", metadata=metadata)
+            metric = self._metric(result)
+            assert metric.status == "warning"
+            assert "reference" in metric.unit
+
+    def test_without_metadata_is_warning_not_ok(self):
+        """No `step_status` at all must never render `ok` (B7-A2).
+
+        Without chain metadata (legacy dialect or standalone QC) there is no
+        evidence that the required steps ran; the old code reported
+        `0 / (all steps ok)` — a false clean bill.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw()
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1")
+            metric = self._metric(result)
+            assert metric.status == "warning"
+            assert metric.value == 0
+            assert metric.unit == "no chain metadata"
+
+    def test_legacy_metadata_without_step_status_is_warning(self):
+        """Legacy `metadata` payloads (no `step_status`) are a warning too."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw()
+            metadata = {"bad_channel_detection": {"detected": [], "n_detected_precap": 0}}
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1", metadata=metadata)
+            metric = self._metric(result)
+            assert metric.status == "warning"
+            assert metric.unit == "no chain metadata"
+
+    def test_empty_step_status_is_warning(self):
+        """An explicitly empty `step_status` is not "all ok" either (B7-A2)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw()
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1", metadata={"step_status": {}})
+            assert self._metric(result).status == "warning"
+
+
+class TestBadChannelAccounting:
+    """'Bad Channels' counts detected/interpolated channels; role exclusions are separate."""
+
+    @staticmethod
+    def _metric(result, name):
+        return next(m for m in result.metrics if m.name == name)
+
+    def test_detector_metadata_is_authoritative(self):
+        """After interpolation `info['bads']` is empty: the detector report counts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw(n_channels=12)
+            assert raw.info["bads"] == []
+            metadata = {
+                "bad_channel_detection": {
+                    "detected": ["E2", "E5"],
+                    "n_detected_precap": 4,
+                },
+            }
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1", metadata=metadata)
+            bad = self._metric(result, "Bad Channels")
+            assert bad.value == 2
+            assert any("2 bad channel(s) detected" in note for note in result.notes)
+            assert any("4 before the budget cap" in note for note in result.notes)
+
+    def test_channel_role_exclusions_are_not_bad_channels(self):
+        """neck/face drops + EEG->EOG retyping are montage decisions (P1-F10).
+
+        B7 rev2 fix 9: only role channels that were **EEG in the before set**
+        count — ``eog_channels`` also lists native EOG electrodes that were
+        never EEG, and subtracting those from ``n_dropped`` would under-count
+        genuine drops (the old code did exactly that: ``EOG1`` was counted as a
+        role exclusion although it never left the EEG set).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_before = _chain_raw(n_channels=14, eog=["EOG1"])
+            raw_after = raw_before.copy().drop_channels(["E13"])
+            # E14 was EEG before and is retyped to EOG by the chain; EOG1 was
+            # always an EOG electrode.
+            raw_after.set_channel_types({"E14": "eog"})
+            metadata = {
+                "channel_roles": {
+                    "neck_face_dropped": ["E13"],
+                    "eog_channels": ["E14", "EOG1"],
+                    "reference_channel": "Cz",
+                },
+                "bad_channel_detection": {"detected": [], "n_detected_precap": 0},
+            }
+            result = PreprocessedQC(Path(tmpdir)).compute(
+                raw_after, "s1", raw_before=raw_before, metadata=metadata)
+            assert self._metric(result, "Bad Channels").value == 0
+            role = self._metric(result, "Channel-role exclusions")
+            # E13 (dropped) + E14 (retyped); EOG1 was never EEG -> not counted.
+            assert role.value == 2, role.unit
+            # The role channels are not reported as bad/removed in the notes.
+            assert not any("Bad/removed channel(s)" in note for note in result.notes)
+
+    def test_native_eog_is_not_subtracted_from_dropped(self):
+        """A native EOG electrode must not hide a genuine EEG drop (fix 9).
+
+        One EEG channel is genuinely dropped, but ``channel_roles`` reports a
+        native EOG channel too. Without the before-set filter the role count
+        would swallow the drop (``n_dropped_other`` = 0); with it, the drop is
+        counted in 'Bad Channels'.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_before = _chain_raw(n_channels=12, eog=["EOG1"])
+            raw_after = raw_before.copy().drop_channels(["E7"])
+            metadata = {
+                "channel_roles": {
+                    "neck_face_dropped": [],
+                    "eog_channels": ["EOG1"],  # never EEG
+                    "reference_channel": "Cz",
+                },
+                "bad_channel_detection": {"detected": [], "n_detected_precap": 0},
+            }
+            result = PreprocessedQC(Path(tmpdir)).compute(
+                raw_after, "s1", raw_before=raw_before, metadata=metadata)
+            assert self._metric(result, "Bad Channels").value == 1
+            # No role exclusion was subtracted (EOG1 was never EEG).
+            assert all(m.name != "Channel-role exclusions" for m in result.metrics)
+            assert any("E7" in note for note in result.notes)
+
+    def test_marked_bad_channels_without_chain_metadata(self):
+        """The generic (non-chain) path keeps counting marked/dropped channels."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = _chain_raw(n_channels=12)
+            raw.info["bads"] = ["E1", "E2"]
+            result = PreprocessedQC(Path(tmpdir)).compute(raw, "s1")
+            assert self._metric(result, "Bad Channels").value == 2

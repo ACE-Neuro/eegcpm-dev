@@ -206,6 +206,48 @@ def _source_erp_frames(
     return frames, missing, distinct_hashes, sorted(set(run_identities))
 
 
+def validate_features_args(parser, args) -> None:
+    """Argparse-level validation of the per-feature-type argument combinations.
+
+    B4-K6: ``--input-dir`` used to be optional for every ``--feature-type``, so a
+    non-``source_erp`` type without ``--input-dir`` (or a ``source_erp`` run with
+    neither ``--input-dir`` nor a resolvable ``--source`` variant) failed at
+    runtime with a ``FileNotFoundError``/``ValueError`` traceback instead of a
+    usage message. Called from ``cli/main.py`` right after parsing, so the CLI
+    exits 2 with the usage line.
+
+    Rules:
+
+    - ``source_erp``: ``--input-dir`` is optional, but without it
+      ``--preprocessing``, ``--task`` **and** ``--source`` must all be given
+      (or resolvable from the config's ``depends_on``);
+    - every other feature type: ``--input-dir`` is required.
+    """
+    feature_type = getattr(args, "feature_type", "specparam")
+    input_dir = getattr(args, "input_dir", None)
+    if feature_type == "source_erp":
+        missing = [
+            flag for flag, value in (
+                ("--preprocessing", getattr(args, "preprocessing", None)),
+                ("--task", getattr(args, "task", None)),
+                ("--source", getattr(args, "source", None)),
+            )
+            if not value
+        ]
+        if input_dir is None and missing:
+            parser.error(
+                "--feature-type source_erp requires --input-dir, or "
+                "--preprocessing/--task/--source (missing: "
+                + ", ".join(missing)
+                + "); they may also come from the config's depends_on"
+            )
+    elif input_dir is None:
+        parser.error(
+            f"--input-dir is required for --feature-type {feature_type} "
+            "(only source_erp can resolve its inputs from the project tree)"
+        )
+
+
 def features_command(args):
     """Run feature extraction on preprocessed EEG.
 

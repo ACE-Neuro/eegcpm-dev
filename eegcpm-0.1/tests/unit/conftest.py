@@ -3,12 +3,28 @@
 ``fsaverage_subjects_dir`` resolves the *cached* fsaverage only. Tests must never
 download data: if the 3-layer BEM solution is missing the dependent tests are
 skipped (the CI workflow prefetches fsaverage before running the suite).
+
+``collect_ignore``: the two specparam test files raise ``RuntimeError`` at
+import when the optional backend is not installed (it is deliberately not in
+this environment — torch/specparam are out of pipeline scope). Without this,
+*every* pytest invocation except the documented one (which lists two explicit
+``--ignore`` flags) dies at collection — including the plan's ``pytest -m
+chain_e2e``. The ignore is conditional: with specparam installed the files are
+collected and run normally.
 """
 
+import importlib.util
 from pathlib import Path
 
 import mne
 import pytest
+
+collect_ignore = []
+if importlib.util.find_spec("specparam") is None:
+    collect_ignore += [
+        "test_specparam_basemodule.py",
+        "test_specparam_features.py",
+    ]
 
 
 @pytest.fixture(scope="session")

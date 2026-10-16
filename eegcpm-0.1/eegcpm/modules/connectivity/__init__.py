@@ -1,5 +1,6 @@
 """Connectivity analysis module."""
 
+import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,6 +9,8 @@ import numpy as np
 
 from eegcpm.pipeline.base import BaseModule, ModuleResult
 from eegcpm.data.conn_rois import get_roi_names, get_network_indices, CONN_NETWORKS
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectivityModule(BaseModule):
@@ -836,6 +839,7 @@ class ConnectivityModule(BaseModule):
         freqs = np.linspace(0, sfreq / 2, 256)
         dtf = np.zeros((n_rois, n_rois))
 
+        n_singular = 0
         for freq_idx, freq in enumerate(freqs):
             if fmin <= freq <= fmax:
                 # A(f) = I - sum_k A_k * exp(-2πifkΔt)
@@ -847,16 +851,25 @@ class ConnectivityModule(BaseModule):
                 # H(f) = A(f)^(-1)
                 try:
                     H_f = np.linalg.inv(A_f)
-
-                    # DTF(i->j, f) = |H_f(j,i)|^2 / sum_k |H_f(j,k)|^2
-                    for i in range(n_rois):
-                        for j in range(n_rois):
-                            if i != j:
-                                numerator = np.abs(H_f[j, i])**2
-                                denominator = np.sum(np.abs(H_f[j, :])**2)
-                                dtf[i, j] += numerator / (denominator + 1e-10)
                 except np.linalg.LinAlgError:
-                    pass  # Singular matrix, skip this frequency
+                    # Singular A(f): this frequency cannot be inverted and is
+                    # excluded from the average — counted and logged, never
+                    # silently skipped (P1-F11).
+                    n_singular += 1
+                    continue
+
+                # DTF(i->j, f) = |H_f(j,i)|^2 / sum_k |H_f(j,k)|^2
+                for i in range(n_rois):
+                    for j in range(n_rois):
+                        if i != j:
+                            numerator = np.abs(H_f[j, i])**2
+                            denominator = np.sum(np.abs(H_f[j, :])**2)
+                            dtf[i, j] += numerator / (denominator + 1e-10)
+
+        if n_singular:
+            logger.warning(
+                "DTF: %d of %d frequency bins had a singular A(f) and were "
+                "excluded from the average", n_singular, len(freqs))
 
         # Average over frequency band
         n_freqs = np.sum((freqs >= fmin) & (freqs <= fmax))

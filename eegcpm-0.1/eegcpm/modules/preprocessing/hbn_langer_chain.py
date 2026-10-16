@@ -239,7 +239,9 @@ class _BadChannelDetectorWrapper(_PS):
 
 class _ASRStepWrapper(_PS):
     name = "asr"
-    version = "2.1"  # 2.1: B6 rev2 NEW-4 (method/train_duration/
+    version = "2.2"  # 2.2: B7 rev2 fix 7 (re-interpolate the ASR-excluded
+    # interpolated channels) + B7-N2 output blow-up guard;
+    # 2.1: B6 rev2 NEW-4 (method/train_duration/
     # ref_maxbadchannels exposed in get_config -> golden hash)
 
     def __init__(self, cutoff: float = 20.0,

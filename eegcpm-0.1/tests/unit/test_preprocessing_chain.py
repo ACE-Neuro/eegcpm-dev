@@ -252,7 +252,13 @@ def test_post_reference_cz_variance_greater_than_zero():
 # --- Toolbox QC module + named-chain CLI wiring (2026-08-04) ---
 
 def test_recording_qc_metrics_emits_schema():
-    """The promoted QC module emits the full per-recording schema."""
+    """The promoted QC module emits the full per-recording schema (P1-F10).
+
+    The B3-era keys `residual_ocular_maxcorr`/`residual_ocular_pass` are gone:
+    the in-sample correlation is informational only (after the OLS EOG
+    regression it is near zero *by construction*), and the ocular gate is
+    `blink_residual_ratio`/`blink_residual_pass`, which needs `raw_pre`.
+    """
     import mne
     from eegcpm.modules.qc.hbn_recording_qc import (
         recording_qc_metrics, EOG_HYDROCEL_NAMES,
@@ -264,32 +270,76 @@ def test_recording_qc_metrics_emits_schema():
     raw = mne.io.RawArray(data, info)
     row = recording_qc_metrics(raw, task="RestingState",
                                subject_id="sub-test")
-    for key in ["duration_post_s", "line_noise_residual_ratio",
-                "residual_ocular_maxcorr", "residual_ocular_pass",
-                "emg_proxy_30_45_ratio", "bad_channels_n", "task",
-                "subject_id"]:
+    for key in ["duration_post_s", "n_times_post", "line_noise_residual_ratio",
+                "residual_ocular_maxcorr_insample",
+                "blink_residual_ratio", "blink_residual_pass", "blink_n",
+                "blink_channel", "emg_proxy_30_45_ratio", "bad_channels_n",
+                "task", "subject_id"]:
         assert key in row, f"missing QC key: {key}"
-    assert row["residual_ocular_maxcorr"] < 0.30  # independent noise
-    assert row["residual_ocular_pass"] is True
+    assert "residual_ocular_maxcorr" not in row
+    assert "residual_ocular_pass" not in row
+    assert row["residual_ocular_maxcorr_insample"] < 0.30  # independent noise
+    # Without `raw_pre` the gate must not run and must not report a pass.
+    assert row["blink_residual_ratio"] is None
+    assert row["blink_residual_pass"] is None
+    assert row["blink_residual_reason"] == "raw_pre_missing"
+    # The EGI EOG names are present in this fixture (typed `eeg`), so the
+    # bipolar proxy still resolves them (it looks at names, not types).
+    assert all(c in raw.ch_names for c in EOG_HYDROCEL_NAMES)
+    assert np.isfinite(row["residual_ocular_maxcorr_insample"])
 
 
-def test_recording_qc_ocular_detection():
-    """A recording with strong EOG->scalp leakage must fail the
-    residual-ocular gate."""
+def test_recording_qc_blink_gate_detects_residual_ocular_activity():
+    """Strong blink leakage left in the scalp must fail the ocular gate.
+
+    Replaces the old in-sample-correlation check, which was vacuous: the EOG
+    regression subtracts the EOG signal from the EEG, so the correlation
+    between them is ~0 whether or not the blinks were actually removed. The
+    blink-locked frontal amplitude ratio measures the *residual* directly.
+    """
     import mne
-    from eegcpm.modules.qc.hbn_recording_qc import recording_qc_metrics
-    ch_names = [f"E{i}" for i in range(1, 129)] + ["Cz"]
+    from eegcpm.modules.qc.hbn_recording_qc import (
+        OCULAR_GATE, recording_qc_metrics,
+    )
+    ch_names = ["Fp1", "Fp2", "F7", "F8", "Fz", "Pz", "Cz"] + [
+        f"E{i}" for i in (8, 14, 17, 21, 25, 125, 126, 127, 128)
+    ]
     rng = np.random.RandomState(1)
-    data = rng.normal(size=(129, 5000)) * 1e-6
+    sfreq, seconds = 500.0, 60.0
+    n_times = int(sfreq * seconds)
+    data = rng.normal(size=(len(ch_names), n_times)) * 3e-6
+    blink = np.exp(-0.5 * ((np.arange(int(0.3 * sfreq)) / sfreq - 0.15) / 0.06) ** 2)
+    frontal = [ch_names.index(ch) for ch in ("Fp1", "Fp2", "F7", "F8", "Fz")]
     eog1 = ch_names.index("E8")
-    # leak E8 into all scalp channels strongly
-    for i in range(129):
-        if i != eog1:
-            data[i] = data[i] * 0.1 + data[eog1] * 0.9
-    info = mne.create_info(ch_names, 500.0, "eeg")
-    raw = mne.io.RawArray(data, info)
-    row = recording_qc_metrics(raw, task="X")
-    assert row["residual_ocular_pass"] is False
+    for onset in np.arange(5.0, seconds - 5.0, 4.0):
+        start = int(onset * sfreq)
+        data[eog1, start:start + blink.size] += 250e-6 * blink
+        for idx in frontal:
+            data[idx, start:start + blink.size] += 200e-6 * blink
+    info = mne.create_info(ch_names, sfreq, "eeg")
+    raw_pre = mne.io.RawArray(data.copy(), info, verbose=False)
+
+    # Post-chain data with the blinks still in the scalp: the gate fails.
+    row = recording_qc_metrics(
+        mne.io.RawArray(data.copy(), info, verbose=False),
+        task="X", raw_pre=raw_pre,
+    )
+    assert row["blink_n"] > 0
+    assert row["blink_residual_ratio"] is not None
+    assert row["blink_residual_ratio"] >= OCULAR_GATE
+    assert row["blink_residual_pass"] is False
+
+    # Post-chain data with the blinks regressed out: the gate passes.
+    cleaned = data.copy()
+    coeffs = np.linalg.lstsq(
+        data[[eog1]].T, data[frontal].T, rcond=None)[0]
+    cleaned[frontal] = data[frontal] - (data[[eog1]].T @ coeffs).T
+    row_clean = recording_qc_metrics(
+        mne.io.RawArray(cleaned, info, verbose=False),
+        task="X", raw_pre=raw_pre,
+    )
+    assert row_clean["blink_residual_ratio"] < OCULAR_GATE
+    assert row_clean["blink_residual_pass"] is True
 
 
 def test_named_chain_resolves():

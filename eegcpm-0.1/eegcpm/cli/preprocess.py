@@ -9,17 +9,62 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 
-from ..workflow.state import WorkflowStateManager, WorkflowState, ProcessingStatus, StepRecord
+from ..workflow.state import (
+    WorkflowStateManager,
+    WorkflowState,
+    ProcessingStatus,
+    StepRecord,
+    _make_json_serializable,
+)
 from ..core.config import load_preprocessing_spec
 from ..core.config_hash import resolved_config_hash
 from ..core.paths import EEGCPMPaths, clear_run_outputs, fail_run_outputs
 from ..modules.preprocessing import PreprocessingPipeline
 from ..modules.qc.preprocessed_qc import PreprocessedQC
+from ..modules.qc.hbn_recording_qc import recording_qc_metrics
 from ..data.event_mapping import get_event_mapping_for_run, translate_event_codes
 from ..core.task_config import TaskConfig
 from ..modules.qc.quality_assessment import extract_metrics_from_qc_result
 from ..modules.qc.metrics_io import save_qc_metrics_json
 from ..data.bids_utils import supported_formats, find_eeg_run_files, read_raw_eeg
+
+
+def _write_run_qc_metrics(
+    *,
+    run_output: Path,
+    subject_id: str,
+    session: str,
+    task: str,
+    run_num: str,
+    status: str,
+    reason: str,
+    extra: dict | None = None,
+) -> Path:
+    """Write ``..._qc_metrics.json`` for a FAILED/EXCLUDED run (P1-F10).
+
+    A recording that never produced a FIF must still leave a QC record: without
+    it a downstream QC table cannot distinguish "excluded for contamination"
+    from "not processed yet". The payload is deliberately minimal (status +
+    reason + run identity, no HTML) and goes through the sidecar encoder so
+    numpy scalars and non-finite values are safe.
+    """
+    payload = {
+        "subject_id": subject_id,
+        "session": session,
+        "task": task,
+        "run": run_num,
+        "status": status,
+        "reason": reason,
+        "created_utc": datetime.now().isoformat(),
+    }
+    if extra:
+        payload.update(extra)
+    json_path = (
+        Path(run_output)
+        / f"{subject_id}_ses-{session}_task-{task}_run-{run_num}_qc_metrics.json"
+    )
+    save_qc_metrics_json(_make_json_serializable(payload), json_path)
+    return json_path
 
 
 def _subject_status(run_statuses: List[ProcessingStatus]) -> ProcessingStatus:
@@ -196,6 +241,7 @@ def preprocess_command(args):
                     # *this* run FAILED, never re-save the previous row.
                     workflow = None
                     result = None
+                    run_output = None
                     try:
                         # One workflow row per run.
                         workflow = WorkflowState(
@@ -314,9 +360,24 @@ def preprocess_command(args):
                             preproc_step.output_path = str(run_output)
                             preproc_step.metadata = result.metadata
 
-                            # Extract bad channel information from metadata
+                            # Extract bad channel information from metadata.
+                            # P1-F5/F10: the canonical chain reports the
+                            # detector's findings under
+                            # `metadata['bad_channel_detection']`
+                            # (`detected` + per-channel `reasons`); the legacy
+                            # `bad_channels` dialect is kept as a fallback.
                             removed_channels = {}
-                            if 'bad_channels' in result.metadata:
+                            detector_meta = result.metadata.get(
+                                'bad_channel_detection') or {}
+                            if detector_meta:
+                                reasons_map = detector_meta.get('reasons') or {}
+                                for ch in (detector_meta.get('detected') or []):
+                                    criteria = reasons_map.get(ch) or ['detected']
+                                    if not isinstance(criteria, (list, tuple)):
+                                        criteria = [criteria]
+                                    removed_channels[str(ch)] = ', '.join(
+                                        str(c) for c in criteria)
+                            elif 'bad_channels' in result.metadata:
                                 bad_ch_meta = result.metadata['bad_channels']
                                 bad_channel_list = bad_ch_meta.get(
                                     'bad_channels', [])
@@ -418,6 +479,18 @@ def preprocess_command(args):
                                     pipeline=args.pipeline,
                                     qc_report_path=html_filename
                                 )
+                                # Per-recording chain QC row (P1-F10): duration,
+                                # line-noise/EMG proxies, blink-residual gate,
+                                # ASR burden, block-rejection fraction. Stored in
+                                # the same metrics JSON so the HBN QC table can be
+                                # built without re-reading the FIFs.
+                                metrics_data['recording_qc'] = recording_qc_metrics(
+                                    result.outputs['data'],
+                                    task,
+                                    subject_id,
+                                    chain_metadata=result.metadata,
+                                    raw_pre=raw,
+                                )
                                 json_path = run_output / \
                                     f"{subject_id}_ses-{session}_task-{task}_run-{run_num}_qc_metrics.json"
                                 save_qc_metrics_json(metrics_data, json_path)
@@ -446,6 +519,20 @@ def preprocess_command(args):
                             preproc_step.metadata = result.metadata
                             preproc_step.error_message = (
                                 f"excluded: {excluded.get('reason')}")
+                            # A failed/excluded run still leaves a QC metrics
+                            # record (status + reason, no HTML): downstream QC
+                            # tables must be able to tell an excluded recording
+                            # from a missing one (P1-F10).
+                            _write_run_qc_metrics(
+                                run_output=run_output,
+                                subject_id=subject_id,
+                                session=session,
+                                task=task,
+                                run_num=run_num,
+                                status=ProcessingStatus.EXCLUDED.value,
+                                reason=f"excluded: {excluded.get('reason')}",
+                                extra={'excluded': excluded},
+                            )
                             console.print(
                                 f"      [yellow]⊘ Run {run_num} excluded "
                                 f"({excluded.get('reason')})[/yellow]")
@@ -453,6 +540,16 @@ def preprocess_command(args):
                             preproc_step.status = ProcessingStatus.FAILED
                             preproc_step.completed_at = datetime.now()
                             preproc_step.error_message = str(result.errors)
+                            _write_run_qc_metrics(
+                                run_output=run_output,
+                                subject_id=subject_id,
+                                session=session,
+                                task=task,
+                                run_num=run_num,
+                                status=ProcessingStatus.FAILED.value,
+                                reason="; ".join(str(e) for e in result.errors),
+                                extra={'errors': [str(e) for e in result.errors]},
+                            )
                             console.print(
                                 f"      [red]✗ Run {run_num} failed: {result.errors}[/red]")
 
@@ -478,6 +575,18 @@ def preprocess_command(args):
                                 run_num=run_num,
                                 output_files=result.output_files,
                                 error=run_error,
+                            )
+                        # Crashed run == FAILED run: leave the same minimal QC
+                        # record (status + reason) when the run directory exists.
+                        if run_output is not None:
+                            _write_run_qc_metrics(
+                                run_output=run_output,
+                                subject_id=subject_id,
+                                session=session,
+                                task=task,
+                                run_num=run_num,
+                                status=ProcessingStatus.FAILED.value,
+                                reason=f"run error: {run_error}",
                             )
                         if workflow is None:
                             workflow = WorkflowState(

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
@@ -13,6 +15,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -168,18 +172,25 @@ def scan_connectivity_options(project_root: Path, pipeline: str) -> dict[str, An
                 continue
             try:
                 with np.load(sample, allow_pickle=True) as npz:
-                    for key in npz.files:
-                        parsed = parse_connectivity_key(key)
-                        if parsed is None:
-                            continue
-                        parsed_values["conditions"].add(parsed.condition)
-                        parsed_values["windows"].add(parsed.window)
-                        parsed_values["methods"].add(parsed.method)
-                        parsed_values["bands"].add(parsed.band)
-                        parsed_values["statistics"].add(parsed.statistic)
-                        parsed_values["keys"].add(parsed.raw)
-            except Exception:
+                    keys = list(npz.files)
+            except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile) as exc:
+                # A corrupt/unreadable sample archive must not silently drop its
+                # task/variant from the option lists — record which file failed
+                # and why (P1-F11).
+                logger.warning(
+                    "option discovery: unreadable connectivity archive %s (%s)",
+                    sample, exc)
                 continue
+            for key in keys:
+                parsed = parse_connectivity_key(key)
+                if parsed is None:
+                    continue
+                parsed_values["conditions"].add(parsed.condition)
+                parsed_values["windows"].add(parsed.window)
+                parsed_values["methods"].add(parsed.method)
+                parsed_values["bands"].add(parsed.band)
+                parsed_values["statistics"].add(parsed.statistic)
+                parsed_values["keys"].add(parsed.raw)
 
     options.update({
         "tasks": sorted(tasks),

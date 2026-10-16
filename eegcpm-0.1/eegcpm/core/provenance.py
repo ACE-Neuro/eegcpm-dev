@@ -273,6 +273,14 @@ def stale_output_patterns(subject_id: str) -> List[str]:
 
     Used to delete a previous run's artifacts before writing new ones so a re-run
     can never leave a mix of old and new files in the output directory (B4-K5).
+
+    Includes the **hidden atomic-writer temp files** (B5-A5): a SIGKILL between
+    ``writer(tmp)`` and ``os.replace(tmp, path)`` leaves ``.{subject}_...tmp*``
+    behind, and nothing else would ever clean them (the process that knew the
+    name is gone). They are scoped to this subject's prefix, so a concurrent
+    writer for another subject is never touched. Single-writer assumption: two
+    processes writing the *same* subject concurrently are not supported — the
+    stale sweep would delete the other writer's in-flight temp file.
     """
     return [
         f"{subject_id}_roi_tc.npz",
@@ -284,4 +292,10 @@ def stale_output_patterns(subject_id: str) -> List[str]:
         f"{subject_id}_*_stc-lh.stc",
         f"{subject_id}_*_stc-rh.stc",
         f"{subject_id}_*_source_qc.html",
+        f"{subject_id}_crosstalk.npz",
+        # Hidden temp leftovers of this module's atomic writers (B5-A5):
+        # `.{name}.tmp`, `.{subject}_{cond}_stc.tmp*`, `.{subject}_roi_tc.tmp.npz`,
+        # `.{subject}-cov.tmp-cov.fif`, `.{subject}-inv.tmp-inv.fif`, ...
+        f".{subject_id}_*",
+        f".{subject_id}-*",
     ]

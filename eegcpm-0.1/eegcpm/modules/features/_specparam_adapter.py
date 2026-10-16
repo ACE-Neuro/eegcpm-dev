@@ -19,11 +19,14 @@ mismatch.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Literal, Optional, Tuple
 
 import numpy as np
 
+
+logger = logging.getLogger(__name__)
 
 # Allowed backends
 SPECPARAM_BACKENDS = ("specparam", "fooof")
@@ -108,6 +111,21 @@ def get_modeled_and_power(model: Any) -> Tuple[np.ndarray, np.ndarray]:
     return modeled, power
 
 
+def _get_metric_or_none(results: Any, key: str) -> Any:
+    """``results.get_metrics(key)`` or ``None`` when the key is not exposed.
+
+    The RMSE cross-check tries candidate metric names because the specparam
+    library renamed them across versions. An unknown key is logged (recorded)
+    and treated as "this candidate does not exist" — never as an RMSE value
+    (P1-F11: no silent ``except: continue``).
+    """
+    try:
+        return results.get_metrics(key)
+    except (KeyError, ValueError, AttributeError) as exc:
+        logger.debug("specparam metrics: candidate key %r unavailable (%s)", key, exc)
+        return None
+
+
 def specparam_rmse(model: Any) -> float:
     """Get the binding RMSE for a fitted SpectralModel.
 
@@ -127,13 +145,10 @@ def specparam_rmse(model: Any) -> float:
     if hasattr(model, "results") and hasattr(model.results, "metrics"):
         lib_rmse = None
         for key in ("rmse", "error_rmse", "gof_rmse"):
-            try:
-                v = model.results.get_metrics(key)
-                if v is not None:
-                    lib_rmse = float(v)
-                    break
-            except Exception:
-                continue
+            v = _get_metric_or_none(model.results, key)
+            if v is not None:
+                lib_rmse = float(v)
+                break
         if lib_rmse is not None:
             if abs(lib_rmse - in_house) > 1e-6:
                 raise RuntimeError(

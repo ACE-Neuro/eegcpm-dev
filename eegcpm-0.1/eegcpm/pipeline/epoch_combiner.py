@@ -4,6 +4,8 @@ This module combines epochs from multiple accepted runs of the same task,
 enabling better SNR and more trials for subsequent analysis.
 """
 
+import logging
+
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
@@ -39,6 +41,9 @@ class EpochCombinationResult:
             self.runs_included = []
         if self.n_epochs_per_run is None:
             self.n_epochs_per_run = {}
+
+
+logger = logging.getLogger(__name__)
 
 
 class EpochCombiner:
@@ -80,8 +85,12 @@ class EpochCombiner:
         if self.verbose:
             try:
                 print(*args, **kwargs)
-            except BrokenPipeError:
-                pass  # Ignore broken pipe errors in non-verbose contexts
+            except BrokenPipeError as exc:
+                # stdout was closed (piped into `head` etc.). Record it and
+                # stop printing instead of silently swallowing the condition
+                # (P1-F11).
+                logger.debug("stdout closed, dropping verbose output: %s", exc)
+                self.verbose = False
 
     def combine_runs(
         self,

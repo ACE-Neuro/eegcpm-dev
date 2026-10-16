@@ -229,9 +229,10 @@ class ERPFeatureModule(BaseModule):
             features[f"{comp_name}_mean"] = np.mean(avg_data)
 
         if "area_under_curve" in self.metrics:
-            # Integrate over time window
+            # Integrate over time window (np.trapezoid: `np.trapz` is deprecated
+            # in numpy 2.x and removed in numpy 2.5)
             dt = np.mean(np.diff(win_times))
-            auc = np.trapz(avg_data, dx=dt)
+            auc = np.trapezoid(avg_data, dx=dt)
             features[f"{comp_name}_auc"] = auc
 
         return features

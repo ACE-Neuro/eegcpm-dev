@@ -6,6 +6,8 @@ generating diagnostic plots (PSD, channel variance, time series, correlations)
 with HTML report output.
 """
 
+import logging
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,6 +17,8 @@ import numpy as np
 
 from .base import BaseQC, QCMetric, QCResult
 
+
+logger = logging.getLogger(__name__)
 
 class RawQC(BaseQC):
     """
@@ -122,7 +126,15 @@ class RawQC(BaseQC):
 
         # 4. Line noise
         line_noise = self._compute_line_noise_ratio(raw, eeg_picks_good)
-        status = "ok" if line_noise < 3 else ("warning" if line_noise < 5 else "bad")
+        if np.isfinite(line_noise):
+            status = "ok" if line_noise < 3 else ("warning" if line_noise < 5 else "bad")
+        else:
+            # A failed measurement must not look like a clean recording (B7 rev2).
+            status = "warning"
+            result.add_note(
+                "Line noise ratio could not be computed (see log); reported "
+                "as NaN, not a false 0.0"
+            )
         result.add_metric(QCMetric("Line Noise Ratio", line_noise, "x", status))
 
         # 5. Generate plots
@@ -223,7 +235,9 @@ class RawQC(BaseQC):
             Ratio of line frequency power to neighboring frequency power
         """
         if len(picks) == 0:
-            return 0.0
+            # No usable channels: NaN, not a false 0.0 "clean" reading (B7 rev2).
+            logger.warning("line-noise ratio: no channels to compute a PSD from")
+            return float("nan")
 
         try:
             psd = raw.compute_psd(picks=picks, fmin=1, fmax=100, verbose=False)
@@ -241,8 +255,11 @@ class RawQC(BaseQC):
                 np.mean(powers[neighbor_mask]) if np.any(neighbor_mask) else 1
             )
             return float(line_power / neighbor_power) if neighbor_power > 0 else 0
-        except Exception:
-            return 0.0
+        except Exception as exc:
+            # A failed measurement is NOT a clean recording: report NaN and
+            # record why, so the caller can flag it (B7 rev2 fix 9).
+            logger.warning("line-noise ratio could not be computed: %s", exc)
+            return float("nan")
 
     def _plot_psd(
         self, raw: mne.io.BaseRaw, picks: np.ndarray
@@ -672,8 +689,10 @@ def run_raw_qc_batch(
             index_builder.add_subject(subject_id, result.status, html_filename)
             results.append(result)
 
-        except Exception as e:
-            print(f"Error processing {raw_path}: {e}")
+        except Exception as exc:
+            # One broken recording must not stop the batch, but it must not be
+            # silently absent from the results either (P1-F11).
+            logger.warning("error processing %s: %s", raw_path, exc)
             continue
 
     # Save index

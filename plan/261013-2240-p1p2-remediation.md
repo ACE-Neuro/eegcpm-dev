@@ -988,3 +988,23 @@ renaming hard-coded ROI names; REST API; user management; `_legacy` code (exclud
    (3) relative near-flat floor; no chain reordering (detector stays step 4; EOG regression / ICA
    keep handling ocular removal downstream). Validate on pilot5 × 3 tasks and the user's other
    dataset; target: clean recordings within budget.
+6. **ASR high-pass design (B7-N2, Opus B7 final audit 2026-10-16 — ⛔ open user decision, blocks
+   B8; recorded, deliberately NOT implemented in B7 rev2):** `eegprep.clean_asr` at `cutoff=20` on
+   the chain's 0.1-Hz-high-passed data rewrites most of a *clean* recording — measured evidence:
+   `repaired_fraction = 0.762` on the e2e fixture (audit 0.76; 0.63 after the rev2
+   ERP-topography fixture change), **94 % of <0.5 Hz power and 52 % of 0.5–2 Hz power removed**
+   (audit probe), and a blow-up regime (2.6e16–5.7e16 µV output with moderate spatial mixing;
+   calibration covariance condition number 9e4–1.4e6 — a separate 32-channel near-duplicate probe
+   returned 4.6e15 µV at condition number 2.2e8). B7 rev2 adds the loud guard
+   (`asr_output_magnitude_blowup`, `ASRStep` fails before any write-back; blow-ups can no longer
+   be misattributed to the block-rejection gate) and the `repaired_fraction`/ERP-retention bounds,
+   but does not change the numerics. Options:
+   (i) compute the ASR correction on a **≥0.5–1 Hz high-passed copy** of the data and add the
+   correction to the 0.1-Hz data (keeps the 0.1 Hz chain and downstream results; isolates the ASR
+   calibration/correction from slow drift and the high-pass phase);
+   (ii) move to a **1 Hz chain variant** (changes the chain composition, the golden hash and every
+   downstream result — needs a full re-validation);
+   (iii) **keep as-is** with the guard + the documented distortion (status quo of B7 rev2).
+   The choice changes what the B8 Checkpoint-B real-data verification validates, so B8 must not
+   proceed until the user picks one. Probes: `/tmp/opencode/b7rev2_probe{1,4,6}.py`; evidence in
+   `planning/VERIFICATION_TODO.md` (B7 rev2 section).

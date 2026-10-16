@@ -19,6 +19,220 @@ import mne
 from .base import BaseQC, QCMetric, QCResult
 from .html_report import HTMLReportBuilder
 
+# mne 1.13.2 exposes the minimum-norm API only under ``mne.minimum_norm``
+# (plan §0.2); the top-level aliases are gone.
+from mne.minimum_norm import (
+    apply_inverse,
+    get_cross_talk,
+    make_inverse_operator,
+    make_inverse_resolution_matrix,
+)
+
+
+#: Methods ``mne.minimum_norm.make_inverse_resolution_matrix`` supports.
+CROSSTALK_METHODS = ("MNE", "dSPM", "sLORETA")
+#: Depth weighting of the QC-only fixed-orientation inverse operator.
+CROSSTALK_DEPTH = 0.8
+
+
+def label_vertex_indices(label, src) -> np.ndarray:
+    """Global source-space indices of a ``Label``/``BiHemiLabel`` (lh then rh).
+
+    ``get_cross_talk``'s ``idx`` handling tests ``type(idx[0]) is Label``, so a
+    ``BiHemiLabel`` (every midline CONN ROI) raises ``IndexError`` — the library
+    call in the plan is only possible with explicit integer index lists (probed
+    2026-10-16; the integer-list summary is numerically identical to the
+    single-``Label`` summary: max abs difference 0.0).
+    """
+    lh = src[0]["vertno"]
+    rh = src[1]["vertno"]
+    if getattr(label, "hemi", None) == "both":
+        idx_lh = np.searchsorted(lh, label.lh.vertices)
+        idx_rh = len(lh) + np.searchsorted(rh, label.rh.vertices)
+        return np.concatenate([idx_lh, idx_rh])
+    if getattr(label, "hemi", None) == "lh":
+        return np.searchsorted(lh, label.vertices)
+    return len(lh) + np.searchsorted(rh, label.vertices)
+
+
+def build_qc_fixed_operator_pair(fwd, info, noise_cov, *, depth: float = CROSSTALK_DEPTH):
+    """QC-only fixed-orientation forward/inverse pair for the crosstalk matrix.
+
+    Returns ``(fwd_fixed, inv_fixed)``.
+
+    **Documented deviation from the plan's literal recipe** (probed 2026-10-16,
+    mne 1.13.2): ``make_inverse_operator(info, fwd_fixed, noise_cov, fixed=True,
+    depth=0.8)`` raises ``ValueError`` ("For a fixed orientation inverse solution
+    with depth weighting, the forward solution must be free-orientation and in
+    surface orientation"). mne's own compatibility table requires a
+    **surface-oriented, free-orientation** forward for fixed-orientation +
+    depth weighting, so the *inverse* is built from
+    ``convert_forward_solution(fwd, surf_ori=True, force_fixed=False)``; the
+    resulting operator is still fixed-orientation (``n_orient_inv == 1``). The
+    ``force_fixed`` forward is needed separately for the resolution matrix.
+
+    This pair approximates the production ``loose=0.2`` operator with
+    ``fixed=True`` (no loose orientation), which is what
+    ``make_inverse_resolution_matrix`` can consume directly.
+    """
+    if info is None:
+        raise ValueError("crosstalk: 'info' is required to build the QC operator pair")
+    if noise_cov is None:
+        raise ValueError("crosstalk: 'noise_cov' is required to build the QC operator pair")
+    fwd_surf = mne.convert_forward_solution(
+        fwd, surf_ori=True, force_fixed=False, use_cps=True, verbose=False
+    )
+    fwd_fixed = mne.convert_forward_solution(
+        fwd, surf_ori=True, force_fixed=True, use_cps=True, verbose=False
+    )
+    inv_fixed = make_inverse_operator(
+        info, fwd_surf, noise_cov, fixed=True, depth=depth, verbose=False
+    )
+    return fwd_fixed, inv_fixed
+
+
+def crosstalk_from_resmat(resmat: np.ndarray, src, labels: List[Any]) -> np.ndarray:
+    """ROI x ROI relative crosstalk from a resolution matrix (plan §B7 task 8).
+
+    ``get_cross_talk(..., mode='mean', norm=False)`` returns **one whole
+    source-space STC per label** (the mean CTF across the label's vertices), so
+    the per-pair ratio is a two-step computation::
+
+        ctf_i = get_cross_talk(resmat, src, verts_i, mode='mean')[0]  # or the i-th STC
+        C[i, j] = mean(|ctf_i in label j|) / mean(|ctf_i in label i|)
+
+    **Direction convention (B7 rev2 fix 5; verified against mne 1.13.2 source:
+    "the columns of the resolution matrix are the PSFs and the rows are the
+    CTFs").** ``ctf_i`` is the mean over label ``i``'s vertices of the
+    resolution-matrix *rows*, i.e. how a true source anywhere appears in the
+    estimate at ROI ``i``. Therefore ``C[i, j]`` is the relative leakage
+    **from ROI j (source, column) into ROI i (target, row)** — row = target,
+    column = source. ``C[i, i] == 1`` by construction, values > 1 are possible
+    (leakage can exceed the in-ROI amplitude), and the matrix is directional
+    (``C[i, j] != C[j, i]`` in general).
+    """
+    n_rois = len(labels)
+    verts_all = [label_vertex_indices(label, src) for label in labels]
+    ctfs = [
+        get_cross_talk(resmat, src, list(verts), mode="mean", norm=False, verbose=False)
+        for verts in verts_all
+    ]
+    crosstalk = np.zeros((n_rois, n_rois))
+    for i, ctf_i in enumerate(ctfs):
+        inside = float(np.mean(np.abs(ctf_i.in_label(labels[i]).data)))
+        for j in range(n_rois):
+            outside = float(np.mean(np.abs(ctf_i.in_label(labels[j]).data)))
+            crosstalk[i, j] = outside / inside if inside > 0 else np.nan
+    return crosstalk
+
+
+def compute_crosstalk_matrix(
+    fwd,
+    info,
+    noise_cov,
+    labels: List[Any],
+    *,
+    method: str = "dSPM",
+    lambda2: float = 1.0 / 9.0,
+    depth: float = CROSSTALK_DEPTH,
+) -> np.ndarray:
+    """Crosstalk matrix through the mne library path (``get_cross_talk``).
+
+    ``method`` must be one of :data:`CROSSTALK_METHODS` (mne does not provide a
+    resolution matrix for eLORETA). The ROI x ROI matrix is ``(n_rois, n_rois)``.
+    """
+    if method not in CROSSTALK_METHODS:
+        raise ValueError(
+            f"crosstalk: method {method!r} is not supported by "
+            f"make_inverse_resolution_matrix (supported: {CROSSTALK_METHODS})"
+        )
+    fwd_fixed, inv_fixed = build_qc_fixed_operator_pair(
+        fwd, info, noise_cov, depth=depth
+    )
+    resmat = make_inverse_resolution_matrix(
+        fwd_fixed, inv_fixed, method=method, lambda2=lambda2, verbose=False
+    )
+    return crosstalk_from_resmat(resmat, fwd_fixed["src"], labels)
+
+
+def compute_crosstalk_matrix_numpy(
+    fwd,
+    info,
+    noise_cov,
+    labels: List[Any],
+    *,
+    method: str = "dSPM",
+    lambda2: float = 1.0 / 9.0,
+    depth: float = CROSSTALK_DEPTH,
+    align_signs: bool = False,
+) -> np.ndarray:
+    """Independent numpy mirror of :func:`compute_crosstalk_matrix` (critic N-3).
+
+    Builds the inverse matrix with plain numpy (``apply_inverse`` on the identity
+    evoked → ``R = J @ G``) and averages the label's CTF rows directly, i.e.
+    without calling ``get_cross_talk`` or ``in_label``. Used by the tests to
+    cross-check the library path, and (``align_signs=True``) as the **primary**
+    crosstalk matrix saved by the source module (B7 rev2 fix 6).
+
+    ``align_signs=True`` multiplies each vertex row by ``mne.label_sign_flip``
+    before averaging. ``get_cross_talk(mode='mean')`` does **not** do this, so the
+    two variants differ wherever a label's surface normals disagree (probed
+    2026-10-16: 34 % of vertices flipped on average, max |ΔC| 2.08) — the
+    library's signed mean cancels across sulcal walls. The flip-aligned matrix
+    is the primary artifact because the pipeline extracts ROI time courses with
+    ``mode='mean_flip'`` (the same sign alignment): rank agreement with the
+    extracted data is 0.76 (flip-aligned) vs 0.61 (library signed mean).
+
+    Direction convention (B7 rev2 fix 5): rows of the resolution matrix are
+    CTFs, so ``C[i, j]`` is the leakage **from ROI j into ROI i** (row =
+    target, column = source); see :func:`crosstalk_from_resmat`.
+    """
+    fwd_fixed, inv_fixed = build_qc_fixed_operator_pair(
+        fwd, info, noise_cov, depth=depth
+    )
+    ch_names = list(info["ch_names"])
+    bads = list(info.get("bads") or [])
+    # The inverse operator's `info` is a copy of the *forward's* info and carries
+    # no `sfreq` (probed 2026-10-16), so the identity evoked is built on the
+    # caller's info; only the channel order/bads are taken from the operator.
+    if list(inv_fixed["info"]["ch_names"]) != ch_names:
+        raise RuntimeError(
+            "crosstalk cross-check: inverse-operator channel order differs from "
+            f"the supplied info ({list(inv_fixed['info']['ch_names'])[:3]}... vs "
+            f"{ch_names[:3]}...)"
+        )
+    good = [i for i, ch in enumerate(ch_names) if ch not in bads]
+
+    n_channels = len(ch_names)
+    evoked_identity = mne.EvokedArray(
+        np.eye(n_channels), info, tmin=0.0, verbose=False
+    )
+    invmat = apply_inverse(
+        evoked_identity, inv_fixed, lambda2=lambda2, method=method,
+        pick_ori=None, verbose=False,
+    ).data
+    # Mirror mne's make_inverse_resolution_matrix: drop the bad-channel columns
+    # of the inverse matrix and use the matching rows of the leadfield.
+    invmat = invmat[:, good]
+    leadfield = fwd_fixed["sol"]["data"][good]
+    resolution = invmat @ leadfield
+
+    src = fwd_fixed["src"]
+    n_rois = len(labels)
+    verts_all = [label_vertex_indices(label, src) for label in labels]
+    crosstalk = np.zeros((n_rois, n_rois))
+    for i, verts_i in enumerate(verts_all):
+        rows = resolution[verts_i]
+        if align_signs:
+            flips = mne.label_sign_flip(labels[i], src)
+            rows = rows * np.asarray(flips)[:, None]
+        row_i = rows.mean(axis=0)
+        inside = float(np.mean(np.abs(row_i[verts_i])))
+        for j, verts_j in enumerate(verts_all):
+            outside = float(np.mean(np.abs(row_i[verts_j])))
+            crosstalk[i, j] = outside / inside if inside > 0 else np.nan
+    return crosstalk
+
 
 class SourceQC(BaseQC):
     """Quality control for source reconstruction results."""
@@ -204,36 +418,47 @@ class SourceQC(BaseQC):
                 result.add_figure("roi_correlation", self.fig_to_base64(fig_corr))
                 plt.close(fig_corr)
 
-        # Figure 7: Source crosstalk matrix (if forward/inverse operators available)
-        fwd = data.get('forward')
-        inv_op = data.get('inverse_operator')
+        # Figure 7: Source crosstalk matrix (computed by the source module, P2-F14)
         labels = data.get('labels')
+        crosstalk = data.get('crosstalk_matrix')
+        # Which matrix this is (B7 rev2 fix 6): the source module saves the
+        # flip-aligned estimator as the primary artifact; recorded so the
+        # statistics below are never ambiguous.
+        crosstalk_kind = data.get('crosstalk_matrix_kind') or "unspecified"
 
-        if fwd is not None and inv_op is not None and labels is not None:
-            try:
-                # Compute or load crosstalk matrix
-                crosstalk = data.get('crosstalk_matrix')
-                if crosstalk is None:
-                    # Compute crosstalk (expensive, should ideally be pre-computed)
-                    result.add_note("Computing crosstalk matrix (this may take several minutes)...")
-                    crosstalk = self._compute_crosstalk_matrix(fwd, inv_op, labels, method)
+        if crosstalk is not None and labels is not None:
+            roi_names = parsed['roi_names'] if parsed else [label.name for label in labels]
+            fig_crosstalk = self._plot_crosstalk_matrix(
+                crosstalk, roi_names, threshold=0.3, kind=crosstalk_kind)
+            if fig_crosstalk:
+                result.add_figure("crosstalk_matrix", self.fig_to_base64(fig_crosstalk))
+                plt.close(fig_crosstalk)
 
-                # Plot crosstalk matrix
-                roi_names = parsed['roi_names'] if parsed else [label.name for label in labels]
-                fig_crosstalk = self._plot_crosstalk_matrix(crosstalk, roi_names, threshold=0.3)
-                if fig_crosstalk:
-                    result.add_figure("crosstalk_matrix", self.fig_to_base64(fig_crosstalk))
-                    plt.close(fig_crosstalk)
-
-                    # Add crosstalk statistics to metadata
-                    mask = ~np.eye(crosstalk.shape[0], dtype=bool)
-                    off_diag = crosstalk[mask]
-                    n_high = np.sum(np.triu(crosstalk, k=1) > 0.3)
-                    result.metadata['crosstalk_mean'] = float(np.mean(off_diag))
-                    result.metadata['crosstalk_high_pairs'] = int(n_high)
-
-            except Exception as e:
-                result.add_note(f"Crosstalk matrix computation failed: {str(e)}")
+                # Add crosstalk statistics to metadata. `C[i, j]` is the leakage
+                # from ROI j (source, column) into ROI i (target, row) — row =
+                # target, column = source (B7 rev2 fix 5; the earlier "source
+                # row" wording was backwards). The count is over *directed*
+                # off-diagonal entries of the matrix supplied above
+                # (`crosstalk_kind`) — the old `triu` count silently halved
+                # reciprocal pairs (B7-A3). The key names say so.
+                mask = ~np.eye(crosstalk.shape[0], dtype=bool)
+                off_diag = crosstalk[mask]
+                n_high = np.sum((crosstalk > 0.3) & mask)
+                result.metadata['crosstalk_mean'] = float(np.mean(off_diag))
+                result.metadata['n_directed_above_0.3'] = int(n_high)
+                result.metadata['crosstalk_matrix_kind'] = str(crosstalk_kind)
+                result.add_note(
+                    f"Crosstalk statistics are computed on the '{crosstalk_kind}' "
+                    "matrix (row = target ROI, column = source ROI: C[i, j] is "
+                    "the leakage from ROI j into ROI i)."
+                )
+        elif labels is not None:
+            # No matrix supplied: say so. The old code silently recomputed an
+            # invalid matrix here (P2-F14).
+            result.add_note(
+                "Crosstalk matrix not provided (compute_crosstalk disabled or the "
+                "run had no forward/covariance); the crosstalk figure is omitted."
+            )
 
         # Overall status
         has_roi = parsed is not None and len(parsed.get('roi_names', [])) > 0
@@ -242,7 +467,91 @@ class SourceQC(BaseQC):
         # Trial-level source mode is valid with ROI data and no saved STCs.
         result.status = "ok" if has_roi and (has_roi_data or has_stc) else "bad"
 
+        # P2-F15: coverage/validity metrics must be able to fail the QC status.
+        if result.status == "ok" and self._roi_validity_bad(result, data, parsed, kwargs):
+            result.status = "bad"
+
         return result
+
+    def _roi_validity_bad(
+        self,
+        result: QCResult,
+        data: Dict[str, Any],
+        parsed: Optional[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+    ) -> bool:
+        """True when a ROI/condition validity metric is `bad` (P2-F15).
+
+        Checks, in order:
+
+        - any ``roi_vertex_counts < roi_min_vertices`` (an under-populated ROI
+          silently produces a noisy time course);
+        - any non-finite value in a ROI array (NaN/Inf silently poisons features);
+        - a condition without its ``{cond}_times`` axis (the time axis is not
+          fabricated any more — a missing axis means the archive is not the
+          expected evoked/trial output).
+        """
+        bad = False
+        roi_data = data.get('roi_data') or {}
+        roi_min_vertices = int(
+            kwargs.get('roi_min_vertices', data.get('roi_min_vertices', 3))
+        )
+
+        counts = roi_data.get('roi_vertex_counts')
+        if counts is not None:
+            counts = np.asarray(counts).astype(float)
+            n_under = int(np.sum(counts < roi_min_vertices))
+            result.add_metric(QCMetric(
+                "ROI Vertex Counts",
+                int(np.min(counts)) if counts.size else 0,
+                f"min vertices (min required {roi_min_vertices})",
+                "ok" if n_under == 0 else "bad",
+            ))
+            if n_under:
+                result.add_note(
+                    f"{n_under} ROI(s) have fewer than {roi_min_vertices} vertices"
+                )
+                bad = True
+
+        if parsed is not None:
+            non_finite = []
+            for cond, arr in (parsed.get('data') or {}).items():
+                if isinstance(arr, np.ndarray) and not np.isfinite(arr).all():
+                    non_finite.append(cond)
+            result.add_metric(QCMetric(
+                "ROI Values Finite",
+                len(non_finite),
+                f"(conditions with non-finite values: {', '.join(non_finite)})"
+                if non_finite else "(all finite)",
+                "ok" if not non_finite else "bad",
+            ))
+            if non_finite:
+                result.add_note(
+                    "Non-finite ROI values in condition(s): "
+                    + ", ".join(non_finite)
+                )
+                bad = True
+
+            conditions = list(parsed.get('conditions') or [])
+            missing_times = [
+                cond for cond in conditions if cond not in (parsed.get('times') or {})
+            ]
+            if conditions:
+                result.add_metric(QCMetric(
+                    "Condition Time Axes",
+                    len(conditions) - len(missing_times),
+                    f"of {len(conditions)} conditions",
+                    "ok" if not missing_times else "bad",
+                ))
+            if missing_times:
+                result.add_note(
+                    "Missing time axis for condition(s): "
+                    + ", ".join(missing_times)
+                    + " (the archive has no '{cond}_times' key)"
+                )
+                bad = True
+
+        return bad
 
     def _count_rois_with_data(self, parsed: Dict[str, Any]) -> int:
         """Count ROIs with finite, non-zero samples in at least one condition."""
@@ -523,8 +832,14 @@ class SourceQC(BaseQC):
         if not roi_names or not conditions or not data:
             return None
 
-        # Get sampling rate from kwargs
-        sfreq = kwargs.get('sfreq', 500.0)
+        # P2-F15: the time axis comes from the archive's `{cond}_times` key only.
+        # The old fallback fabricated `arange(n_times)/sfreq` centred on the
+        # middle sample with a hard-coded `sfreq=500.0` default, which silently
+        # mislabelled every latency when the archive carried its own axis (or a
+        # different sampling rate). Conditions without an axis are skipped.
+        conditions = [cond for cond in conditions if cond in times_dict and cond in data]
+        if not conditions:
+            return None
 
         # ROI names are already unique (e.g. "DefaultMode.LP_L" / "DefaultMode.LP_R";
         # P2-F2), so display them as stored — no L/R guessing from list order.
@@ -532,18 +847,11 @@ class SourceQC(BaseQC):
 
         n_rois = len(roi_names)
 
-        # Get time axis from first condition
+        # Time axis from the first condition that has one (all must share it).
         first_cond = conditions[0]
-        if first_cond in times_dict:
-            times = times_dict[first_cond]
-        else:
-            # Fallback: construct time axis
-            # Determine n_times from data (handle both 2D and 3D)
-            first_data = data[first_cond]
-            n_times = first_data.shape[-1]  # Last dimension is always time
-            times = np.arange(n_times) / sfreq
-            # Center at 0 (assume epoch from -tmin to tmax)
-            times = times - times[len(times) // 2]
+        times = np.asarray(times_dict[first_cond])
+        if times.size != data[first_cond].shape[-1]:
+            return None
 
         # Detect if data is trial-level (3D) or evoked (2D)
         first_data = data[first_cond]
@@ -651,13 +959,16 @@ class SourceQC(BaseQC):
 
         n_rois = len(roi_names)
 
-        # Get time axis
-        first_cond = conditions[0]
-        if first_cond not in times_dict:
+        # Get time axis (from the archive; P2-F15 — never fabricated)
+        if not conditions or conditions[0] not in times_dict:
             return None
+        first_cond = conditions[0]
 
-        times = times_dict[first_cond]
-        sfreq = 1.0 / np.median(np.diff(times)) if len(times) > 1 else 500.0
+        times = np.asarray(times_dict[first_cond])
+        if len(times) < 2:
+            # A single-sample axis cannot support windowed correlation.
+            return None
+        sfreq = 1.0 / np.median(np.diff(times))
 
         # Define sliding windows (in seconds)
         window_size = 0.1  # 100 ms
@@ -845,168 +1156,40 @@ class SourceQC(BaseQC):
         plt.tight_layout()
         return fig
 
-    def _compute_crosstalk_matrix(
-        self,
-        fwd: mne.Forward,
-        inv_op: mne.minimum_norm.InverseOperator,
-        labels: List[mne.Label],
-        method: str = 'dSPM'
-    ) -> np.ndarray:
-        """
-        Compute source crosstalk (point spread function) matrix.
-
-        Simulates a point source at each ROI, applies forward-inverse round trip,
-        and measures how much signal leaks into other ROIs.
-
-        This quantifies the spatial resolution limitations of the inverse solution
-        and identifies ROI pairs that will show spurious correlation due to
-        volume conduction/spatial leakage.
-
-        Parameters
-        ----------
-        fwd : mne.Forward
-            Forward solution (head model + sensor positions)
-        inv_op : mne.minimum_norm.InverseOperator
-            Inverse operator (dSPM, sLORETA, etc.)
-        labels : list of mne.Label
-            ROI parcellation (one Label per ROI)
-        method : str
-            Inverse method ('dSPM', 'sLORETA', 'eLORETA')
-
-        Returns
-        -------
-        crosstalk : ndarray (n_rois, n_rois)
-            Crosstalk matrix where C[i,j] = correlation between:
-            - Simulated source at ROI i
-            - Reconstructed signal at ROI j
-            Diagonal = 1.0 (perfect reconstruction of own ROI)
-            Off-diagonal = spatial leakage (should be low, e.g., < 0.3)
-
-        Notes
-        -----
-        High crosstalk (e.g., > 0.5) indicates ROI pairs whose connectivity
-        estimates are unreliable due to spatial leakage.
-
-        This computation is expensive (O(n_rois)) but only needs to be done
-        once per source reconstruction configuration. The result should be
-        saved and reused for all downstream connectivity/feature analyses.
-
-        References
-        ----------
-        Hauk, O., & Stenroos, M. (2014). A framework for the design of flexible
-        cross-talk functions for spatial filtering of EEG/MEG data.
-        Human brain mapping, 35(4), 1792-1802.
-        """
-        n_rois = len(labels)
-        n_times = 100  # Short simulation (crosstalk is time-independent)
-        sfreq = inv_op['info']['sfreq']
-
-        # Initialize crosstalk matrix
-        crosstalk = np.zeros((n_rois, n_rois))
-
-        # Extract label centers (vertices with peak in each ROI)
-        label_centers = []
-        for label in labels:
-            # Use the vertex closest to the label's center of mass
-            if len(label.vertices) > 0:
-                center_vertex = label.vertices[len(label.vertices) // 2]
-                label_centers.append((label.hemi, center_vertex))
-            else:
-                label_centers.append(None)
-
-        # For each ROI, simulate point source and measure leakage
-        for i, label_i in enumerate(labels):
-            if label_centers[i] is None:
-                continue
-
-            hemi, vertex = label_centers[i]
-
-            # Create source estimate with delta function at ROI i
-            # (1 µA·m at t=0, zero elsewhere)
-            stc_simulated = mne.SourceEstimate(
-                data=np.zeros((len(fwd['src'][0]['vertno']) + len(fwd['src'][1]['vertno']), n_times)),
-                vertices=[fwd['src'][0]['vertno'], fwd['src'][1]['vertno']],
-                tmin=0,
-                tstep=1.0 / sfreq
-            )
-
-            # Set delta at vertex
-            if hemi == 'lh':
-                vertex_idx = np.where(fwd['src'][0]['vertno'] == vertex)[0]
-                if len(vertex_idx) > 0:
-                    stc_simulated.data[vertex_idx[0], 0] = 1e-9  # 1 nA·m
-            else:
-                vertex_idx = np.where(fwd['src'][1]['vertno'] == vertex)[0]
-                if len(vertex_idx) > 0:
-                    lh_nverts = len(fwd['src'][0]['vertno'])
-                    stc_simulated.data[lh_nverts + vertex_idx[0], 0] = 1e-9
-
-            # Forward model: source -> sensors
-            try:
-                evoked_simulated = mne.apply_forward(fwd, stc_simulated, inv_op['info'])
-
-                # Inverse solution: sensors -> reconstructed sources
-                stc_reconstructed = mne.minimum_norm.apply_inverse(
-                    evoked_simulated,
-                    inv_op,
-                    lambda2=1.0 / 9.0,  # Standard SNR=3
-                    method=method,
-                    verbose=False
-                )
-
-                # Extract ROI time courses from reconstructed source
-                roi_timeseries_reconstructed = mne.extract_label_time_course(
-                    stc_reconstructed,
-                    labels,
-                    fwd['src'],
-                    mode='mean',
-                    verbose=False
-                )  # (n_rois, n_times)
-
-                # Measure correlation between simulated (delta at i) and reconstructed (all ROIs)
-                # Simulated signal at ROI i
-                simulated_roi_i = np.zeros(n_times)
-                simulated_roi_i[0] = 1.0  # Delta function
-
-                # Correlation with each reconstructed ROI
-                for j in range(n_rois):
-                    reconstructed_roi_j = roi_timeseries_reconstructed[j, :]
-
-                    # Correlation (handles zero-variance case)
-                    if np.std(reconstructed_roi_j) > 1e-10:
-                        corr = np.corrcoef(simulated_roi_i, reconstructed_roi_j)[0, 1]
-                        crosstalk[i, j] = np.abs(corr)  # Use absolute value
-                    else:
-                        crosstalk[i, j] = 0.0
-
-            except Exception as e:
-                print(f"Warning: Crosstalk computation failed for ROI {i} ({labels[i].name}): {e}")
-                # Leave as zeros for this ROI
-                continue
-
-        # Ensure diagonal is 1.0 (ROI reconstructs itself perfectly)
-        np.fill_diagonal(crosstalk, 1.0)
-
-        return crosstalk
+    # ------------------------------------------------------------------
+    # Crosstalk matrix (P2-F14, plan §B7 task 8)
+    # ------------------------------------------------------------------
+    #
+    # The crosstalk matrix is computed at module level (``compute_crosstalk_matrix``
+    # below) by the source module, which owns the forward/covariance and caches the
+    # result; QC only plots it. The old in-QC implementation ("simulate a point
+    # source at the label's middle vertex, reconstruct, correlate") was invalid and
+    # is deleted: it correlated a delta waveform with a dSPM magnitude and set the
+    # diagonal to 1.0 by hand.
 
     def _plot_crosstalk_matrix(
         self,
         crosstalk: np.ndarray,
         roi_names: List[str],
-        threshold: float = 0.3
+        threshold: float = 0.3,
+        kind: str = "unspecified",
     ) -> plt.Figure:
         """
-        Plot source crosstalk (point spread function) matrix.
+        Plot source crosstalk (cross-talk function) matrix.
 
         Parameters
         ----------
         crosstalk : ndarray (n_rois, n_rois)
-            Crosstalk matrix from _compute_crosstalk_matrix()
+            Crosstalk matrix from the source module's crosstalk computation
+            (``crosstalk_matrix`` in the QC data).
         roi_names : list of str
             ROI names for axis labels
         threshold : float
             Threshold for highlighting problematic ROI pairs (default: 0.3)
-            Pairs with crosstalk > threshold shown in red
+            Directed entries with crosstalk > threshold shown in red
+        kind : str
+            Which matrix this is (e.g. ``crosstalk_flip_aligned``); printed in
+            the statistics block so the numbers are never ambiguous.
 
         Returns
         -------
@@ -1016,9 +1199,10 @@ class SourceQC(BaseQC):
         Notes
         -----
         Visualization includes:
-        - Full crosstalk matrix (heatmap)
-        - Red boxes around high-crosstalk ROI pairs (> threshold)
-        - Statistics: % of ROI pairs with high crosstalk
+        - Full crosstalk matrix (heatmap; row i = target ROI, column j = source
+          ROI: ``C[i, j]`` is the leakage **from ROI j into ROI i**, B7 rev2 fix 5)
+        - Red boxes around high-crosstalk directed entries (> threshold)
+        - Statistics: % of directed ROI pairs with high crosstalk
         - Interpretation guide
         """
         n_rois = len(roi_names)
@@ -1035,7 +1219,7 @@ class SourceQC(BaseQC):
 
         # Colorbar
         cbar = plt.colorbar(im, ax=ax_main, fraction=0.046, pad=0.02)
-        cbar.set_label('Crosstalk (Absolute Correlation)', rotation=270, labelpad=25, fontsize=12)
+        cbar.set_label('Crosstalk (relative leakage ratio)', rotation=270, labelpad=25, fontsize=12)
 
         # Highlight high-crosstalk pairs with red boxes
         high_crosstalk = np.where(crosstalk > threshold)
@@ -1060,10 +1244,10 @@ class SourceQC(BaseQC):
         ax_main.set_xticklabels(short_names, rotation=90, fontsize=8, ha='center')
         ax_main.set_yticklabels(short_names, fontsize=8)
 
-        ax_main.set_title('Source Crosstalk Matrix (Point Spread Function)',
+        ax_main.set_title('Source Crosstalk Matrix (Cross-Talk Functions)',
                          fontsize=14, fontweight='bold', pad=15)
-        ax_main.set_xlabel('Target ROI', fontsize=12)
-        ax_main.set_ylabel('Source ROI', fontsize=12)
+        ax_main.set_xlabel('Source ROI', fontsize=12)
+        ax_main.set_ylabel('Target ROI', fontsize=12)
 
         # Add grid for readability
         ax_main.set_xticks(np.arange(n_rois) - 0.5, minor=True)
@@ -1093,10 +1277,16 @@ class SourceQC(BaseQC):
         ax_text = fig.add_subplot(gs[1, 1])
         ax_text.axis('off')
 
-        # Compute statistics
-        n_pairs = n_rois * (n_rois - 1) // 2  # Unique pairs (upper triangle)
-        n_high_crosstalk = np.sum(np.triu(crosstalk, k=1) > threshold)
-        pct_high_crosstalk = 100 * n_high_crosstalk / n_pairs if n_pairs > 0 else 0
+        # Compute statistics. The matrix is directional: the resolution-matrix
+        # rows are cross-talk functions, so C[i, j] is the leakage FROM ROI j
+        # (source, column) INTO ROI i (target, row) — B7 rev2 fix 5. The
+        # highlighted cells and the count below are directed off-diagonal
+        # entries — consistent with the QC metadata `n_directed_above_0.3`
+        # (B7-A3).
+        mask_off = ~np.eye(n_rois, dtype=bool)
+        n_directed = n_rois * (n_rois - 1)
+        n_high_crosstalk = np.sum((crosstalk > threshold) & mask_off)
+        pct_high_crosstalk = 100 * n_high_crosstalk / n_directed if n_directed > 0 else 0
 
         mean_crosstalk = np.mean(off_diag_values)
         median_crosstalk = np.median(off_diag_values)
@@ -1104,8 +1294,10 @@ class SourceQC(BaseQC):
 
         stats_text = f"""
 CROSSTALK STATISTICS
+Matrix: {kind}
+(row = target ROI, column = source ROI)
 
-Total ROI pairs: {n_pairs}
+Total ROI pairs (directed): {n_directed}
 High crosstalk (>{threshold}): {n_high_crosstalk} ({pct_high_crosstalk:.1f}%)
 
 Mean crosstalk: {mean_crosstalk:.3f}
@@ -1224,18 +1416,18 @@ ROI pairs requiring correction.
                 </div>
             ''')
 
-            builder.add_raw_html(f'<div class="figure-container"><img src="data:image/png;base64,{result.figures["crosstalk_matrix"]}" alt="Crosstalk Matrix"><div class="figure-caption">Point spread function showing spatial leakage between ROI pairs. Red boxes indicate high-crosstalk pairs (> 0.3) requiring leakage correction for reliable connectivity estimation.</div></div>')
+            builder.add_raw_html(f'<div class="figure-container"><img src="data:image/png;base64,{result.figures["crosstalk_matrix"]}" alt="Crosstalk Matrix"><div class="figure-caption">Cross-talk function matrix showing spatial leakage between ROI pairs (directed: row = target ROI, column = source ROI — C[i, j] is the leakage from ROI j into ROI i; matrix: {result.metadata.get("crosstalk_matrix_kind", "unspecified")}). Red boxes indicate high-crosstalk directed pairs (> 0.3) requiring leakage correction for reliable connectivity estimation.</div></div>')
 
             # Add crosstalk statistics if available
             if 'crosstalk_mean' in result.metadata:
                 mean_ct = result.metadata['crosstalk_mean']
-                n_high = result.metadata.get('crosstalk_high_pairs', 0)
+                n_high = result.metadata.get('n_directed_above_0.3', 0)
                 builder.add_raw_html(f'''
                     <div style="background-color: #e8f4f8; padding: 10px; border-radius: 5px; margin-top: 10px;">
                         <p style="margin: 5px 0; font-size: 0.9em;">
                             <strong>Crosstalk Statistics:</strong><br>
                             Mean off-diagonal crosstalk: {mean_ct:.3f}<br>
-                            High-crosstalk pairs (&gt; 0.3): {n_high}
+                            High-crosstalk directed pairs (&gt; 0.3): {n_high}
                         </p>
                     </div>
                 ''')

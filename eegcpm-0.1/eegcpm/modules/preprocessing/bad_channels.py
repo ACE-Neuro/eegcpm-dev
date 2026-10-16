@@ -11,11 +11,15 @@ Author: EEGCPM Development Team
 Created: 2025-01
 """
 
+import logging
+
 from typing import List, Optional, Set, Tuple, Union
 import mne
 import numpy as np
 from scipy import stats
 
+
+logger = logging.getLogger(__name__)
 
 class BadChannelDetector:
     """
@@ -623,36 +627,46 @@ def detect_and_interpolate_bad_channels(
     # Separate interpolatable and zero-variance channels
     interpolatable = [ch for ch in bad_channels if ch not in zero_variance_channels]
 
-    # Interpolate if requested (only for non-zero variance channels)
+    # Interpolate if requested (only for non-zero variance channels).
+    # B6-K9/P1-F11: the two `except Exception: print(...)` handlers that used to
+    # silently *drop* the bad channels (when the montage could not be set or the
+    # interpolation failed) are gone. A requested interpolation that cannot run
+    # must fail loudly — dropping channels changes the montage and the sensor
+    # count behind the caller's back.
     if config.get('interpolate', True) and len(interpolatable) > 0:
         # Need montage for interpolation
         if raw.get_montage() is None:
             try:
                 montage = mne.channels.make_standard_montage('standard_1020')
                 raw.set_montage(montage, on_missing='warn', verbose=False)
-            except Exception as e:
-                print(f"Warning: Could not set montage for interpolation: {e}")
-                # Drop zero-variance channels instead
-                if len(zero_variance_channels) > 0:
-                    raw.drop_channels(zero_variance_channels)
-                return raw, bad_channels
+            except (ValueError, RuntimeError) as exc:
+                raise RuntimeError(
+                    f"cannot interpolate {len(interpolatable)} bad channel(s): "
+                    f"no montage on the data and the standard_1020 montage "
+                    f"could not be set ({exc}); refusing to drop channels "
+                    f"silently"
+                ) from exc
 
         # Set only interpolatable channels as bad
         raw.info['bads'] = interpolatable
 
         try:
             raw.interpolate_bads(reset_bads=True, verbose=False)
-        except Exception as e:
-            print(f"Warning: Interpolation failed: {e}")
-            # If interpolation fails, just drop the bad channels
-            if len(interpolatable) > 0:
-                raw.drop_channels(interpolatable)
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"interpolation of {len(interpolatable)} bad channel(s) "
+                f"failed ({exc}); refusing to drop channels silently"
+            ) from exc
 
-    # Drop zero-variance channels (cannot be interpolated)
+    # Drop zero-variance channels (cannot be interpolated). This is deliberate
+    # and recorded: the channels are returned in `bad_channels` and logged.
     if len(zero_variance_channels) > 0:
         # Filter to only existing channels
         existing_zero_var = [ch for ch in zero_variance_channels if ch in raw.ch_names]
         if len(existing_zero_var) > 0:
+            logger.warning(
+                "dropping %d zero-variance channel(s) that cannot be "
+                "interpolated: %s", len(existing_zero_var), existing_zero_var)
             raw.drop_channels(existing_zero_var)
 
     return raw, bad_channels
