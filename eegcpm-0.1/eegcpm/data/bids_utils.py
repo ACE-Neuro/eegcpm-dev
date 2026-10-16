@@ -9,6 +9,7 @@ import mne
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
+import json
 import re
 
 # Supported EEG formats: (extension, file_type_name)
@@ -98,6 +99,14 @@ def read_raw_eeg(input_file: Path):
             }
             channels_to_set = {ch: t for ch,
                                t in misc_channels.items() if ch in raw.ch_names}
+            # Digital trigger/status channels are recorded as regular EEG by
+            # some systems (e.g. Neuroscan BrainVision exports named
+            # "Trigger"); type them as stim so montage/interpolation/source
+            # steps never treat them as EEG electrodes.
+            for ch in raw.ch_names:
+                if (ch.lower() in ('trigger', 'trig', 'status')
+                        and ch not in channels_to_set):
+                    channels_to_set[ch] = 'stim'
             if channels_to_set:
                 raw.set_channel_types(channels_to_set)
         case "fif":
@@ -126,6 +135,22 @@ def read_raw_eeg(input_file: Path):
     channels_to_set = {ch: t for ch, t in extra_eeg_channels.items() if ch in raw.ch_names}
     if channels_to_set:
         raw.set_channel_types(channels_to_set)
+
+    # BIDS sidecar: PowerLineFrequency is the recording's declared line
+    # frequency (50 EU / 60 US). Record it on the info so frequency-aware
+    # consumers (zapline, the QC line-noise metric) do not have to guess or
+    # auto-detect. A missing sidecar or a non-numeric value ("n/a") is a
+    # legitimate no-op; a malformed JSON file fails loudly.
+    sidecar = input_file.with_name(
+        input_file.stem.rsplit("_", 1)[0] + "_eeg.json"
+    )
+    if sidecar.exists():
+        with open(sidecar, encoding="utf-8-sig") as fh:
+            sidecar_meta = json.load(fh)
+        line_freq = sidecar_meta.get("PowerLineFrequency")
+        if isinstance(line_freq, (int, float)) and line_freq > 0:
+            with raw.info._unlock():
+                raw.info["line_freq"] = float(line_freq)
 
     return raw
 

@@ -23,6 +23,7 @@ from .montage import MontageStep
 from .artifacts import ArtifactAnnotationStep
 from .drop_flat import DropFlatStep
 from .zapline import ZaplineStep
+from .set_channel_types import SetChannelTypesStep
 
 # Step registry - maps config names to step classes
 STEP_REGISTRY = {
@@ -40,6 +41,7 @@ STEP_REGISTRY = {
     'artifacts': ArtifactAnnotationStep,
     'drop_flat': DropFlatStep,
     'zapline': ZaplineStep,
+    'set_channel_types': SetChannelTypesStep,
 }
 
 __all__ = [
@@ -59,5 +61,6 @@ __all__ = [
     'ArtifactAnnotationStep',
     'DropFlatStep',
     'ZaplineStep',
+    'SetChannelTypesStep',
     'STEP_REGISTRY',
 ]

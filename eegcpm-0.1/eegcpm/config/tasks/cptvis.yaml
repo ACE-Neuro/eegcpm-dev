@@ -1,0 +1,87 @@
+# Task Configuration: CPT-Visual (cptvis)
+# Gradual Continuous Performance Task - Visual modality
+#
+# Event codes match the trial_type column in BIDS events.tsv
+# (target = city/urban image + sound, press SPACE; nontarget = nature, withhold).
+#
+# Dataset: 25SusAttn (Neuroscan 64-ch, 1000 Hz, 50 Hz line).
+# VEOG/HEOG are recorded and typed as EOG by the BrainVision loader, so the
+# ICA step's EOG-informed component detection (find_bads_eog) is active.
+
+task_name: cptvis
+description: 'Sustained attention / inhibitory-control task (visual modality).
+
+  Images cross-fade every ~1 s; press SPACE for city/urban images (target),
+
+  withhold for nature images (non-target).'
+
+task_type: event-related
+
+primary_event:
+  name: all_stimuli
+  codes: [1, 2]
+
+tmin: -0.2
+tmax: 0.8
+baseline: [-0.2, 0.0]
+
+conditions:
+  - name: target
+    event_codes: ["target"]
+    description: "City/urban image - spacebar press required (go)"
+  - name: nontarget
+    event_codes: ["nontarget"]
+    description: "Nature image - withhold response (no-go)"
+
+# Behavioral response mapping
+response_mapping:
+  response_column: key_resp.corr
+  categories:
+    correct: 1
+    incorrect: 0
+    no_response: n/a
+  rt_column: key_resp.rt
+  rt_min: 100
+  rt_max: 1200
+
+# ERP components
+erp_components:
+  - name: N1
+    search_window: [0.08, 0.16]
+    channels: [POz, Oz, PO3, PO4]
+    polarity: negative
+    description: Visual N1 (sensory response)
+  - name: N2
+    search_window: [0.2, 0.35]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Conflict / no-go N2
+  - name: P3
+    search_window: [0.35, 0.6]
+    channels: [Pz, CPz, Cz]
+    polarity: positive
+    description: Target detection P3
+
+# Rejection criteria
+reject:
+  eeg: 150e-6
+
+flat:
+  eeg: 1e-6
+
+# Trial binning
+binning:
+  - name: rt_quartiles
+    method: quantile
+    n_bins: 4
+    column: key_resp.rt
+    labels: [fast, medium_fast, medium_slow, slow]
+
+sampling_rate: 1000
+
+notes: |
+  Use phase=="main" filter (set in UI) to exclude practice trials.
+  Visual N1/P1 are strongest at occipito-parietal sites (POz/Oz).
+  N2/P3 contrast target (go) vs nontarget (no-go) trials.
+  VEOG/HEOG are available as EOG channels (typed by the loader); blink
+  components are caught by ICA auto-detection + ICLabel.

@@ -790,6 +790,98 @@ class TestBlinkResidualGate:
         assert result["n_blinks"] > 0
         assert result["frontal_channels"]
 
+    def test_dead_eog_falls_back_to_frontal_proxy(self):
+        """A dead EOG channel must not drive the gate (25SusAttn sub-001 case).
+
+        ``find_eog_events`` thresholds a flat channel's own noise (probed on
+        real data: a VEOG with 1.4 µV of noise reported 92 blinks/min and the
+        gate passed); the rate guard must reject it and retry the frontal
+        proxy instead of reporting a meaningless ratio.
+        """
+        from eegcpm.modules.qc.hbn_recording_qc import blink_residual_ratio
+
+        ch_names = ["Fp1", "Fp2", "F7", "F8", "Fz", "Cz", "VEOG"]
+        ch_types = ["eeg"] * 6 + ["eog"]
+        rng = np.random.default_rng(0)
+        sfreq, seconds = 250.0, 60.0
+        n_times = int(sfreq * seconds)
+        data = rng.standard_normal((len(ch_names), n_times)) * 5e-6
+        data[ch_names.index("VEOG")] = rng.standard_normal(n_times) * 1.4e-6
+        blink = np.exp(-0.5 * ((np.arange(int(0.3 * sfreq)) / sfreq - 0.15) / 0.06) ** 2)
+        frontal = [ch_names.index(ch) for ch in ("Fp1", "Fp2", "F7", "F8")]
+        for onset in np.arange(5.0, seconds - 5.0, 4.0):
+            start = int(onset * sfreq)
+            data[frontal, start:start + blink.size] += (200e-6 * blink)[None, :]
+        raw = mne.io.RawArray(
+            data, mne.create_info(ch_names, sfreq, ch_types), verbose=False)
+
+        result = blink_residual_ratio(raw, raw)
+
+        assert result["blink_channel"] in ("Fp1", "Fp2", "F7", "F8")
+        assert result["blinks_per_minute"] is not None
+        assert 1.0 <= result["blinks_per_minute"] <= 60.0
+        assert any(
+            attempt["channel"] == "VEOG"
+            and attempt["reason"] == "implausible_blink_rate"
+            for attempt in result["attempts"]
+        )
+        assert result["ratio"] is not None
+
+    def test_retyped_eog_channels_are_not_used(self):
+        """A chain that retyped the EOG channels away must not have them used.
+
+        The gate reads ``raw_pre`` (pre-chain types) but the chain's own typing
+        decides what is usable: 25SusAttn's auxiliary electrodes are unusable
+        and the config retypes them to ``misc``, so the gate must fall back to
+        the frontal proxy instead of consuming them.
+        """
+        from eegcpm.modules.qc.hbn_recording_qc import blink_residual_ratio
+
+        ch_names = ["Fp1", "Fp2", "F7", "F8", "Fz", "Cz", "VEOG"]
+        ch_types = ["eeg"] * 6 + ["eog"]
+        rng = np.random.default_rng(0)
+        sfreq, seconds = 250.0, 60.0
+        n_times = int(sfreq * seconds)
+        data = rng.standard_normal((len(ch_names), n_times)) * 5e-6
+        data[ch_names.index("VEOG")] = rng.standard_normal(n_times) * 1.4e-6
+        blink = np.exp(-0.5 * ((np.arange(int(0.3 * sfreq)) / sfreq - 0.15) / 0.06) ** 2)
+        frontal = [ch_names.index(ch) for ch in ("Fp1", "Fp2", "F7", "F8")]
+        for onset in np.arange(5.0, seconds - 5.0, 4.0):
+            start = int(onset * sfreq)
+            data[frontal, start:start + blink.size] += (200e-6 * blink)[None, :]
+        raw_pre = mne.io.RawArray(
+            data, mne.create_info(ch_names, sfreq, ch_types), verbose=False)
+        raw_post = raw_pre.copy()
+        raw_post.set_channel_types({"VEOG": "misc"})
+
+        result = blink_residual_ratio(raw_pre, raw_post)
+
+        assert result["retyped_eog_channels"] == ["VEOG"]
+        assert result["blink_channel"] in ("Fp1", "Fp2", "F7", "F8")
+        assert result["blinks_per_minute"] is not None
+        assert result["ratio"] is not None
+
+    def test_no_usable_blink_channel_never_passes(self, monkeypatch):
+        """Every candidate implausible → pass None with a reason (no false pass)."""
+        from eegcpm.modules.qc import hbn_recording_qc
+        from eegcpm.modules.qc.hbn_recording_qc import blink_residual_ratio
+
+        raw = _eog_raw()
+        monkeypatch.setattr(
+            hbn_recording_qc, "_blink_events", lambda raw_, name: np.arange(10_000)
+        )
+
+        result = blink_residual_ratio(raw, raw)
+
+        assert result["pass"] is None
+        assert result["ratio"] is None
+        assert result["reason"] == "no_usable_blink_channel"
+        assert result["attempts"]
+        assert all(
+            attempt["reason"] == "implausible_blink_rate"
+            for attempt in result["attempts"]
+        )
+
     def test_resampled_post_is_timeline_mismatch(self):
         """B7 rev2 fix 3: blink indices from raw_pre are not usable on a resampled post.
 
@@ -913,3 +1005,41 @@ class TestBlinkResidualGate:
         assert row["bad_channels_n"] == 1
         assert row["blink_residual_pass"] is None
         assert row["blink_residual_reason"] == "raw_pre_missing"
+
+
+class TestRecordingQCLineFrequency:
+    """The line-noise metric measures the recording's declared line frequency.
+
+    2026-10-17 (25SusAttn): the metric was hardcoded to 60 Hz (HBN, US data),
+    so a 50 Hz recording was measured at an irrelevant bin. The loader now
+    records the BIDS ``PowerLineFrequency`` on ``info['line_freq']`` and the
+    metric uses it (60 Hz default when the recording does not declare one).
+    """
+
+    def _raw_with_line_noise(self, line_freq=50.0, sfreq=250.0, seconds=20.0):
+        rng = np.random.default_rng(0)
+        n_times = int(sfreq * seconds)
+        t = np.arange(n_times) / sfreq
+        data = rng.standard_normal((4, n_times)) * 5e-6
+        data += (50e-6 * np.sin(2 * np.pi * line_freq * t))[None, :]
+        return mne.io.RawArray(
+            data,
+            mne.create_info(["Fz", "Cz", "Pz", "Oz"], sfreq, "eeg"),
+            verbose=False,
+        )
+
+    def test_measures_declared_line_frequency_not_60(self):
+        from eegcpm.modules.qc.hbn_recording_qc import recording_qc_metrics
+
+        raw = self._raw_with_line_noise(50.0)
+
+        row_default = recording_qc_metrics(raw, task="cptvis")
+        assert row_default["line_noise_freq_hz"] == 60.0
+
+        with raw.info._unlock():
+            raw.info["line_freq"] = 50.0
+        row_50 = recording_qc_metrics(raw, task="cptvis")
+
+        assert row_50["line_noise_freq_hz"] == 50.0
+        assert (row_50["line_noise_residual_ratio"]
+                > row_default["line_noise_residual_ratio"])

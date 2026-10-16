@@ -6,7 +6,12 @@ design). One row per recording (subject x task).
 
 Metrics:
 - duration_post_s / n_times_post: usable duration after the chain
-- line_noise_residual_ratio: 60 Hz / 20-40 Hz spectral ratio (post)
+- line_noise_residual_ratio: line-frequency / 20-40 Hz spectral ratio (post).
+  The measured frequency is ``info['line_freq']`` when the recording declares
+  it (BIDS ``PowerLineFrequency``, set by the loader) and 60 Hz otherwise
+  (HBN is US data); the frequency used is recorded as
+  ``line_noise_freq_hz``. Measuring a 50 Hz recording at 60 Hz reports an
+  irrelevant bin (found on 25SusAttn, 2026-10-17).
 - blink_residual_ratio: **the ocular gate** (P1-F10). Blinks are detected on
   the *pre-chain* recording (``raw_pre``) through the first available EOG
   channel (EGI HydroCel names first, else ``find_eog_events``' synthetic
@@ -70,6 +75,22 @@ FRONTAL_PROXY_NAMES: Tuple[str, ...] = (
     "Fp1", "Fp2", "Fpz", "AF3", "AF4", "F7", "F8",
     "E1", "E22", "E26", "E33", "E34", "E45", "E46", "E122", "E123",
 )
+#: Band-pass used to *rank* EOG-typed blink-channel candidates (the same band
+#: as the bad-channel detector's B6-NEW-2 selection). Raw-variance ranking is
+#: dominated by electrode DC drift (an infraorbital EOG channel can have a huge
+#: drift variance but few detectable blinks).
+BLINK_SELECTION_BANDPASS_HZ: Tuple[float, float] = (1.0, 10.0)
+#: Plausibility window for the detected blink rate (blinks per minute).
+#: Humans blink roughly 10-20 times/min, so a rate outside this window means
+#: the detection aid is broken rather than the subject unusual: on 25SusAttn
+#: sub-001 (2026-10-17) a **flat** VEOG channel (band-passed std 0.15 µV) made
+#: ``find_eog_events``' data-driven threshold fire on noise and reported 92
+#: blinks/min with ``pass=True``. An implausible candidate is retried with the
+#: next one (frontal proxy included); if every candidate is implausible the
+#: gate returns ``pass=None`` with ``reason='no_usable_blink_channel'`` —
+#: a gate that cannot run must never report a pass.
+MIN_BLINK_RATE_PER_MINUTE: float = 1.0
+MAX_BLINK_RATE_PER_MINUTE: float = 60.0
 
 
 def _first_eog_channel(raw, eog_names: Sequence[str] = EOG_HYDROCEL_NAMES) -> Optional[str]:
@@ -83,6 +104,57 @@ def _first_eog_channel(raw, eog_names: Sequence[str] = EOG_HYDROCEL_NAMES) -> Op
     if len(eog_picks):
         return raw.ch_names[eog_picks[0]]
     return None
+
+
+def _blink_channel_candidates(
+    raw,
+    eog_names: Sequence[str] = EOG_HYDROCEL_NAMES,
+) -> Tuple[List[str], Optional[str]]:
+    """Blink-detection candidates in priority order (best first).
+
+    EGI HydroCel EOG names (in the canonical order, when present) first — the
+    HBN behaviour is unchanged — then EOG-typed channels ranked by variance on
+    the 1-10 Hz band-passed signal, then the frontal scalp proxy
+    (:data:`FRONTAL_PROXY_NAMES`, in order, skipping channels with no usable
+    position). Returns ``(candidates, selection_error)``; the error string is
+    recorded (never silent) when the band-pass ranking had to fall back to raw
+    variance.
+    """
+    import mne
+
+    candidates: List[str] = []
+    for name in eog_names:
+        if name in raw.ch_names and name not in candidates:
+            candidates.append(name)
+
+    eog_picks = [
+        p for p in mne.pick_types(raw.info, eog=True, exclude="bads")
+        if raw.ch_names[p] not in candidates
+    ]
+    selection_error: Optional[str] = None
+    if eog_picks:
+        eog_data = raw.get_data(picks=eog_picks)
+        try:
+            ranked = mne.filter.filter_data(
+                eog_data, float(raw.info["sfreq"]),
+                BLINK_SELECTION_BANDPASS_HZ[0], BLINK_SELECTION_BANDPASS_HZ[1],
+                verbose=False,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            selection_error = f"{type(exc).__name__}: {exc}"
+            ranked = eog_data
+        variances = np.var(ranked, axis=1)
+        for idx in np.argsort(-variances):
+            name = raw.ch_names[eog_picks[int(idx)]]
+            if name not in candidates:
+                candidates.append(name)
+
+    for name in FRONTAL_PROXY_NAMES:
+        if name in raw.ch_names and name not in candidates:
+            candidates.append(name)
+
+    return candidates, selection_error
+
 
 
 def _blink_events(raw, proxy_name: str) -> np.ndarray:
@@ -203,12 +275,33 @@ def blink_residual_ratio(
       pass/fail verdict);
     - the pre and post peak-to-peak amplitudes are measured on identically
       band-passed copies (:data:`BLINK_BANDPASS_HZ`).
+
+    Blink-channel guards (2026-10-17, 25SusAttn real data):
+
+    - candidates are tried best-first — EGI EOG names, then EOG-typed channels
+      ranked by 1-10 Hz band-passed variance, then the frontal scalp proxy —
+      and each candidate's blink rate must be plausible
+      (:data:`MIN_BLINK_RATE_PER_MINUTE` ..
+      :data:`MAX_BLINK_RATE_PER_MINUTE`). A **flat** EOG channel makes
+      ``find_eog_events`` threshold its own noise and reported 92 blinks/min
+      with ``pass=True`` before this guard; now the next candidate is tried and
+      every attempt is recorded under ``attempts``. When no candidate is
+      usable the result is ``pass=None`` with
+      ``reason='no_usable_blink_channel'`` — a gate that cannot run never
+      reports a pass.
+    - a candidate that was EOG-typed in ``raw_pre`` but is no longer EOG-typed
+      in ``raw_post`` (the chain retyped it, e.g. unusable auxiliary
+      electrodes set to ``misc``) is excluded and recorded under
+      ``retyped_eog_channels``: the gate must not consume the channels the
+      chain rejected.
     """
     result: Dict[str, Any] = {
         "ratio": None,
         "pass": None,
         "n_blinks": 0,
         "blink_channel": None,
+        "blinks_per_minute": None,
+        "attempts": [],
         "frontal_channels": [],
         "reason": None,
     }
@@ -236,21 +329,74 @@ def blink_residual_ratio(
         }
         return result
 
-    blink_channel = _first_eog_channel(raw_pre, eog_names)
-    if blink_channel is None:
-        # Synthetic frontal proxy: the most anterior available channel.
-        candidates = [ch for ch in raw_pre.ch_names if ch in FRONTAL_PROXY_NAMES]
-        if not candidates:
-            result["reason"] = "no_eog_or_frontal_channel"
-            return result
-        blink_channel = candidates[0]
-    result["blink_channel"] = blink_channel
-
-    try:
-        events = _blink_events(raw_pre, blink_channel)
-    except Exception as exc:  # mne raises for degenerate/flat reference channels
-        result["reason"] = f"find_eog_events_failed: {exc}"
+    candidates, selection_error = _blink_channel_candidates(raw_pre, eog_names)
+    if selection_error:
+        result["selection_error"] = selection_error
+    # Channels the chain deliberately retyped away must not drive the gate's
+    # event detection: 25SusAttn's auxiliary electrodes are unusable and the
+    # config retypes them to ``misc`` (2026-10-17) — a gate that then used
+    # the pre-chain EOG typing would consume exactly the garbage the chain
+    # rejected.
+    pre_types = dict(zip(raw_pre.ch_names, raw_pre.get_channel_types()))
+    post_types = dict(zip(raw_post.ch_names, raw_post.get_channel_types()))
+    retyped = [
+        ch for ch in candidates
+        if pre_types.get(ch) == "eog" and post_types.get(ch) != "eog"
+    ]
+    if retyped:
+        result["retyped_eog_channels"] = retyped
+        candidates = [ch for ch in candidates if ch not in retyped]
+    if not candidates:
+        result["reason"] = "no_eog_or_frontal_channel"
         return result
+
+    duration_minutes = float(raw_pre.n_times) / float(raw_pre.info["sfreq"]) / 60.0
+    attempts: List[Dict[str, Any]] = []
+    blink_channel: Optional[str] = None
+    events = None
+    blinks_per_minute: Optional[float] = None
+    for candidate in candidates:
+        try:
+            candidate_events = _blink_events(raw_pre, candidate)
+        except Exception as exc:  # mne raises for degenerate/flat reference channels
+            attempts.append({
+                "channel": candidate,
+                "reason": f"find_eog_events_failed: {exc}",
+            })
+            continue
+        n_events = int(candidate_events.size)
+        rate = (n_events / duration_minutes) if duration_minutes > 0 else float("inf")
+        if n_events == 0:
+            attempts.append({
+                "channel": candidate,
+                "n_blinks": 0,
+                "blinks_per_minute": 0.0,
+                "reason": "no_blinks",
+            })
+            continue
+        if not (MIN_BLINK_RATE_PER_MINUTE <= rate <= MAX_BLINK_RATE_PER_MINUTE):
+            # A dead EOG channel makes find_eog_events threshold its own noise
+            # (probed: 92 blinks/min on a flat VEOG); retry the next candidate
+            # instead of reporting a meaningless ratio.
+            attempts.append({
+                "channel": candidate,
+                "n_blinks": n_events,
+                "blinks_per_minute": rate,
+                "reason": "implausible_blink_rate",
+            })
+            continue
+        blink_channel = candidate
+        events = candidate_events
+        blinks_per_minute = rate
+        break
+
+    result["attempts"] = attempts
+    if blink_channel is None:
+        # Every candidate was unusable: no gate, and never a false pass.
+        result["reason"] = "no_usable_blink_channel"
+        return result
+    result["blink_channel"] = blink_channel
+    result["blinks_per_minute"] = blinks_per_minute
 
     frontal_names = _frontal_channels(raw_pre)
     # Identical band-pass on both sides before the ptp (fix 4): the pre
@@ -312,10 +458,19 @@ def recording_qc_metrics(
     F = np.abs(np.fft.rfft(data * win, axis=-1))
     freqs = np.fft.rfftfreq(data.shape[1], d=1.0 / sfreq)
 
-    m60 = (freqs > 58) & (freqs < 62)
+    line_freq = raw_post.info.get("line_freq")
+    if not isinstance(line_freq, (int, float)) or line_freq <= 0:
+        # The metric was hardcoded to 60 Hz (HBN is US data). Recordings that
+        # declare their line frequency through the BIDS sidecar (the loader
+        # sets ``info['line_freq']``) are measured at their own frequency —
+        # measuring a 50 Hz recording at 60 Hz reports an irrelevant bin.
+        line_freq = 60.0
+    line_freq = float(line_freq)
+    mline = (freqs > line_freq - 2) & (freqs < line_freq + 2)
     mbb = (freqs > 20) & (freqs < 40)
+    row["line_noise_freq_hz"] = line_freq
     row["line_noise_residual_ratio"] = float(
-        (F[:, m60].mean() + 1e-30) / (F[:, mbb].mean() + 1e-30))
+        (F[:, mline].mean() + 1e-30) / (F[:, mbb].mean() + 1e-30))
 
     # Residual ocular — informational only (vacuous as a gate after the OLS
     # EOG regression, P1-F10): bipolar EOG proxy vs scalp max |corr|.

@@ -214,7 +214,7 @@ with `plot_alignment` check + crosstalk matrix in QC; 6) re-audit changed areas.
 | B5 | Source hardening + provenance (covariance, trial inversion, eLORETA, BEM, montage) | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev1 applied (N1/N2/A1/A2/A3/A6/A7/N6) → scoped re-audit `approve`, no conditions left (residuals → B6/B7/B8) |
 | B6 | ⛔ Checkpoint A (RPCA) + instrumentation + golden resolved-config hash + P1 tier-2 debt | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev2 (NEW-1…NEW-10) + scoped-re-audit ASR-fix applied; desk-check + suites (2F connectivity-only / 729P) per the re-audit; hash `72c394e7…` |
 | B7 | QC truthfulness, test-suite honesty, CI job | `[x]` **verified 2026-10-16** — Opus final audit `revise` → rev2 (B7-N2 ASR guard + majors) + scoped re-audit: all conditions met (hash `1ef8780d…`; suite 2F connectivity-only / 853P / 0 skipped; chain e2e 18; fsaverage 43/0; gate 108 files / 0 offenders) — **hash later re-pinned to `b47de382…` by the final-verification-audit fix round (F1–F7), see the B8 evidence** |
-| B8 | End-to-end verification prep; ⛔ Checkpoint B (real EGI-129 subject) | `[~]` **task 1 verified 2026-10-16 (code scope)** — final-verification audit `revise` → fixes F1–F7 applied + scoped re-check `confirm-with-notes`; **P1 C1–C6 and P2 conditions 1–4 verified for code scope**; ⛔ Checkpoint B (real data) blocked by the second-dataset path and a green remote CI run (push-gated) — the **ASR high-pass decision §12.6 is resolved** (EEGLAB-standard path implemented 2026-10-16, awaiting audit) |
+| B8 | End-to-end verification prep; ⛔ Checkpoint B (real EGI-129 subject) | `[~]` **task 1 verified 2026-10-16 (code scope)** — final-verification audit `revise` → fixes F1–F7 applied + scoped re-check `confirm-with-notes`; **P1 C1–C6 and P2 conditions 1–4 verified for code scope**; Checkpoint B (real data) gates: second-dataset path **provided** (`~/proj/25SusAttn`, established 2026-10-16); **green remote CI run DONE** (run `38892244381`, success); ASR §12.6 resolved (EEGLAB-standard path + R1 pinv fix, audited/approved 2026-10-16). Remaining: choose 25SusAttn tasks + run the real-data checklists |
 
 B1 evidence (2026-10-14, after rev1 + rev2): focused suite green (six files: executor semantics,
 schema, status persistence [15 tests], reachability, chain, output discovery → **93 passed**);
@@ -801,7 +801,7 @@ decision (a), P1-F2/F7/F9/F13–F22 + B3-K9/B3-K5/B5-N3/B5-A4 + B4-D2**, plan §
       `chain_params`. Evidence, real-data numbers and the new golden hash in the §12.6 evidence
       section below. ⛔ Checkpoint B no longer blocked by this item — **the unblocking fix is R1 (the MATLAB-tolerance pinv patch), not the drift filter**: with R1, **6/6 pilot5 recordings that reach ASR process cleanly** (was 2/6; see the R1–R6 table).
 - [ ] Real-subject end-to-end verification (Checkpoint B artifacts → `planning/audits/`)
-- [ ] **⛔ B8/Checkpoint B open item — green remote CI run (F1, user-gated):**
+- [x] **✅ B8/Checkpoint B open item — green remote CI run (F1):** **DONE 2026-10-16** — run `38892244381` completed **success** (13m47s; first run failed on the missing `pyarrow` parquet engine, fixed in the `pipeline` extra). The previous line's description follows:
       `.github/workflows/pipeline-verification.yml` is tracked with the F1–F7 round (it was
       **untracked** through B7 — the B7 commit message claimed it but never added it), and the
       exact workflow commands are green in a local dry run. A **green remote GitHub run requires
@@ -1322,3 +1322,93 @@ both `get_config`s + `ASRStep` 2.2 → 2.3 / `_ASRStepWrapper` 2.4 → 2.5).
   (`test_connectivity.py::test_wpli_close_to_mne_connectivity`,
   `::test_dwpli_close_to_mne_connectivity`); `test_no_silent_continue` gate green (19 passed,
   108 files / 0 offenders).
+
+
+### 2026-10-17 — Track B pilot: 25SusAttn (user's dataset), setup + first runs
+
+**Scope chosen by the user**: their own dataset first (HBN is public), tasks **`cptvis`**
+(visual GradCPT, attention) + **`stroopvis`** (spatial Stroop, ERP).
+
+**New assets**
+
+- Task configs `eegcpm/config/tasks/cptvis.yaml` (target/nontarget, occipital N1, N2, P3,
+  `key_resp.*`) and `stroopvis.yaml` (congruent/incongruent, N2/N450/P3, `response.*`) —
+  both validated by `TaskConfig.from_yaml`.
+- Preprocessing config `~/proj/25SusAttn/configs/25susattn_optimized.yaml`: montage (sfp) →
+  1 Hz HP → drop_flat → variance bad channels (7 SD) → **interpolate** (missing in the
+  packaged optimized.yaml despite its comment) → zapline (adaptive 50 Hz) → ASR (20,
+  EEGLAB-standard path + R1 pinv fix) → average reference → ICA (EOG-informed auto-detect) →
+  ICLabel (0.5) → 40 Hz LP.
+- Montage `~/proj/25SusAttn/25susattn_64.sfp` from the CapTrak `electrodes.tsv`
+  (64 EEG channels; `coordsystem.json` has NAS/LPA/RPA for a later coregistration).
+
+**Montage findings (all verified on real data)**
+
+1. The TSV has `n/a` coordinates for VEOG/HEOG/EKG/EMG; one NaN row makes MNE's `.sfp`
+   reader scale **every** position to NaN (median-norm divide) → exclude those rows.
+2. `set_montage(match_alias=True)` resolves raw `M1/M2/Cb1/Cb2` to the canonical
+   `TP9/TP10/POO7/POO8`; the .sfp must therefore store those canonical names.
+3. BrainVision records `Trigger` as an EEG channel; the loader now retypes
+   trigger/trig/status → `stim` (`eegcpm/data/bids_utils.py`), regression test
+   `test_preprocess.py::TestReadRawEeg::test_brainvision_trigger_channel_typed_as_stim`.
+4. The dataset **does** have VEOG/HEOG (typed EOG by the loader), so ICA's
+   `find_bads_eog` is active — the earlier "no EOG channels" note was about `eeg.json`.
+
+#### 2026-10-17 — Track B real-data findings + fixes (25SusAttn sub-001)
+
+**Unusable auxiliary channels (dataset-wide).** VEOG in sub-001 is dead
+(mean −206 089 µV, std 1.4 µV); HEOG/EKG/EMG carry mV-scale DC offsets and
+noise (HEOG std 13.8 mV). sub-002/003/010 are similar (VEOG std 1.5–9.2 mV).
+The `eeg.json` says `EOGChannelCount: 0`; the loader types them EOG anyway.
+
+**Fixes (all tested):**
+
+1. **QC blink gate truthfulness** — the gate consumed the dead VEOG:
+   `find_eog_events` thresholds a flat channel's own noise → 1018 "blinks"
+   (92/min) with `blink_residual_pass: true`. Now candidates are ranked by
+   1–10 Hz band-passed variance, each candidate's rate must be plausible
+   (1–60/min), a dead candidate is retried (frontal proxy included), and a gate
+   with no usable candidate returns `pass=None`
+   (`reason='no_usable_blink_channel'`). Candidates the chain deliberately
+   retyped away are excluded (`retyped_eog_channels`). Tests:
+   `test_qc.py::TestBlinkResidualGate::{test_dead_eog_falls_back_to_frontal_proxy,
+   test_no_usable_blink_channel_never_passes, test_retyped_eog_channels_are_not_used}`.
+2. **Zapline frequency** — adaptive detection picked **87.9 Hz** on stroopvis
+   (and reported it as an "additional frequency" on cptvis) and missed the
+   50 Hz line. The 25SusAttn config now uses fixed `fline: 50.0`
+   (`adaptive: false`): 17 components removed, 1.0 dB line reduction.
+3. **QC line-noise metric** — was hardcoded to 60 Hz (HBN/US); now uses
+   `info['line_freq']` (set by the loader from BIDS `PowerLineFrequency`) and
+   records `line_noise_freq_hz`. Honest sub-001 cptvis residual at 50 Hz:
+   **0.151** (the previous 0.033 was an irrelevant 60 Hz bin). Tests:
+   `test_qc.py::TestRecordingQCLineFrequency`, `test_preprocess.py`
+   (BrainVision sidecar → `info['line_freq'] == 50.0`).
+4. **Loader** — trigger/trig/status channels → `stim` (regression test), BIDS
+   `PowerLineFrequency` → `info['line_freq']`.
+5. **New generic step `set_channel_types`** (`steps/set_channel_types.py`,
+   registered; `tests/unit/test_set_channel_types.py`) — the 25SusAttn config
+   retypes VEOG/HEOG/EKG/EMG to `misc`, so EOG-based ICA detection
+   (`find_bads_eog`/`find_bads_ecg`) and the QC gate never consume them.
+6. **Reference** — `projection: true` left the data projector-based (ICLabel
+   warned "does not seem to be referenced to a common average reference");
+   the config now applies a real CAR (`projection: false`).
+
+**First-run numbers (sub-001, cptvis, final config):** 6 bad channels
+(AF4, CP1, Fp1, Fp2, Fpz, PO3) interpolated; ASR repaired 20.5 % of samples,
+window-rejected 0.3 %, output ratio 0.66 (no blow-up); ICA 63 components →
+ICLabel rejected 7 (EOG/ECG auto-detection now a no-op by design); QC status
+`excellent`, `recommended_action: accept`; epochs 598/600 trials (540 target +
+60 nontarget, practice excluded via `phase=='main'`).
+
+**Event-alignment check (2026-10-17).** The PsychoPy timing columns are a
+constant offset from the `events.tsv` `onset` column within each task —
+cptvis: `image_front.started - onset = +0.421 s` (std 0.000, n=600);
+stroopvis: `stroop_arrow.started - onset = -7.679 s` (std 0.000, n=325).
+Both are clock-offset artifacts between the PsychoPy session clock and the
+EEG-time onsets (RTs computed from the PsychoPy columns match the logged
+`response.rt`/`key_resp.rt`), not per-trial jitter, so they cannot smear
+averages. The response-locked average on the cleaned cptvis data shows no
+sharp press artifact (button presses are electrically small here), so the
+absolute stimulus latency cannot be confirmed from EEG alone — flagged for
+the lab's task-timing documentation if component latencies are to be
+interpreted quantitatively.

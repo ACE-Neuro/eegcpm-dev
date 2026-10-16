@@ -482,3 +482,70 @@ class TestReadRawEeg:
 
             assert raw is not None
             assert len(raw.ch_names) == len(sample_raw.ch_names)
+
+    def _write_minimal_brainvision(self, tmpdir, ch_names):
+        """Write a minimal BrainVision ASCII triplet for loader tests."""
+        base = Path(tmpdir) / "test_eeg"
+        vhdr = base.with_suffix(".vhdr")
+        vmrk = base.with_suffix(".vmrk")
+        eeg = base.with_suffix(".eeg")
+
+        n_ch = len(ch_names)
+        ch_lines = "\n".join(
+            f"Ch{i + 1}={name},,0.1" for i, name in enumerate(ch_names)
+        )
+        vhdr.write_text(
+            "Brain Vision Data Exchange Header File Version 1.0\n"
+            "; test fixture\n\n"
+            "[Common Infos]\n"
+            "Codepage=UTF-8\n"
+            "DataFile=test_eeg.eeg\n"
+            "MarkerFile=test_eeg.vmrk\n"
+            "DataFormat=ASCII\n"
+            "DataOrientation=MULTIPLEXED\n"
+            f"NumberOfChannels={n_ch}\n"
+            "SamplingInterval=4000\n\n"
+            "[ASCII Infos]\n"
+            "DecimalSymbol=.\n"
+            "SkipLines=0\n"
+            "SkipColumns=0\n\n"
+            "[Channel Infos]\n"
+            f"{ch_lines}\n"
+        )
+        vmrk.write_text(
+            "Brain Vision Data Exchange Marker File, Version 1.0\n\n"
+            "[Common Infos]\n"
+            "Codepage=UTF-8\n"
+            "DataFile=test_eeg.eeg\n\n"
+            "[Marker Infos]\n"
+        )
+        eeg.write_text("\n".join(",".join(["0"] * n_ch) for _ in range(10)) + "\n")
+        # BIDS sidecar: PowerLineFrequency must reach info['line_freq'].
+        base.with_name("test_eeg.json").write_text(
+            '{"PowerLineFrequency": 50.0, "SamplingFrequency": 250.0}\n'
+        )
+        return vhdr
+
+    def test_brainvision_trigger_channel_typed_as_stim(self):
+        """Trigger/status channels recorded as EEG must become stim channels.
+
+        Neuroscan BrainVision exports record the digital trigger line as a
+        regular channel named "Trigger"; leaving it typed as EEG makes the
+        montage guard fail (a trigger has no electrode position).
+        """
+        ch_names = ["Fz", "Pz", "VEOG", "HEOG", "EKG", "EMG", "Trigger"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vhdr = self._write_minimal_brainvision(tmpdir, ch_names)
+            raw = read_raw_eeg(vhdr)
+
+        types = dict(zip(raw.ch_names, raw.get_channel_types()))
+        assert types["Fz"] == "eeg"
+        assert types["Pz"] == "eeg"
+        assert types["VEOG"] == "eog"
+        assert types["HEOG"] == "eog"
+        assert types["EKG"] == "ecg"
+        assert types["EMG"] == "emg"
+        assert types["Trigger"] == "stim"
+        # BIDS PowerLineFrequency is recorded on the info (the QC line-noise
+        # metric and frequency-aware steps must not have to guess).
+        assert raw.info["line_freq"] == 50.0

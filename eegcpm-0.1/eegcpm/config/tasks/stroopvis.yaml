@@ -1,0 +1,89 @@
+# Task Configuration: Spatial Stroop - Visual (stroopvis)
+# Cross-modal spatial Stroop task (auditory word + visual arrow location)
+#
+# Event codes match the trial_type column in BIDS events.tsv
+# (congruent = word location matches arrow location; incongruent = conflict).
+#
+# Dataset: 25SusAttn (Neuroscan 64-ch, 1000 Hz, 50 Hz line).
+# VEOG/HEOG are recorded and typed as EOG by the BrainVision loader, so the
+# ICA step's EOG-informed component detection (find_bads_eog) is active.
+
+task_name: stroopvis
+description: 'Spatial Stroop task (visual modality).
+
+  A visual arrow appears left/front/right while an auditory word names a
+
+  location; respond with the arrow direction (up = front). Congruent trials
+
+  match, incongruent trials conflict.'
+
+task_type: event-related
+
+primary_event:
+  name: all_stimuli
+  codes: [1, 2]
+
+tmin: -0.2
+tmax: 1.0
+baseline: [-0.2, 0.0]
+
+conditions:
+  - name: congruent
+    event_codes: ["congruent"]
+    description: "Auditory word location matches arrow location"
+  - name: incongruent
+    event_codes: ["incongruent"]
+    description: "Auditory word location conflicts with arrow location"
+
+# Behavioral response mapping
+response_mapping:
+  response_column: response.corr
+  categories:
+    correct: 1
+    incorrect: 0
+    no_response: n/a
+  rt_column: response.rt
+  rt_min: 100
+  rt_max: 2000
+
+# ERP components
+erp_components:
+  - name: N2
+    search_window: [0.2, 0.35]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Conflict monitoring N2
+  - name: N450
+    search_window: [0.35, 0.55]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Stroop conflict N450 (fronto-central)
+  - name: P3
+    search_window: [0.35, 0.6]
+    channels: [Pz, CPz, Cz]
+    polarity: positive
+    description: P3 (stimulus evaluation / response selection)
+
+# Rejection criteria
+reject:
+  eeg: 150e-6
+
+flat:
+  eeg: 1e-6
+
+# Trial binning
+binning:
+  - name: rt_quartiles
+    method: quantile
+    n_bins: 4
+    column: response.rt
+    labels: [fast, medium_fast, medium_slow, slow]
+
+sampling_rate: 1000
+
+notes: |
+  Use phase=="main" filter (set in UI) to exclude practice trials.
+  The congruency effect is expected on N450/N2 (incongruent more negative)
+  and on P3 (incongruent delayed/reduced).
+  VEOG/HEOG are available as EOG channels (typed by the loader); blink
+  components are caught by ICA auto-detection + ICLabel.
