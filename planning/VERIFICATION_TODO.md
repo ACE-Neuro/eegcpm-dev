@@ -1412,3 +1412,31 @@ sharp press artifact (button presses are electrically small here), so the
 absolute stimulus latency cannot be confirmed from EEG alone — flagged for
 the lab's task-timing documentation if component latencies are to be
 interpreted quantitatively.
+
+#### 2026-10-17 — Track B pilot results (sub-001) + batch
+
+**Final pipeline (config `~/proj/25SusAttn/configs/25susattn_optimized.yaml`):**
+montage(sfp) → set_channel_types(VEOG/HEOG/EKG/EMG→misc) → 1 Hz HP → drop_flat →
+variance bad channels (7 SD) → interpolate → zapline (fixed 50 Hz) → ASR (20,
+EEGLAB path + pinv fix) → CAR (projection=False) → ICA infomax → ICLabel (0.5) →
+40 Hz LP. Code commit `29c520e`.
+
+**sub-001 results**
+
+| task | bad channels | ASR repaired / rejected | ICA comps → rejected | line 50 Hz residual | blink gate | epochs |
+|---|---|---|---|---|---|---|
+| cptvis | 6 (AF4, CP1, Fp1, Fp2, Fpz, PO3) | 20.5 % / 0.3 % | 63 → 7 | 0.151 | Fp1 proxy, 326 blinks (~30/min), ratio 0.095, pass | 598/600 (540 target + 60 nontarget) |
+| stroopvis | 4 (CP1, Fp1, Fp2, Fpz) | 22.8 % / 1.1 % | 63 → 3 | 0.131 | Fp1 proxy, 405 blinks, ratio 0.179, pass | 321/325 (163 congruent + 162 incongruent) |
+
+Both QC `excellent` / `recommended_action: accept`. cptvis N1 −1.34 µV @ 127 ms
+(POz/Oz/PO3/PO4); stroopvis shows the expected conflict direction (incongruent
+more negative than congruent, −1.61 µV difference at ~251 ms at Fz/FCz). The
+component windows in the task configs are a starting point for per-dataset
+tuning, not a pipeline property.
+
+**Resume caveat found:** the skip/reprocess decision compares the *config* hash
+(R3), not the repository code revision — after a code change with an unchanged
+config, `--force` is required to reprocess (observed on cptvis, 2026-10-17).
+
+**Batch (in progress):** subjects 002/003/007 × cptvis/stroopvis
+(preprocess + epochs), launched 2026-10-17 after the pilot checks passed.
