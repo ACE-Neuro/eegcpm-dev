@@ -67,6 +67,9 @@ pipeline = [
     "pyzaplineplus==0.1.0",
     "eeglabio==0.1.4",
     "autoreject==0.5.1",
+    # CI parity: pandas needs a parquet engine for the features CLI; it was
+    # only present transitively in the dev venv (CI failure 2026-10-16).
+    "pyarrow==25.0.1",
 ]
 all = [
     "streamlit>=1.20",
