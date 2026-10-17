@@ -1473,3 +1473,48 @@ residual line noise. No config change needed.
 
 **Artifacts** were force-regenerated for all 8 recordings after the veto fix so
 every QC JSON carries `gates_ok` and the corrected action.
+
+#### 2026-10-17 — Track B: source reconstruction + source-ERP features (25SusAttn)
+
+**Coregistration (the gating problem for a non-standard cap).** The montage
+step's `.sfp` reader normalises the digitisation to MNE's 95 mm head convention
+(raw median 120 mm → ×0.79) and `set_montage` fabricates placeholder fiducials
+(0.0968 m) — the MNE template `fsaverage-trans.fif` is only valid for standard
+montages. `~/proj/25SusAttn/scripts/make_fsaverage_trans.py` reads the CapTrak
+electrodes + NAS/LPA/RPA from the BIDS sidecars, aligns fiducials then refines
+with the 64 electrodes (`fit_icp(eeg_weight=1)`) and writes a **project-local**
+subjects dir (symlinked fsaverage assets; the bundled template trans is never
+overwritten). Measured with the source module's own pre-flight:
+
+| montage | median | max | status |
+|---|---|---|---|
+| 25SusAttn (CapTrak coregistered) | **10.7 mm** | **23.9 mm** | ok (warning) |
+| MNE GSN-HydroCel-129 (validated reference) | 12.3 mm | 24.1 mm | ok (warning) |
+
+i.e. the template forward is as trustworthy here as for a standard montage.
+
+**Runs.** `source-reconstruct` (dSPM, oct6 fsaverage, CONN 32 networks,
+`roi_radius` 10/15 mm, `mode: evoked`) completed for **8/8** recordings
+(4 subjects × cptvis/stroopvis); outputs per run: per-condition `.stc` (lh/rh),
+`*_roi_tc.npz` (30 ROIs, signed `mean_flip`, 2 cerebellar ROIs excluded by the
+vertex threshold), `*_crosstalk.npz`, covariance/inverse, provenance, QC HTML.
+Covariance/data rank 63 (64 EEG − 1 CAR projector); 59–63 epochs per condition.
+
+**Source-ERP features.** `features --feature-type source_erp` produced
+`source_erp_{cptvis,stroopvis}.parquet` (4 subjects × 360 ROI×component×metric
+values; source-config hash `f88f9bcb…` recorded in the provenance sidecar).
+
+**Bug found and fixed (commit `7125d36`):** the source-ERP QC report called a
+non-existent `HTMLReportBuilder.add_section` and passed `add_figure` arguments
+in the wrong order, so every report degraded to a warning with no HTML; now
+`add_header(level=2)` + `add_figure('roi_erps', fig_bytes, caption)` with a
+regression test.
+
+**Caveats (documented, not defects):** template MRI with the individual head
+*size* normalised away; coregistration median 10.7 mm; `mean_flip` ROI
+sign-cancellation attenuation (repo decision B6, 11/30 vs 22/30 ROIs); the
+report's ROI panels show the largest-difference ROIs by construction.
+
+**Artifacts:** `derivatives/source/25susattn/{cptvis,stroopvis}/variant-dSPM-CONN32-25sus/…`,
+`derivatives/features/25susattn/source_erp/…`, reports
+`derivatives/reports/trackB_report{,_summary}.html` (section 5 = source ERPs).
