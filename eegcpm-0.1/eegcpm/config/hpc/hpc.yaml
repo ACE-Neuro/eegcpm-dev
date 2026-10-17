@@ -1,0 +1,63 @@
+# HPC batch template — `eegcpm hpc`
+#
+# ONE implementation: the CLI (`eegcpm hpc ...`, and the Streamlit pages) all
+# call `eegcpm.pipeline.slurm`. This file is the ONE batch schema
+# (`eegcpm.core.config.HpcBatchConfig`); unknown keys are HARD ERRORS, so a
+# typo never silently submits the wrong job.
+#
+# Copy it next to your project (e.g. `<project>/hpc.yaml`), replace the
+# placeholders, and use it with:
+#
+#   eegcpm hpc submit --config hpc.yaml --manifest hpc/manifest_pending.tsv \
+#       --pipeline <name> --source-variant <variant> --dry-run
+#
+# Explicit CLI flags override every value here. Relative paths are resolved
+# against `project` (a relative `project` itself is resolved against this
+# file's directory).
+#
+# See README.md in this directory for the full workflow.
+
+slurm:
+  # Per-partition resources + concurrency caps (`%k`). `hpc submit` chunks the
+  # manifest across these partitions (round-robin) and writes one sbatch job
+  # array per partition.
+  partitions:
+    - name: PLACEHOLDER_PARTITION_NAME   # <-- real SLURM partition name
+      max_concurrent: 24                 # <-- max array tasks at once (%k)
+      cpus: 4
+      mem: 16G
+      time: "02:00:00"
+    - name: PLACEHOLDER_LONG_PARTITION   # e.g. a long / high-mem partition
+      max_concurrent: 8
+      cpus: 4
+      mem: 24G
+      time: "08:00:00"
+
+  # Environment for the generated scripts.
+  modules: []                            # e.g. ["python/3.11"]; [] if baked in
+  venv: null                             # e.g. "/home/user/eegcpm-0.1/.venv"
+  exports: {}                            # extra `export KEY=value` lines
+
+  # Defaults used when a partition entry omits a value (and by the legacy
+  # single-job API). Keep them consistent with your partitions.
+  partition: PLACEHOLDER_PARTITION_NAME
+  cpus_per_task: 4
+  mem: 16G
+  time: "02:00:00"
+
+# Project root on the shared filesystem (contains bids/ and derivatives/).
+project: PLACEHOLDER_PROJECT_PATH
+
+# Stage configs used by the array tasks / finalize.
+preprocessing_config: configs/25susattn_optimized.yaml
+source_config: configs/source_dspm_25susattn.yaml
+features_config: configs/features_source_erp_cptvis.yaml
+
+# Per-unit array stages. `features` is intentionally absent: it is the
+# task-level finalize step (`eegcpm hpc finalize`), never an array-task stage.
+stages: [preprocess, epochs, source]
+
+# Optional; defaults shown (relative to `project`).
+# logs_dir: hpc/logs                 # SLURM logs + per-unit records (<logs>/../units)
+# state_db_dir: hpc/state            # per-unit SQLite state DBs
+# submissions_dir: hpc/submissions   # chunk TSVs + sbatch scripts

@@ -1,7 +1,11 @@
-"""Tests for batch preprocessing script generation functions."""
+"""Tests for batch preprocessing script generation functions.
 
+The generators live in :mod:`eegcpm.pipeline.slurm` (there is exactly ONE HPC
+implementation); the Streamlit page only imports and previews them.
+"""
+
+import ast
 import sys
-import importlib.util
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -10,14 +14,9 @@ import pytest
 # Mock only streamlit (not eegcpm.ui.utils — that's a real package other tests need)
 sys.modules.setdefault('streamlit', MagicMock())
 
-# Load the page module directly
-_page_path = Path(__file__).parent.parent.parent / "eegcpm" / "ui" / "pages" / "2_batch_preprocessing.py"
-_spec = importlib.util.spec_from_file_location("batch_page", _page_path)
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
+from eegcpm.pipeline.slurm import generate_local_script, generate_slurm_script  # noqa: E402
 
-generate_local_script = _mod.generate_local_script
-generate_slurm_script = _mod.generate_slurm_script
+_PAGE_PATH = Path(__file__).parent.parent.parent / "eegcpm" / "ui" / "pages" / "2_batch_preprocessing.py"
 
 
 @pytest.fixture
@@ -98,6 +97,30 @@ class TestGenerateSlurm:
         script = generate_slurm_script(base_config, bids_root, eegcpm_root)
         assert '# #SBATCH --mail-user=' in script
 
+    def test_header_block_is_pinned(self, base_config, bids_root, eegcpm_root):
+        """The #SBATCH header block (order included) is byte-stable."""
+        script = generate_slurm_script(base_config, bids_root, eegcpm_root)
+
+        assert script.startswith(
+            "#!/bin/bash\n"
+            "#SBATCH --job-name=eegcpm_standard\n"
+            "#SBATCH --partition=shared_cpu\n"
+            "#SBATCH --nodes=1\n"
+            "#SBATCH --ntasks-per-node=1\n"
+            "#SBATCH --cpus-per-task=4\n"
+            "#SBATCH --mem=16G\n"
+            "#SBATCH --time=02:00:00\n"
+            "#SBATCH --array=0-2%10\n"
+            "#SBATCH --output=/share/ps_clivewong/25SusAttn/derivatives/preprocessing/"
+            "standard/slurm_%A_%a.out\n"
+            "#SBATCH --error=/share/ps_clivewong/25SusAttn/derivatives/preprocessing/"
+            "standard/slurm_%A_%a.err\n"
+            "#SBATCH --mail-type=END,FAIL\n"
+            "#SBATCH --mail-user=user@eduhk.hk\n"
+            "\n"
+            "# EEGCPM SLURM Batch Preprocessing\n"
+        )
+
 
 class TestGenerateLocal:
     """Tests for local script generation."""
@@ -110,3 +133,42 @@ class TestGenerateLocal:
         assert 'TASKS=("rest" "contdet")' in script
         assert 'NDARAA306NT2' in script
         assert 'NDARAC123XYZ' in script
+
+
+class TestNoInlineGenerators:
+    """The pages must not carry their own copy of an sbatch generator."""
+
+    def _function_names(self, page: Path) -> set:
+        tree = ast.parse(page.read_text(encoding="utf-8"))
+        return {
+            node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
+
+    def test_batch_page_has_no_local_generators(self):
+        names = self._function_names(_PAGE_PATH)
+        assert "generate_slurm_script" not in names, (
+            "ui/pages/2_batch_preprocessing.py must import generate_slurm_script "
+            "from eegcpm.pipeline.slurm instead of defining its own copy"
+        )
+        assert "generate_local_script" not in names
+
+    def test_pages_contain_no_sbatch_headers(self):
+        """No page may inline a #SBATCH header (one implementation only).
+
+        ``_archived/`` is deliberately out of scope: archives are history, not
+        code that runs (the archived mock HPC page must not be revived as a
+        second copy of the unified module).
+        """
+        pages_dir = _PAGE_PATH.parent
+        offenders = []
+        for page in sorted(pages_dir.glob("*.py")):
+            for lineno, line in enumerate(
+                page.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if "#SBATCH" in line:
+                    offenders.append(f"{page.name}:{lineno}")
+        assert offenders == [], (
+            "inline #SBATCH headers in UI pages: "
+            + ", ".join(offenders)
+            + " — use eegcpm.pipeline.slurm.generate_*_script instead"
+        )

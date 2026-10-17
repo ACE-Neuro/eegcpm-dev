@@ -222,6 +222,37 @@ def find_eeg_run_files(
     return None
 
 
+def parse_run_identity(filename: str, fallback_index: int = 1) -> Tuple[str, str]:
+    """Derive the (session, run) identity a recording is processed under.
+
+    The preprocessing CLI assigns a run identity to every input file: the
+    session comes from the ``ses-`` entity (default ``"01"``) and a file without
+    a ``run-`` entity takes its 1-based position in the task's run list as the
+    run number — a single-file task therefore becomes ``run-1``. This helper is
+    the single source of truth for that rule, shared by
+    ``eegcpm.cli.preprocess`` (per-run identity) and ``eegcpm.pipeline.slurm``
+    (work-unit manifest / artifact paths).
+
+    Parameters
+    ----------
+    filename : str
+        File name (or path) of the BIDS recording, e.g.
+        ``sub-001_ses-01_task-cptvis_run-2_eeg.vhdr``.
+    fallback_index : int
+        The file's 1-based position in the run list used when the file name has
+        no ``run-`` entity.
+
+    Returns
+    -------
+    (session, run) : tuple of str
+        Entity values without their ``ses-``/``run-`` prefixes.
+    """
+    stem = Path(filename).stem
+    session = stem.split('_ses-')[1].split('_')[0] if '_ses-' in stem else "01"
+    run = stem.split('_run-')[1].split('_')[0] if '_run-' in stem else str(fallback_index)
+    return session, run
+
+
 def parse_legacy_task_name(task_name: str) -> Tuple[str, str]:
     """
     Parse legacy task name to extract task and run.

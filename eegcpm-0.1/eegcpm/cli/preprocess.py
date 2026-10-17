@@ -26,7 +26,12 @@ from ..data.event_mapping import get_event_mapping_for_run, translate_event_code
 from ..core.task_config import TaskConfig
 from ..modules.qc.quality_assessment import extract_metrics_from_qc_result
 from ..modules.qc.metrics_io import save_qc_metrics_json
-from ..data.bids_utils import supported_formats, find_eeg_run_files, read_raw_eeg
+from ..data.bids_utils import (
+    supported_formats,
+    find_eeg_run_files,
+    read_raw_eeg,
+    parse_run_identity,
+)
 
 
 def _write_run_qc_metrics(
@@ -124,8 +129,11 @@ def preprocess_command(args):
             args, 'eegcpm_root') and args.eegcpm_root else None
     )
 
-    # Setup state manager using new paths
-    db_path = paths.get_state_db()
+    # Setup state manager using new paths. `--state-db` overrides the shared
+    # project DB — `hpc run-unit` passes one DB per work unit so concurrent
+    # array tasks never open the same SQLite file. When the flag is absent the
+    # path is byte-identical to `paths.get_state_db()`.
+    db_path = args.state_db if getattr(args, 'state_db', None) else paths.get_state_db()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     manager = WorkflowStateManager(db_path)
 
@@ -232,14 +240,41 @@ def preprocess_command(args):
                 console.print(
                     f"  Found {len(input_files)} run(s) for {subject_id}")
 
+                # HPC per-unit isolation: optionally restrict this invocation to
+                # specific sessions/runs, using the exact identity rule of the
+                # loop below (the shared `parse_run_identity` helper, also used
+                # by the HPC manifest). Without the flags the file list is
+                # untouched, so the batch behaviour is unchanged.
+                indexed_files = list(enumerate(input_files, 1))
+                requested_sessions = list(getattr(args, 'sessions', None) or [])
+                requested_runs = list(getattr(args, 'runs', None) or [])
+                if requested_sessions or requested_runs:
+                    selected = []
+                    for index, path in indexed_files:
+                        session_id, run_id = parse_run_identity(
+                            path.name, fallback_index=index)
+                        if requested_sessions and session_id not in requested_sessions:
+                            continue
+                        if requested_runs and run_id not in requested_runs:
+                            continue
+                        selected.append((index, path))
+                    indexed_files = selected
+                    if not indexed_files:
+                        console.print(
+                            f"  [red]✗ {subject_id}: no input files match "
+                            f"--sessions={requested_sessions} "
+                            f"--runs={requested_runs}[/red]")
+                        batch_failed += 1
+                        progress.update(overall_task, advance=1)
+                        continue
+
                 # Process each run
-                for run_idx, input_file in enumerate(input_files, 1):
-                    # Extract run number and session from filename
-                    run_num = input_file.stem.split(
-                        '_run-')[1].split('_')[0] if '_run-' in input_file.stem else str(run_idx)
-                    # Extract session (default to "01")
-                    session = input_file.stem.split(
-                        '_ses-')[1].split('_')[0] if '_ses-' in input_file.stem else "01"
+                for run_idx, input_file in indexed_files:
+                    # Run/session identity. The fallback run number is the
+                    # file's position in the *unfiltered* run list, matching
+                    # both the shared helper and the HPC manifest.
+                    session, run_num = parse_run_identity(
+                        input_file.name, fallback_index=run_idx)
 
                     # Skip runs already completed or excluded for this
                     # exact identity (subject/session/task/run) — but only when

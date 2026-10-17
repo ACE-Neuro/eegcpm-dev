@@ -20,8 +20,8 @@ from eegcpm.evaluation.prediction.workflow import (
     save_prediction_outputs,
     scan_connectivity_options,
 )
+from eegcpm.pipeline.slurm import generate_command_slurm_script
 from eegcpm.ui.session_persistence import restore_project_from_storage
-
 
 MODEL_LABELS = {
     "spls_lite": "sPLS-lite (feature selection + PLS)",
@@ -131,32 +131,21 @@ def _make_slurm_script(config: dict, hpc: dict) -> str:
     hpc_project = hpc.get("project_root") or config["project_root"]
     eegcpm_root = hpc.get("eegcpm_root") or "/path/to/eegcpm-0.1"
     venv = hpc.get("venv") or f"{eegcpm_root}/venv/bin/activate"
-    email = hpc.get("email", "")
-    email_line = f"#SBATCH --mail-user={email}" if email else "# #SBATCH --mail-user=your_email@eduhk.hk"
     slurm_config = dict(config)
     slurm_config["project_root"] = hpc_project
     if slurm_config.get("hpc_behavior_path"):
         slurm_config["behavior_path"] = slurm_config["hpc_behavior_path"]
-    return f"""#!/bin/bash
-#SBATCH --job-name=eegcpm_predict
-#SBATCH --partition={hpc.get('partition', 'shared_cpu')}
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task={hpc.get('cpus', 4)}
-#SBATCH --mem={hpc.get('mem', '16G')}
-#SBATCH --time={hpc.get('time', '02:00:00')}
-#SBATCH --output={hpc_project}/logs/prediction_%A.out
-#SBATCH --error={hpc_project}/logs/prediction_%A.err
-#SBATCH --mail-type=END,FAIL
-{email_line}
-
-set -e
-mkdir -p "{hpc_project}/logs"
-source "{venv}"
-cd "{eegcpm_root}"
-
-{_make_local_script(slurm_config)}
-"""
+    return generate_command_slurm_script(
+        "eegcpm_predict",
+        _make_local_script(slurm_config),
+        hpc=hpc,
+        project_root=hpc_project,
+        log_dir=f"{hpc_project}/logs",
+        venv=venv,
+        work_dir=eegcpm_root,
+        output_pattern="prediction_%A.out",
+        error_pattern="prediction_%A.err",
+    )
 
 
 def main():

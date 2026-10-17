@@ -12,6 +12,7 @@ from .epochs import epochs_command, discover_events_command
 from .source_reconstruct import source_reconstruct_command
 from .connectivity import connectivity_command
 from .features import features_command, add_features_parser, validate_features_args
+from .hpc import add_hpc_parser, hpc_command
 from .predict import predict_command, add_predict_parser
 
 
@@ -122,6 +123,20 @@ For more information: https://github.com/clivehywong/eegcpm-dev
         help='Task config name for ERP QC (default: auto-detect from task name)'
     )
     preprocess_parser.add_argument(
+        '--sessions',
+        type=str,
+        nargs='+',
+        help='Specific sessions to process (e.g., 01); '
+             'used by `hpc run-unit` for per-unit isolation'
+    )
+    preprocess_parser.add_argument(
+        '--runs',
+        type=str,
+        nargs='+',
+        help='Specific runs to process (e.g., 1 2); '
+             'used by `hpc run-unit` for per-unit isolation'
+    )
+    preprocess_parser.add_argument(
         '--pipeline',
         type=str,
         default='standard',
@@ -141,6 +156,14 @@ For more information: https://github.com/clivehywong/eegcpm-dev
         '--parallel',
         type=int,
         help='Number of parallel jobs (default: 1)'
+    )
+    preprocess_parser.add_argument(
+        '--state-db',
+        type=Path,
+        default=None,
+        help='Override the workflow state database path '
+             '(default: {eegcpm_root}/.eegcpm/state.db); '
+             '`hpc run-unit` passes one DB per work unit'
     )
 
     # Resume command
@@ -402,6 +425,9 @@ For more information: https://github.com/clivehywong/eegcpm-dev
     # primary-config validator, and DUA path enforcement)
     features_parser = add_features_parser(subparsers)
     add_predict_parser(subparsers)
+
+    # HPC batch commands (SLURM job arrays; a Streamlit monitor page comes later)
+    add_hpc_parser(subparsers)
     connectivity_parser.add_argument(
         '--subjects',
         type=str,
@@ -456,6 +482,10 @@ For more information: https://github.com/clivehywong/eegcpm-dev
             features_command(args)
         elif args.command == 'predict':
             predict_command(args)
+        elif args.command == 'hpc':
+            rc = hpc_command(args)
+            if rc:
+                sys.exit(int(rc))
         else:
             parser.print_help()
             sys.exit(1)

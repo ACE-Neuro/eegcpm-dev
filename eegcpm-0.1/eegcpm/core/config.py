@@ -761,8 +761,35 @@ class EvaluationConfig(BaseModel):
     n_permutations: int = Field(default=1000)
 
 
+class PartitionConfig(BaseModel):
+    """One SLURM partition with its per-array-task resources.
+
+    Used by the batch config (``HpcBatchConfig.slurm.partitions``): each
+    partition carries the resources its array tasks request and the
+    concurrency cap (``%k``) for it. There is exactly one partition schema —
+    do not add a second one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., description="SLURM partition name")
+    max_concurrent: int = Field(
+        default=1, ge=1,
+        description="Maximum array tasks running at once on this partition (%k)",
+    )
+    cpus: int = Field(default=4, ge=1, description="CPUs per array task")
+    mem: str = Field(default="16G", description="Memory per array task")
+    time: str = Field(default="02:00:00", description="Wall time per array task (HH:MM:SS)")
+
+
 class SlurmConfig(BaseModel):
-    """SLURM HPC configuration."""
+    """SLURM HPC configuration.
+
+    ``extra='forbid'`` (the repo-wide config invariant): a misspelled key in a
+    cluster YAML is a hard error, never a silently ignored default.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     partition: str = Field(default="normal")
     time: str = Field(default="04:00:00")
@@ -770,6 +797,108 @@ class SlurmConfig(BaseModel):
     cpus_per_task: int = Field(default=8)
     gpus: Optional[int] = Field(default=None)
     modules: List[str] = Field(default_factory=list, description="Modules to load")
+    partitions: List[PartitionConfig] = Field(
+        default_factory=list,
+        description="Per-partition resources/concurrency for the batch config",
+    )
+    venv: Optional[str] = Field(
+        default=None,
+        description="Virtualenv to activate/use (None = the submitter's interpreter)",
+    )
+    exports: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Environment variables exported by the generated scripts",
+    )
+
+
+class HpcBatchConfig(BaseModel):
+    """Batch YAML schema for ``eegcpm hpc`` (the only HPC batch config).
+
+    Unknown keys are **hard errors** (``extra='forbid'``): a silently ignored
+    typo in a cluster config would submit the wrong job. Paths are resolved to
+    absolute paths against ``project`` (``project`` itself is resolved against
+    the YAML file's directory by :meth:`from_yaml`), because the generated
+    sbatch scripts run on compute nodes with an arbitrary cwd.
+
+    ``stages`` are the per-unit array stages; ``features`` is deliberately not
+    allowed there — it is the task-level ``hpc finalize`` step.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    slurm: SlurmConfig = Field(default_factory=SlurmConfig)
+    project: Path = Field(..., description="Project root directory")
+    preprocessing_config: Path = Field(..., description="Preprocessing config YAML")
+    source_config: Path = Field(..., description="Source reconstruction config YAML")
+    features_config: Path = Field(..., description="Features config YAML (finalize step)")
+    stages: List[Literal["preprocess", "epochs", "source"]] = Field(
+        ..., description="Per-unit array stages (features runs via finalize)"
+    )
+    logs_dir: Optional[Path] = Field(
+        default=None, description="SLURM log dir (default: <project>/hpc/logs)"
+    )
+    state_db_dir: Optional[Path] = Field(
+        default=None, description="Per-unit state DB dir (default: <project>/hpc/state)"
+    )
+    submissions_dir: Optional[Path] = Field(
+        default=None,
+        description="Chunk/script dir (default: <project>/hpc/submissions)",
+    )
+
+    @model_validator(mode="after")
+    def _resolve_relative_paths(self) -> "HpcBatchConfig":
+        """Make every path absolute; fill the optional dirs from the project."""
+        project = Path(self.project).expanduser()
+        self.project = project
+
+        for field_name, default in (
+            ("logs_dir", project / "hpc" / "logs"),
+            ("state_db_dir", project / "hpc" / "state"),
+            ("submissions_dir", project / "hpc" / "submissions"),
+            ("preprocessing_config", None),
+            ("source_config", None),
+            ("features_config", None),
+        ):
+            value = getattr(self, field_name)
+            value = Path(value).expanduser() if value is not None else default
+            if value is not None and not value.is_absolute():
+                value = project / value
+            setattr(self, field_name, value)
+        return self
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> "HpcBatchConfig":
+        """Load and validate a batch YAML file.
+
+        A relative ``project`` is resolved against the YAML file's directory
+        (so a config shipped next to a project still points at that project),
+        then every other path is resolved against the project.
+        """
+        import yaml
+
+        path = Path(path).expanduser()
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = yaml.safe_load(handle)
+        except OSError as exc:
+            raise FileNotFoundError(f"batch config not found: {path} ({exc})") from exc
+        except yaml.YAMLError as exc:  # YAMLError is not a ValueError
+            raise ValueError(f"{path}: invalid YAML: {exc}") from exc
+
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"{path}: expected a YAML mapping, got {type(data).__name__}"
+            )
+        project = data.get("project")
+        if project is not None:
+            project = Path(str(project)).expanduser()
+            if not project.is_absolute():
+                project = (path.parent / project).resolve()
+            data["project"] = project
+        return cls(**data)
+
 
 
 class Config(BaseModel):
