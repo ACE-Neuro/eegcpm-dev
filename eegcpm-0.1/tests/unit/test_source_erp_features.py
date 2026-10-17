@@ -409,3 +409,22 @@ def test_features_cli_refuses_mixed_source_configs(tmp_path):
     assert payload["parquet_sha256"] == sha256_file(parquet)
     assert payload["library_versions"]["mne"]
     assert payload["n_rows"] == int(result["n_rows"])
+
+
+def test_qc_report_is_written_with_embedded_figure(tmp_path):
+    """The source-ERP QC report must build through the real builder API.
+
+    2026-10-17: the report path called a non-existent
+    ``HTMLReportBuilder.add_section`` (and passed ``add_figure`` arguments in the
+    wrong order), so every source-ERP QC report was skipped with a warning and
+    no HTML was written.
+    """
+    module = SourceERPFeatureModule(_config(generate_qc=True), tmp_path)
+    module.process(_synthetic_data(), subject=SimpleNamespace(id="sub-01", session="01"))
+
+    qc_path = tmp_path / "sub-01_source_erp_qc.html"
+    assert qc_path.exists(), "source-ERP QC report was not written"
+    html = qc_path.read_text()
+    assert "Overview" in html
+    assert "ROI Event-Related Potentials" in html
+    assert 'src="data:image/png;base64,' in html, "figure not embedded"

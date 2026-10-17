@@ -428,12 +428,12 @@ class SourceERPFeatureModule(BaseModule):
             # Create HTML report
             builder = HTMLReportBuilder(title=f"Source ERP Features: {subject_id}")
 
-            builder.add_section("Overview")
-            builder.add_text(f"**Subject**: {subject_id}")
-            builder.add_text(f"**Session**: {session_id}")
-            builder.add_text(f"**Source Variant**: {self.source_variant}")
-            builder.add_text(f"**Conditions**: {', '.join(conditions)}")
-            builder.add_text(f"**Components**: {', '.join(self.components.keys())}")
+            builder.add_header("Overview", level=2)
+            builder.add_text(f"Subject: {subject_id}")
+            builder.add_text(f"Session: {session_id}")
+            builder.add_text(f"Source Variant: {self.source_variant}")
+            builder.add_text(f"Conditions: {', '.join(conditions)}")
+            builder.add_text(f"Components: {', '.join(self.components.keys())}")
 
             # Plot ROI ERPs (one line per condition) with component markers
             plot_rois = roi_names[:12]  # Top 12 ROIs
@@ -443,8 +443,11 @@ class SourceERPFeatureModule(BaseModule):
                 if fig:
                     from eegcpm.modules.qc.base import BaseQC
                     fig_bytes = BaseQC.fig_to_base64(fig)
-                    builder.add_section("ROI Event-Related Potentials")
-                    builder.add_figure(fig_bytes, "ERP waveforms for top ROIs")
+                    builder.add_header("ROI Event-Related Potentials", level=2)
+                    builder.add_figure(
+                        "roi_erps", fig_bytes,
+                        "ERP waveforms for the first 12 ROIs (one line per condition)",
+                    )
                     plt.close(fig)
 
             # Save HTML
