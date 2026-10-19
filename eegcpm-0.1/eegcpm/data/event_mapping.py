@@ -90,6 +90,7 @@ def load_events_from_bids_tsv(
     filter_col: Optional[str] = None,
     filter_val: Optional[str] = None,
     max_time: Optional[float] = None,
+    return_metadata: bool = False,
 ) -> tuple:
     """Load MNE-compatible events from a BIDS events.tsv file.
 
@@ -110,23 +111,33 @@ def load_events_from_bids_tsv(
         Value to match in filter_col (e.g., 'main').
     max_time : float, optional
         Maximum onset time in seconds; events beyond this are excluded.
+    return_metadata : bool
+        When True, also return the filtered events DataFrame. The DataFrame
+        has exactly one row per returned event, in the same order, so it can
+        be passed to ``mne.Epochs(..., metadata=df)`` / module ``process()``.
 
     Returns
     -------
-    tuple of (np.ndarray, dict) or (None, None)
+    tuple
+        ``(events, event_id)`` by default, or ``(events, event_id, df_valid)``
+        when ``return_metadata=True``. On failure (missing file, missing
+        columns, or no rows left after filtering) all entries are ``None``:
+        ``(None, None)`` / ``(None, None, None)``.
+
         events: shape (n_events, 3), compatible with mne.Epochs
         event_id: dict mapping trial_type to integer code
+        df_valid: pandas.DataFrame with one row per event (same order)
     """
     import numpy as np
     import pandas as pd
 
     if not events_tsv_path.exists():
-        return None, None
+        return (None, None, None) if return_metadata else (None, None)
 
     df = pd.read_csv(events_tsv_path, sep='\t')
 
     if 'onset' not in df.columns or trial_type_col not in df.columns:
-        return None, None
+        return (None, None, None) if return_metadata else (None, None)
 
     # Apply optional filter (e.g., phase == "main")
     if filter_col and filter_val and filter_col in df.columns:
@@ -139,7 +150,7 @@ def load_events_from_bids_tsv(
     df_valid = df[valid]
 
     if len(df_valid) == 0:
-        return None, None
+        return (None, None, None) if return_metadata else (None, None)
 
     unique_types = sorted(df_valid[trial_type_col].unique())
     event_id = {tt: i + 1 for i, tt in enumerate(unique_types)}
@@ -148,6 +159,9 @@ def load_events_from_bids_tsv(
         [int(onset * sfreq), 0, event_id[trial_type]]
         for onset, trial_type in zip(df_valid['onset'], df_valid[trial_type_col])
     ], dtype=int)
+
+    if return_metadata:
+        return events, event_id, df_valid
 
     return events, event_id
 

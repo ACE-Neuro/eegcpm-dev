@@ -4,6 +4,7 @@ import pytest
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from eegcpm.data.event_mapping import (
     load_events_from_bids_tsv,
@@ -138,6 +139,99 @@ class TestLoadEventsFromBidsTsv:
 
         assert events is None
         assert event_id is None
+
+
+# ---------------------------------------------------------------------------
+# load_events_from_bids_tsv(return_metadata=True)  (Pass 1)
+# ---------------------------------------------------------------------------
+
+class TestLoadEventsFromBidsTsvReturnMetadata:
+    """return_metadata=True returns the filtered DataFrame with the events."""
+
+    def _write_tsv(self, path: Path, rows, columns="onset\tduration\ttrial_type"):
+        with open(path, "w") as f:
+            f.write(columns + "\n")
+            for row in rows:
+                f.write("\t".join(str(v) for v in row) + "\n")
+
+    def test_default_still_returns_two_tuple(self, tmp_path):
+        tsv = tmp_path / "events.tsv"
+        self._write_tsv(tsv, [(1.0, 0.0, "target")])
+
+        result = load_events_from_bids_tsv(tsv, sfreq=500.0)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+    def test_returns_filtered_dataframe(self, tmp_path):
+        tsv = tmp_path / "events.tsv"
+        self._write_tsv(tsv, [
+            (1.0, 0.0, "target", "main", 0.41),
+            (2.0, 0.0, "nontarget", "practice", 0.55),
+            (3.0, 0.0, "target", "main", 0.62),
+        ], columns="onset\tduration\ttrial_type\tphase\tkey_resp.rt")
+
+        events, event_id, df_valid = load_events_from_bids_tsv(
+            tsv,
+            sfreq=500.0,
+            filter_col="phase",
+            filter_val="main",
+            return_metadata=True,
+        )
+
+        assert events is not None
+        assert isinstance(df_valid, pd.DataFrame)
+        # phase filter applies to metadata exactly as it does to events
+        assert df_valid["phase"].tolist() == ["main", "main"]
+        assert len(df_valid) == events.shape[0] == 2
+        # rows correspond to events rows, in the same order
+        assert [int(o * 500.0) for o in df_valid["onset"]] == events[:, 0].tolist()
+        assert df_valid["trial_type"].tolist() == ["target", "target"]
+        # extra BIDS columns (RT) survive into the metadata
+        assert "key_resp.rt" in df_valid.columns
+
+    def test_max_time_filter_applies_to_metadata(self, tmp_path):
+        tsv = tmp_path / "events.tsv"
+        self._write_tsv(tsv, [
+            (1.0, 0.0, "target"),
+            (5.0, 0.0, "nontarget"),
+            (8.0, 0.0, "target"),
+        ])
+
+        events, _event_id, df_valid = load_events_from_bids_tsv(
+            tsv, sfreq=500.0, max_time=6.0, return_metadata=True
+        )
+
+        assert len(df_valid) == len(events) == 2
+        assert df_valid["onset"].tolist() == [1.0, 5.0]
+
+    def test_missing_file_returns_three_nones(self, tmp_path):
+        result = load_events_from_bids_tsv(
+            tmp_path / "nonexistent.tsv", sfreq=500.0, return_metadata=True
+        )
+        assert result == (None, None, None)
+
+    def test_missing_column_returns_three_nones(self, tmp_path):
+        tsv = tmp_path / "events.tsv"
+        tsv.write_text("duration\ttrial_type\n0.0\ttarget\n")
+        result = load_events_from_bids_tsv(
+            tsv, sfreq=500.0, return_metadata=True
+        )
+        assert result == (None, None, None)
+
+    def test_empty_after_filter_returns_three_nones(self, tmp_path):
+        tsv = tmp_path / "events.tsv"
+        self._write_tsv(tsv, [
+            (1.0, 0.0, "target", "practice"),
+        ], columns="onset\tduration\ttrial_type\tphase")
+        result = load_events_from_bids_tsv(
+            tsv,
+            sfreq=500.0,
+            filter_col="phase",
+            filter_val="main",
+            return_metadata=True,
+        )
+        assert result == (None, None, None)
 
 
 # ---------------------------------------------------------------------------

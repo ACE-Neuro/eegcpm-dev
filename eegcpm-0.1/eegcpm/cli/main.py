@@ -9,6 +9,7 @@ from .preprocess import preprocess_command
 from .resume import resume_command
 from .import_qc import import_qc_command
 from .epochs import epochs_command, discover_events_command
+from .epochs_select import add_epochs_select_parser, epochs_select_command
 from .source_reconstruct import source_reconstruct_command
 from .connectivity import connectivity_command
 from .features import features_command, add_features_parser, validate_features_args
@@ -291,6 +292,9 @@ For more information: https://github.com/clivehywong/eegcpm-dev
         help='Specific runs to combine (e.g., 1 2 3). If not specified, combines all runs.'
     )
 
+    # Trial selection command (filters/sort/split/bins -> selections/<name>/)
+    add_epochs_select_parser(subparsers)
+
     # Discover events command
     discover_parser = subparsers.add_parser(
         'discover-events',
@@ -472,6 +476,10 @@ For more information: https://github.com/clivehywong/eegcpm-dev
             import_qc_command(args)
         elif args.command == 'epochs':
             epochs_command(args)
+        elif args.command == 'epochs-select':
+            rc = epochs_select_command(args)
+            if rc:
+                sys.exit(int(rc))
         elif args.command == 'discover-events':
             discover_events_command(args)
         elif args.command == 'source-reconstruct':

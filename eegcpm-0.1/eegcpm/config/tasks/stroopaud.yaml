@@ -1,0 +1,78 @@
+# Task Configuration: Spatial Stroop — Auditory word modality (stroopaud)
+# The word "left"/"right" is spoken while the participant responds to the
+# spatial location; congruent vs incongruent is the conflict contrast.
+#
+# Event codes match the trial_type column in BIDS events.tsv:
+#   congruent   -> word matches the required response side
+#   incongruent -> word conflicts with the required response side
+#
+# Dataset: 25SusAttn (Neuroscan 64-ch, 1000 Hz, 50 Hz line).
+
+task_name: stroopaud
+description: "Spatial Stroop — auditory word modality (98 subjects)"
+task_type: event-related
+
+primary_event:
+  name: all_stimuli
+  codes: [congruent, incongruent]
+
+tmin: -0.2
+tmax: 1.0
+baseline: [-0.2, 0.0]
+
+conditions:
+  - name: congruent
+    event_codes: ["congruent"]
+    description: "Word matches the response side (low conflict)"
+  - name: incongruent
+    event_codes: ["incongruent"]
+    description: "Word conflicts with the response side (high conflict)"
+
+# Behavioral response mapping
+response_mapping:
+  response_column: response.corr
+  categories:
+    correct: 1
+    incorrect: 0
+  rt_column: response.rt
+  rt_min: 100
+  rt_max: 1500
+
+# ERP components
+erp_components:
+  - name: N2
+    search_window: [0.20, 0.35]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Conflict N2
+  - name: N450
+    search_window: [0.35, 0.55]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Stroop N450
+  - name: P3
+    search_window: [0.35, 0.60]
+    channels: [Pz, CPz, Cz]
+    polarity: positive
+    description: P3
+
+# Rejection criteria
+reject:
+  eeg: 150e-6
+
+flat:
+  eeg: 1e-6
+
+# Trial binning
+binning:
+  - name: rt_quartiles
+    method: quantile
+    n_bins: 4
+    column: response.rt
+    labels: [fast, medium_fast, medium_slow, slow]
+
+sampling_rate: 1000
+
+notes: |
+  Auditory Stroop; same component windows as stroopvis. 98 subjects have
+  this task (3 subjects missing: sub-001/002/003).

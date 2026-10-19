@@ -1,21 +1,55 @@
-"""Tests for task configuration system (trial filtering and binning)."""
+"""Tests for task configuration system (trial filtering and binning).
+
+Binning is covered through the consolidated ``TrialSorter`` API
+(``bin_trials`` / ``split``); the dead ``modules/epochs/binning.py`` module
+was deleted in pass 1 of the sorting/filtering remediation.
+"""
 
 from pathlib import Path
 
+import mne
 import numpy as np
 import pandas as pd
 import pytest
 
 from eegcpm.modules.epochs.trial_filter import (
-    filter_by_rt,
-    filter_by_accuracy,
     drop_missing_responses,
     drop_sequential_positions,
+    filter_by_accuracy,
+    filter_by_rt,
 )
-from eegcpm.modules.epochs.binning import (
-    bin_rt_quartiles,
-    bin_sequential_position,
-)
+
+
+def _load_task_config():
+    """Load a real task config for TrialSorter tests (else skip)."""
+    from eegcpm.core.task_config import TaskConfig
+
+    config_path = Path(__file__).parent.parent / "eegcpm" / "config" / "tasks" / "cptvis.yaml"
+    if not config_path.exists():
+        pytest.skip("cptvis task config not found")
+    return TaskConfig.from_yaml(config_path)
+
+
+def _epochs_from_events_df(events_df):
+    """Wrap a behavioral events DataFrame in synthetic epochs + metadata."""
+    n_trials = len(events_df)
+    sfreq = 100.0
+    info = mne.create_info(["EEG1", "EEG2"], sfreq, ch_types=["eeg", "eeg"])
+    data = np.zeros((n_trials, 2, 11))
+    events = np.column_stack([
+        np.arange(1, n_trials + 1) * 10,
+        np.zeros(n_trials, dtype=int),
+        np.ones(n_trials, dtype=int),
+    ])
+    return mne.EpochsArray(
+        data,
+        info,
+        events=events,
+        tmin=-0.05,
+        event_id={"stim": 1},
+        metadata=events_df,
+        verbose=False,
+    )
 
 
 @pytest.fixture
@@ -119,44 +153,55 @@ def test_drop_sequential_positions_both(mock_events_df):
 
 
 def test_bin_rt_quartiles(mock_events_df):
-    """Test binning by RT quartiles."""
-    # Create mock BinningConfig
-    class MockBinningConfig:
-        rt_field = "response_time"
-        n_bins = 4
-        labels = ["Q1", "Q2", "Q3", "Q4"]
+    """Bin trials by RT quartiles through TrialSorter.bin_trials."""
+    from eegcpm.core.task_config import BinSpec, TrialSorter
 
-    config = MockBinningConfig()
+    task_config = _load_task_config()
+    sorter = TrialSorter(task_config)
 
-    # Remove NaN RTs first
-    df = mock_events_df.dropna(subset=["response_time"])
-    bins = bin_rt_quartiles(df, config)
+    bin_spec = BinSpec(
+        name="rt_quartiles",
+        method="quantile",
+        n_bins=4,
+        column="response_time",
+        labels=["Q1", "Q2", "Q3", "Q4"],
+    )
+    epochs = _epochs_from_events_df(mock_events_df)
+    bins = sorter.bin_trials(epochs, bin_spec=bin_spec)
 
     assert len(bins) == 4
     assert "Q1" in bins
     assert "Q4" in bins
 
-    # Check all trials are included
-    total_trials = sum(len(bin_df) for bin_df in bins.values())
-    assert total_trials <= len(df)  # Some may be dropped due to duplicates
+    # Check all trials are included (NaNs in RT are excluded from the bins)
+    total_trials = sum(info["n_trials"] for info in bins.values())
+    n_valid = int(mock_events_df["response_time"].notna().sum())
+    assert total_trials == n_valid
+    # Provenance is attached
+    assert "selection_record" in bins["Q1"]
 
 
 def test_bin_sequential_position(mock_events_df):
-    """Test binning by sequential position."""
-    class MockBinningConfig:
-        bins = 5
-        position_labels = ["early", "mid_early", "middle", "mid_late", "late"]
+    """Split trials by sequential position through TrialSorter.split."""
+    from eegcpm.core.task_config import TrialSorter
 
-    config = MockBinningConfig()
-    bins = bin_sequential_position(mock_events_df, config)
+    task_config = _load_task_config()
+    sorter = TrialSorter(task_config)
 
-    assert len(bins) == 5
-    assert "early" in bins
-    assert "late" in bins
+    epochs = _epochs_from_events_df(mock_events_df)
+    parts = sorter.split(epochs, by="position", parts=5)
 
-    # Check all trials are included
-    total_trials = sum(len(bin_df) for bin_df in bins.values())
+    assert len(parts) == 5
+    assert "half_1" in parts
+    assert "half_5" in parts
+
+    # Check all trials are included and the chunks are disjoint
+    total_trials = sum(len(info[0]) for info in parts.values())
     assert total_trials == len(mock_events_df)
+    for name, (part_epochs, record) in parts.items():
+        assert record.n_before == len(mock_events_df)
+        assert record.n_after == len(part_epochs)
+        assert record.mask_hash  # boolean mask hash recorded
 
 
 def test_combined_filtering_pipeline(mock_events_df):

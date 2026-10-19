@@ -284,18 +284,28 @@ def epochs_command(args):
                 annotations_match = bool(event_dict) and any(
                     c in event_dict for c in event_codes_to_epoch
                 )
+                # Per-trial metadata from the BIDS events.tsv (when used).
+                # Rows are aligned 1:1 with `events`; the epochs module keeps
+                # the frame in lock-step when event_id filters events and when
+                # epochs are rejected.
+                epochs_metadata = None
+
                 if len(events) == 0 or (semantic_codes and not annotations_match and events_tsv):
                     if events_tsv:
-                        tsv_events, tsv_event_id = load_events_from_bids_tsv(
+                        tsv_events, tsv_event_id, tsv_metadata = load_events_from_bids_tsv(
                             events_tsv,
                             sfreq=raw_combined.info['sfreq'],
                             max_time=raw_combined.times[-1],
                             filter_col='phase',
                             filter_val='main',
+                            return_metadata=True,
                         )
                         if tsv_events is not None:
                             events, event_dict = tsv_events, tsv_event_id
+                            epochs_metadata = tsv_metadata
                             print(f"   ✓ Loaded {len(events)} events from BIDS events.tsv ({list(event_dict.keys())})")
+                            print(f"   ✓ Loaded trial metadata: {len(epochs_metadata)} rows, "
+                                  f"columns {list(epochs_metadata.columns)}")
 
                 # Build event_id from task config to filter which events to epoch
 
@@ -366,7 +376,11 @@ def epochs_command(args):
                     raw_combined,
                     subject=subject,
                     events=events,
-                    event_id=filtered_event_id  # Use filtered event_id
+                    event_id=filtered_event_id,  # Use filtered event_id
+                    metadata=epochs_metadata,
+                    metadata_source=(
+                        str(events_tsv) if epochs_metadata is not None else None
+                    ),
                 )
 
                 if result.success:

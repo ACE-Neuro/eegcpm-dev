@@ -1,0 +1,65 @@
+# Task Configuration: Psychomotor Vigilance Task — Auditory modality (pvtaud)
+# Sustained-attention task: a stimulus appears after a jittered interval and
+# the participant responds as fast as possible (RT is the measure of interest).
+#
+# Event codes match the trial_type column in BIDS events.tsv:
+#   stimulus -> vigilance stimulus (single condition)
+#
+# Dataset: 25SusAttn (Neuroscan 64-ch, 1000 Hz, 50 Hz line).
+
+task_name: pvtaud
+description: "Psychomotor Vigilance Task — auditory modality (sustained attention, RT-based)"
+task_type: event-related
+
+primary_event:
+  name: all_stimuli
+  codes: [stimulus]
+
+# Epoch timing: 0.5 s keeps the epoch inside the shortest trial
+# (min trial duration in this dataset is 0.28 s) so a response cannot
+# overlap the next stimulus epoch.
+tmin: -0.2
+tmax: 0.5
+baseline: [-0.2, 0.0]
+
+conditions:
+  - name: stimulus
+    event_codes: ["stimulus"]
+    description: "vigilance stimulus"
+
+# No response_mapping: PVT has no correctness column, only RT. RT bins below
+# (trial_response.rt) carry the behavioural contrast.
+
+# ERP components
+erp_components:
+  - name: N1
+    search_window: [0.08, 0.18]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Auditory N1 (sensory response)
+  - name: P3
+    search_window: [0.25, 0.45]
+    channels: [Pz, CPz, Cz]
+    polarity: positive
+    description: P3 (attention allocation)
+
+# Rejection criteria
+reject:
+  eeg: 150e-6
+
+flat:
+  eeg: 1e-6
+
+# Trial binning
+binning:
+  - name: rt_quartiles
+    method: quantile
+    n_bins: 4
+    column: trial_response.rt
+    labels: [fast, medium_fast, medium_slow, slow]
+
+sampling_rate: 1000
+
+notes: |
+  Single-condition task — value is in RT bins. Window 0.5 s to avoid
+  response-epoch overlap (min trial duration 0.28 s). No correctness column.

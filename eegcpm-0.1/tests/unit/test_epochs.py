@@ -1,10 +1,12 @@
 """Unit tests for epochs module."""
 
+import json
 import tempfile
 from pathlib import Path
 
 import mne
 import numpy as np
+import pandas as pd
 import pytest
 
 from eegcpm.modules.epochs import EpochExtractionModule, sanitize_name
@@ -544,4 +546,367 @@ class TestSanitizeName:
 
     def test_empty_string(self):
         assert sanitize_name("") == ""
+
+
+# ---------------------------------------------------------------------------
+# Per-trial metadata: attachment, CSV/sidecar export, alignment (Pass 1)
+# ---------------------------------------------------------------------------
+
+
+class _MetadataSubject:
+    """Minimal subject stand-in (only ``.id`` is used for filenames)."""
+
+    id = "test_sub"
+
+
+def _metadata_raw_and_events(n_events: int = 10, sfreq: float = 250.0, seed: int = 42):
+    """Raw + events + behavioral metadata with one row per event."""
+    rng = np.random.default_rng(seed)
+    n_channels = 4
+    n_samples = int(sfreq * (n_events + 4))
+    data = rng.standard_normal((n_channels, n_samples)) * 1e-5  # ~10 uV noise
+    info = mne.create_info(
+        [f"EEG{i}" for i in range(n_channels)], sfreq, ["eeg"] * n_channels
+    )
+    raw = mne.io.RawArray(data, info, verbose=False)
+
+    event_times = np.arange(1, n_events + 1)
+    codes = np.tile([1, 2], int(np.ceil(n_events / 2)))[:n_events]
+    events = np.column_stack(
+        [(event_times * sfreq).astype(int), np.zeros(n_events, dtype=int), codes]
+    )
+    corr = np.tile([1, 0], int(np.ceil(n_events / 2)))[:n_events]
+    metadata = pd.DataFrame(
+        {
+            "trial_type": ["target" if c == 1 else "nontarget" for c in codes],
+            "key_resp.corr": corr,
+            "key_resp.rt": np.linspace(0.3, 0.9, n_events),
+            "trial_index": np.arange(n_events),
+        }
+    )
+    return raw, events, metadata
+
+
+def _process_with_metadata(tmp_path, raw, events, **kwargs):
+    module = EpochExtractionModule({"tmin": -0.2, "tmax": 0.4}, tmp_path)
+    return module.process(raw, subject=_MetadataSubject(), events=events, **kwargs)
+
+
+@pytest.fixture
+def raw_events_metadata():
+    return _metadata_raw_and_events()
+
+
+class TestEpochMetadataAttachment:
+    """``process(metadata=...)`` attaches, saves and reports trial metadata."""
+
+    def test_metadata_attached_and_csv_written(self, tmp_path, raw_events_metadata):
+        raw, events, metadata = raw_events_metadata
+        source = "/bids/sub-001/eeg/sub-001_task-x_events.tsv"
+        result = _process_with_metadata(
+            tmp_path,
+            raw,
+            events,
+            event_id={"target": 1, "nontarget": 2},
+            metadata=metadata,
+            metadata_source=source,
+        )
+
+        assert result.success, result.errors
+        epochs = result.outputs["epochs"]
+        assert epochs.metadata is not None
+        assert len(epochs.metadata) == len(epochs) == len(metadata)
+
+        # CSV: same rows as the original DataFrame (nothing dropped), aligned
+        # with the events array order.
+        csv_path = tmp_path / "test_sub_epochs_metadata.csv"
+        assert csv_path.exists()
+        csv = pd.read_csv(csv_path)
+        assert len(csv) == len(metadata)
+        assert list(csv.columns) == list(metadata.columns)
+        code_to_type = {1: "target", 2: "nontarget"}
+        assert csv["trial_type"].tolist() == [
+            code_to_type[int(code)] for code in epochs.events[:, 2]
+        ]
+        assert csv["trial_type"].tolist() == metadata["trial_type"].tolist()
+        assert csv["trial_index"].tolist() == metadata["trial_index"].tolist()
+
+        # ModuleResult metadata records what was passed in AND what was saved
+        assert result.metadata["metadata_rows"] == len(metadata)
+        assert result.metadata["metadata_rows_saved"] == len(epochs)
+        assert result.metadata["metadata_columns"] == list(metadata.columns)
+        assert result.metadata["metadata_source"] == source
+
+        # Provenance sidecar
+        sidecar = json.loads(
+            (tmp_path / "test_sub_epochs_metadata.json").read_text()
+        )
+        assert sidecar["source_events_tsv"] == source
+        assert sidecar["n_rows"] == len(metadata)
+        assert sidecar["n_rows_input"] == len(metadata)
+        assert sidecar["n_events_input"] == len(events)
+        assert sidecar["n_epochs"] == len(epochs)
+        assert sidecar["columns"] == list(metadata.columns)
+        assert sidecar["epochs_file"].endswith("test_sub_epo.fif")
+        assert sidecar["written_at"]
+
+        output_names = {path.name for path in result.output_files}
+        assert {
+            "test_sub_epo.fif",
+            "test_sub_epochs_metadata.csv",
+            "test_sub_epochs_metadata.json",
+        } <= output_names
+
+    def test_metadata_rows_follow_epochs_after_event_id_subset(self, tmp_path):
+        """Metadata is subset with the events when ``event_id`` filters them."""
+        n_events = 9
+        raw, _events, _metadata = _metadata_raw_and_events(n_events=n_events)
+        events = np.column_stack(
+            [
+                np.arange(1, n_events + 1) * 250,
+                np.zeros(n_events, dtype=int),
+                np.tile([1, 2, 3], 3),
+            ]
+        )
+        metadata = pd.DataFrame(
+            {
+                "trial_type": ["a", "b", "c"] * 3,
+                "trial_index": np.arange(n_events),
+            }
+        )
+
+        result = _process_with_metadata(
+            tmp_path, raw, events, event_id={"a": 1}, metadata=metadata
+        )
+
+        assert result.success, result.errors
+        epochs = result.outputs["epochs"]
+        assert len(epochs) == 3
+        assert len(epochs.metadata) == 3
+        assert epochs.metadata["trial_type"].tolist() == ["a", "a", "a"]
+        # MNE 1.13.2 would hand back rows 0-2 here (it takes metadata rows
+        # positionally after an event_id filter); the module pre-filters
+        # events+metadata together, so the surviving rows are 0, 3, 6.
+        assert epochs.metadata["trial_index"].tolist() == [0, 3, 6]
+        # epochs.selection indexes the events that were passed to mne.Epochs,
+        # i.e. the array after the module's event_id pre-filter (codes 1,2,3
+        # -> keep code 1 at rows 0, 3, 6).
+        keep = np.tile([1, 2, 3], 3) == 1
+        np.testing.assert_array_equal(
+            epochs.metadata["trial_index"].to_numpy(),
+            np.arange(n_events)[keep][epochs.selection],
+        )
+
+        csv = pd.read_csv(tmp_path / "test_sub_epochs_metadata.csv")
+        assert len(csv) == 3
+        assert csv["trial_index"].tolist() == [0, 3, 6]
+        assert result.metadata["metadata_rows"] == n_events
+        assert result.metadata["metadata_rows_saved"] == 3
+        sidecar = json.loads(
+            (tmp_path / "test_sub_epochs_metadata.json").read_text()
+        )
+        assert sidecar["n_rows"] == 3
+        assert sidecar["n_rows_input"] == n_events
+        assert sidecar["n_events_input"] == 9
+        assert sidecar["n_epochs"] == 3
+
+    def test_roundtrip_metadata_survives_read_epochs(self, tmp_path, raw_events_metadata):
+        raw, events, metadata = raw_events_metadata
+        result = _process_with_metadata(
+            tmp_path,
+            raw,
+            events,
+            event_id={"target": 1, "nontarget": 2},
+            metadata=metadata,
+        )
+        assert result.success
+
+        epochs_loaded = mne.read_epochs(
+            tmp_path / "test_sub_epo.fif", preload=True, verbose=False
+        )
+        assert epochs_loaded.metadata is not None
+        csv = pd.read_csv(tmp_path / "test_sub_epochs_metadata.csv")
+        assert (
+            epochs_loaded.metadata["trial_type"].tolist()
+            == csv["trial_type"].tolist()
+        )
+        assert (
+            epochs_loaded.metadata["trial_index"].tolist()
+            == csv["trial_index"].tolist()
+        )
+        # MNE's FIF metadata serialization rounds floats to ~10 significant
+        # digits: numeric values survive, bit-exact equality does not.
+        np.testing.assert_allclose(
+            epochs_loaded.metadata["key_resp.rt"].to_numpy(),
+            metadata["key_resp.rt"].to_numpy(),
+            rtol=1e-9,
+        )
+
+    def test_rejection_keeps_metadata_aligned(self, tmp_path):
+        """A rejected trial is dropped from BOTH epochs and metadata."""
+        n_events = 8
+        raw, events, metadata = _metadata_raw_and_events(n_events=n_events)
+        # 1 mV artifact over the epoch at t=4 s (event index 3)
+        sfreq = raw.info["sfreq"]
+        raw._data[:, int(4.0 * sfreq): int(4.5 * sfreq)] += 1e-3
+
+        module = EpochExtractionModule(
+            {
+                "tmin": -0.2,
+                "tmax": 0.4,
+                "rejection": {"strategy": "threshold", "reject": {"eeg": 200e-6}},
+            },
+            tmp_path,
+        )
+        result = module.process(
+            raw,
+            subject=_MetadataSubject(),
+            events=events,
+            event_id={"target": 1, "nontarget": 2},
+            metadata=metadata,
+        )
+
+        assert result.success, result.errors
+        epochs = result.outputs["epochs"]
+        assert len(epochs) == n_events - 1
+        # MNE 1.13.2 subsets metadata down to the *surviving* epochs; the rows
+        # stay aligned with epochs.events. This is the MNE contract the module
+        # relies on (verified by probe, not assumed).
+        assert len(epochs.metadata) == len(epochs)
+        assert epochs.metadata["trial_index"].tolist() == [0, 1, 2, 4, 5, 6, 7]
+        np.testing.assert_array_equal(
+            epochs.metadata["trial_index"].to_numpy(),
+            np.arange(n_events)[epochs.selection],
+        )
+        # metadata_rows counts the input frame; metadata_rows_saved the CSV
+        assert result.metadata["metadata_rows"] == n_events
+        assert result.metadata["metadata_rows_saved"] == len(epochs)
+
+        csv = pd.read_csv(tmp_path / "test_sub_epochs_metadata.csv")
+        assert len(csv) == len(epochs)
+        assert csv["trial_index"].tolist() == [
+            int(i) for i in epochs.metadata["trial_index"]
+        ]
+        sidecar = json.loads(
+            (tmp_path / "test_sub_epochs_metadata.json").read_text()
+        )
+        assert sidecar["n_rows"] == len(epochs)
+        assert sidecar["n_rows_input"] == n_events
+        assert sidecar["n_events_input"] == n_events
+
+    def test_metadata_source_optional(self, tmp_path, raw_events_metadata):
+        raw, events, metadata = raw_events_metadata
+        result = _process_with_metadata(
+            tmp_path,
+            raw,
+            events,
+            event_id={"target": 1, "nontarget": 2},
+            metadata=metadata,
+        )
+        assert result.success
+        sidecar = json.loads(
+            (tmp_path / "test_sub_epochs_metadata.json").read_text()
+        )
+        assert sidecar["source_events_tsv"] is None
+        assert result.metadata["metadata_source"] is None
+
+    def test_autoreject_keeps_metadata_aligned(self, tmp_path):
+        """autoreject's fit_transform keeps ``epochs.metadata`` in lock-step."""
+        pytest.importorskip("autoreject")
+        n_events, sfreq = 20, 100.0
+        rng = np.random.default_rng(0)
+        info = mne.create_info(["Fz", "Cz"], sfreq, ["eeg", "eeg"])
+        info.set_montage(mne.channels.make_standard_montage("standard_1020"))
+        n_samples = int(sfreq * (n_events + 2))
+        data = rng.standard_normal((2, n_samples)) * 1e-5
+        data[:, int(4.0 * sfreq): int(4.5 * sfreq)] += 1e-3
+        raw = mne.io.RawArray(data, info, verbose=False)
+        events = np.column_stack(
+            [
+                (np.arange(1, n_events + 1) * sfreq).astype(int),
+                np.zeros(n_events, dtype=int),
+                np.ones(n_events, dtype=int),
+            ]
+        )
+        metadata = pd.DataFrame({"trial_index": np.arange(n_events)})
+
+        module = EpochExtractionModule(
+            {
+                "tmin": -0.2,
+                "tmax": 0.2,
+                "rejection": {"strategy": "autoreject", "use_autoreject": True},
+            },
+            tmp_path,
+        )
+        result = module.process(
+            raw,
+            subject=_MetadataSubject(),
+            events=events,
+            event_id={"target": 1},
+            metadata=metadata,
+        )
+
+        assert result.success, result.errors
+        epochs = result.outputs["epochs"]
+        assert len(epochs) < n_events  # autoreject dropped/interpolated epochs
+        assert len(epochs.metadata) == len(epochs)
+        np.testing.assert_array_equal(
+            epochs.metadata["trial_index"].to_numpy(),
+            np.arange(n_events)[epochs.selection],
+        )
+        csv = pd.read_csv(tmp_path / "test_sub_epochs_metadata.csv")
+        assert csv["trial_index"].tolist() == [
+            int(i) for i in epochs.metadata["trial_index"]
+        ]
+
+
+class TestEpochMetadataBackwardsCompatible:
+    """The events-only path is unchanged and still the default."""
+
+    def test_process_without_metadata(self, tmp_path, raw_events_metadata):
+        raw, events, metadata = raw_events_metadata
+        result = _process_with_metadata(
+            tmp_path,
+            raw,
+            events,
+            event_id={"target": 1, "nontarget": 2},
+        )
+
+        assert result.success, result.errors
+        epochs = result.outputs["epochs"]
+        assert epochs.metadata is None
+        assert not (tmp_path / "test_sub_epochs_metadata.csv").exists()
+        assert not (tmp_path / "test_sub_epochs_metadata.json").exists()
+        assert result.metadata["metadata_rows"] == 0
+        assert result.metadata["metadata_rows_saved"] == 0
+        assert result.metadata["metadata_columns"] == []
+        assert result.metadata["metadata_source"] is None
+
+    def test_metadata_wrong_length_fails_loudly(self, tmp_path, raw_events_metadata):
+        raw, events, metadata = raw_events_metadata
+        result = _process_with_metadata(
+            tmp_path,
+            raw,
+            events,
+            event_id={"target": 1, "nontarget": 2},
+            metadata=metadata.iloc[:-1],
+        )
+
+        assert not result.success
+        assert any("metadata has" in err for err in result.errors), result.errors
+        assert not (tmp_path / "test_sub_epo.fif").exists()
+        assert not (tmp_path / "test_sub_epochs_metadata.csv").exists()
+
+    def test_metadata_wrong_type_fails_loudly(self, tmp_path, raw_events_metadata):
+        raw, events, metadata = raw_events_metadata
+        result = _process_with_metadata(
+            tmp_path,
+            raw,
+            events,
+            event_id={"target": 1, "nontarget": 2},
+            metadata={"trial_type": "target"},
+        )
+
+        assert not result.success
+        assert any("pandas.DataFrame" in err for err in result.errors), result.errors
 

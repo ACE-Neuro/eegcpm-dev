@@ -1,0 +1,90 @@
+# Task Configuration: Stop-Signal Task — Auditory modality (sstaud)
+# Adaptive stop-signal task (stop-signal delay tracks ~50% stopping).
+#
+# Event codes match the trial_type column in BIDS events.tsv:
+#   go            -> go trial (no stop signal; respond to the arrow)
+#   stop_success  -> stop signal shown, response successfully withheld
+#   stop_fail     -> stop signal shown, response nevertheless emitted
+#
+# Dataset: 25SusAttn (Neuroscan 64-ch, 1000 Hz, 50 Hz line).
+
+task_name: sstaud
+description: "Stop-signal task — auditory modality"
+task_type: event-related
+
+primary_event:
+  name: all_stimuli
+  codes: [go, stop_success, stop_fail]
+
+# Epoch timing: the P3 to the stop signal is the largest component and
+# extends past 0.8 s only slightly.
+tmin: -0.2
+tmax: 0.8
+baseline: [-0.2, 0.0]
+
+conditions:
+  - name: go
+    event_codes: ["go"]
+    description: "Go trial — respond to the arrow (no stop signal)"
+  - name: stop_success
+    event_codes: ["stop_success"]
+    description: "Stop trial — response successfully withheld"
+  - name: stop_fail
+    event_codes: ["stop_fail"]
+    description: "Stop trial — response emitted despite the stop signal"
+
+# Behavioral response mapping
+response_mapping:
+  response_column: response.corr
+  categories:
+    correct: 1
+    incorrect: 0
+  rt_column: response.rt
+  rt_min: 100
+  rt_max: 1100
+
+# ERP components
+erp_components:
+  - name: N1
+    search_window: [0.08, 0.18]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Auditory N1 (sensory response)
+  - name: N2
+    search_window: [0.15, 0.30]
+    channels: [Fz, FCz, Cz]
+    polarity: negative
+    description: Stop-signal N2 (enhanced on stop trials)
+  - name: P3
+    search_window: [0.25, 0.55]
+    channels: [Pz, CPz, Cz]
+    polarity: positive
+    description: Stop-signal P3
+
+# Rejection criteria
+reject:
+  eeg: 150e-6
+
+flat:
+  eeg: 1e-6
+
+# Trial binning
+binning:
+  - name: ssd_terciles
+    method: quantile
+    n_bins: 3
+    column: actualSSD
+    labels: [short, medium, long]
+  - name: rt_quartiles
+    method: quantile
+    n_bins: 4
+    column: response.rt
+    labels: [fast, medium_fast, medium_slow, slow]
+
+sampling_rate: 1000
+
+notes: |
+  Stop-signal SSD ranges 0.05-0.9 s (adaptive staircase). Bins are
+  within-subject quantiles. Stop-fail is kept separate (success-vs-fail is
+  a first-class contrast). Stop-signal-locked ERPs (aligning at
+  onset+actualSSD) would need derived events — a follow-up.
